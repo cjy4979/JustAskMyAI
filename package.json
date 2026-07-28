@@ -1,0 +1,40 @@
+{
+  "name": "just-ask-my-ai",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A thin MCP-to-A2A bridge for asking another person's local AI.",
+  "bin": {
+    "jamai-node": "./dist/src/daemon.js",
+    "jamai-mcp": "./dist/src/mcp.js",
+    "jamai-hub": "./dist/src/hub.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev:node": "tsx src/daemon.ts",
+    "dev:mcp": "tsx src/mcp.ts",
+    "dev:hub": "tsx src/hub.ts",
+    "test": "node --test --import tsx test/*.test.ts",
+    "test:e2e": "node test/e2e-runner.mjs",
+    "check": "npm run build && npm test && npm run test:e2e"
+  },
+  "dependencies": {
+    "@a2a-js/sdk": "^1.0.0",
+    "@agentclientprotocol/sdk": "^1.3.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "bonjour-service": "^1.4.3",
+    "express": "^5.1.0",
+    "ws": "^8.18.3",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.10.0",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
