@@ -14,4 +14,5 @@ export interface AgentAdapter {
   readonly id: string;
   readonly displayName: string;
   run(request: AgentRequest): Promise<AgentResult>;
+  close?(): Promise<void> | void;
 }

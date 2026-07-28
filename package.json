@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "A thin MCP-to-A2A bridge for asking another person's local AI.",
+  "description": "The identity, consent, delegation, and audit layer between personal AIs.",
   "bin": {
     "jamai-node": "./dist/src/daemon.js",
     "jamai-mcp": "./dist/src/mcp.js",
@@ -36,6 +36,6 @@
     "typescript": "^5.9.3"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13"
   }
 }

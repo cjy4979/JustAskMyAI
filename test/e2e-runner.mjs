@@ -3,10 +3,15 @@ import { setTimeout as delay } from "node:timers/promises";
 import { ClientFactory, JsonRpcTransportFactory } from "@a2a-js/sdk/client";
 import { Role } from "@a2a-js/sdk";
 import { randomUUID } from "node:crypto";
+import { GatewayIdentity } from "../dist/src/protocol/signed-request.js";
+import { GatewayStore } from "../dist/src/storage/sqlite.js";
+
+const requesterStore = new GatewayStore(":memory:");
+const requesterIdentity = new GatewayIdentity(requesterStore);
 
 const child = spawn(process.execPath, ["dist/src/daemon.js"], {
   cwd: process.cwd(),
-  env: { ...process.env, JAMAI_POLICY: "auto", JAMAI_HOST: "127.0.0.1" },
+  env: { ...process.env, JAMAI_POLICY: "always_ask", JAMAI_HOST: "127.0.0.1" },
   stdio: ["ignore", "pipe", "pipe"],
 });
 let stderr = "";
@@ -52,13 +57,20 @@ try {
     configuration: undefined,
     metadata: undefined,
   });
-  const collaboration = await client.sendMessage({
-    tenant: "",
-    message: {
+  const delegatedTask = {
+    version: 1,
+    delegationId: "e2e-delegation",
+    mode: "delegate",
+    role: "test engineer",
+    objective: "Add a regression test",
+    acceptanceCriteria: ["Return a verified work report"],
+    expectedResult: { type: "report" },
+  };
+  const delegationMessage = (contextId = "", taskId = "", approvalId) => ({
       role: Role.ROLE_USER,
       messageId: randomUUID(),
-      contextId: "",
-      taskId: "",
+      contextId,
+      taskId,
       parts: [{
         content: { $case: "text", value: "add a test" },
         metadata: undefined,
@@ -66,35 +78,59 @@ try {
         mediaType: "text/plain",
       }],
       metadata: {
-        collaboration: {
-          version: 1,
-          collaborationId: "e2e-collaboration",
-          role: "test engineer",
-          objective: "Add a regression test",
-          acceptanceCriteria: ["Return a verified work report"],
-        },
+        senderPeerId: requesterIdentity.peerId,
+        delegation: delegatedTask,
+        requestAuth: requesterIdentity.sign({
+          delegation: delegatedTask,
+          text: "add a test",
+        }),
+        ...(approvalId ? { approvalId } : {}),
       },
       extensions: [],
       referenceTaskIds: [],
-    },
+  });
+  const initialDelegation = await client.sendMessage({
+    tenant: "",
+    message: delegationMessage(),
     configuration: undefined,
     metadata: undefined,
   });
-  const collaborationArtifact = collaboration.artifacts?.[0];
-  if (collaborationArtifact?.name !== "collaboration-report") {
-    throw new Error("collaboration request did not return a collaboration-report artifact");
+  const approvalId = initialDelegation.status?.message?.metadata?.approvalId;
+  if (typeof approvalId !== "string") {
+    throw new Error(`delegation did not request owner consent: ${JSON.stringify(initialDelegation)}`);
+  }
+  const approvalResponse = await fetch(
+    `http://127.0.0.1:43120/api/approvals/${approvalId}/approve`,
+    { method: "POST" },
+  );
+  if (!approvalResponse.ok) throw new Error("owner approval endpoint failed");
+  const delegation = await client.sendMessage({
+    tenant: "",
+    message: delegationMessage(
+      initialDelegation.contextId,
+      initialDelegation.id,
+      approvalId,
+    ),
+    configuration: undefined,
+    metadata: undefined,
+  });
+  const delegationArtifact = delegation.artifacts?.[0];
+  if (delegationArtifact?.name !== "delegate-result") {
+    throw new Error("delegation request did not return a delegate-result artifact");
   }
   console.log(JSON.stringify({
     health,
     card: card.name,
     result,
-    collaboration: {
-      state: collaboration.status?.state,
-      artifact: collaborationArtifact.name,
-      metadata: collaborationArtifact.metadata,
+    delegation: {
+      approvalId,
+      state: delegation.status?.state,
+      artifact: delegationArtifact.name,
+      metadata: delegationArtifact.metadata,
     },
   }));
 } finally {
+  requesterStore.close();
   child.kill("SIGTERM");
   await Promise.race([
     new Promise((resolve) => child.once("exit", resolve)),

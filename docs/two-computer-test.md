@@ -1,15 +1,18 @@
-# Two-computer collaboration test
+# Two-computer delegation test
 
-This test uses computer A as the coordinator and computer B as a worker.
-Both computers need Node.js 22+ and a checkout of this repository.
+Computer A asks or delegates through its existing Agent. Computer B runs its own existing
+Agent and remains controlled by B.
 
-## 1. Start the worker on computer B
+Both machines need Node.js 22.13+ and this repository.
 
-Replace `192.168.1.52` with computer B's LAN address:
+## 1. Start B's gateway
+
+Replace `192.168.1.52` and the workspace path:
 
 ```powershell
-cd G:\JustAskMyAI
-$env:JAMAI_NAME="Bob Worker"
+npm install
+npm run build
+$env:JAMAI_NAME="Bob's AI"
 $env:JAMAI_HOST="0.0.0.0"
 $env:JAMAI_PORT="43122"
 $env:JAMAI_PUBLIC_URL="http://192.168.1.52:43122"
@@ -17,54 +20,50 @@ $env:JAMAI_POLICY="always_ask"
 $env:JAMAI_ADAPTER="acp"
 $env:JAMAI_ACP_COMMAND="hermes"
 $env:JAMAI_ACP_ARGS='["acp"]'
-$env:JAMAI_AGENT_CWD="D:\projects\the-shared-project"
+$env:JAMAI_AGENT_CWD="D:\projects\the-project"
 $env:JAMAI_ACP_ALLOW_TOOLS="true"
 npm run dev:node
 ```
 
-`JAMAI_AGENT_CWD` is chosen locally by B. A remote caller cannot select an
-arbitrary directory on B.
+B chooses `JAMAI_AGENT_CWD`; A cannot choose an arbitrary directory on B.
 
-Confirm from computer A:
+From A:
 
 ```powershell
 Invoke-RestMethod http://192.168.1.52:43122/health
 Invoke-RestMethod http://192.168.1.52:43122/api/capabilities
 ```
 
-Expected capabilities include:
-
-```json
-{
-  "adapter": "acp",
-  "canExecuteWork": true,
-  "humanApproval": "always_ask",
-  "acpToolPermissions": true
-}
-```
-
-## 2. Start the coordinator node on computer A
+## 2. Start A's gateway
 
 ```powershell
-cd G:\JustAskMyAI
-$env:JAMAI_NAME="Alice Coordinator"
+npm install
+npm run build
+$env:JAMAI_NAME="Alice's AI"
 $env:JAMAI_PORT="43120"
-$env:JAMAI_PUBLIC_URL="http://127.0.0.1:43120"
 $env:JAMAI_POLICY="auto"
 npm run dev:node
 ```
 
-If mDNS does not discover B, register it manually:
+If mDNS has not found B:
 
 ```powershell
 Invoke-RestMethod `
   -Method Post `
   -ContentType "application/json" `
   -Uri http://127.0.0.1:43120/api/peers `
-  -Body '{"name":"Bob Worker","url":"http://192.168.1.52:43122"}'
+  -Body '{"name":"Bob AI","url":"http://192.168.1.52:43122"}'
 ```
 
-## 3. Open the MCP server on computer A
+## 3. Connect the MCP on A
+
+Configure A's Codex/Claude Code/Hermes MCP command as:
+
+```text
+node G:\JustAskMyAI\dist\src\mcp.js
+```
+
+For a visible smoke test:
 
 ```powershell
 $env:JAMAI_DAEMON_URL="http://127.0.0.1:43120"
@@ -77,19 +76,22 @@ Call `delegate_remote_task`:
 {
   "peerUrl": "http://192.168.1.52:43122",
   "role": "test engineer",
-  "objective": "Inspect the project, add regression tests for the authentication middleware, and run the relevant test suite.",
-  "sharedContext": "Alice is changing the token refresh implementation on her computer.",
+  "objective": "Inspect the project, add regression tests for authentication, and run them.",
+  "context": "Alice is changing token refresh on her own computer.",
   "acceptanceCriteria": [
-    "Add tests for valid, expired, and malformed tokens",
-    "Do not modify the token refresh implementation",
-    "Report changed files and exact test results"
-  ]
+    "Cover valid, expired, and malformed tokens",
+    "Do not modify token refresh",
+    "Return changed files and exact test results"
+  ],
+  "allowedActions": ["read-workspace", "edit-workspace", "run-tests"],
+  "deniedActions": ["push", "deploy", "contact-third-party"]
 }
 ```
 
-## 4. Approve on computer B
+## 4. B approves
 
-The first result is `TASK_STATE_INPUT_REQUIRED` and contains an `approvalId`.
+The first response is `INPUT_REQUIRED` with `approvalId`, `taskId`, and `contextId`.
+
 On B:
 
 ```powershell
@@ -99,22 +101,30 @@ Invoke-RestMethod `
   http://127.0.0.1:43122/api/approvals/<approvalId>/approve
 ```
 
-Call `delegate_remote_task` again with the same fields plus the returned
-`taskId`, `contextId`, and `approvalId`.
+On A call `continue_remote_task` using the exact original delegation fields plus its
+`delegationId`, `taskId`, `contextId`, and `approvalId`. Expected result:
 
-The expected final result is `TASK_STATE_COMPLETED` with a
-`collaboration-report` artifact containing:
+- state `COMPLETED`
+- artifact named `delegate-result`
+- remote Agent session ID in artifact metadata
+- result/report produced from B's locally selected workspace
 
-- completion status
-- files or artifacts changed on B
-- commands/tests run
-- blockers
+Changing the request after approval intentionally creates a new approval requirement.
 
-## Source-code collaboration
+## 5. Verify continuity and audit
 
-Use separate Git branches or worktrees on A and B. The bridge does not copy an
-entire working directory between machines.
+Continue the completed task with the same `contextId` and ask a follow-up referring to the
+previous turn. The artifact metadata should retain the same `agentSessionId`.
 
-For the first test, have B edit and test locally without pushing. After review,
-explicitly delegate a second objective that asks B to commit and push its named
-branch. Pushing is never implied by a general task.
+On B:
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:43122/api/tasks"
+Invoke-RestMethod "http://127.0.0.1:43122/api/audit?taskId=<taskId>"
+Invoke-RestMethod "http://127.0.0.1:43122/api/audit/verify"
+```
+
+The final verification should return `"valid": true`.
+
+Source delivery is explicit. A general delegation never implies commit, push, publish, deploy,
+or contacting third parties.

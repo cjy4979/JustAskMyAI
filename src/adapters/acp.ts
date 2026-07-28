@@ -1,5 +1,5 @@
 import * as acp from "@agentclientprotocol/sdk";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import type { AgentAdapter, AgentRequest, AgentResult } from "./types.js";
 
@@ -10,33 +10,102 @@ export interface AcpAdapterOptions {
   allowToolPermissions?: boolean;
 }
 
+interface AcpRuntime {
+  child: ChildProcessWithoutNullStreams;
+  connection: acp.ClientSideConnection;
+  sessionId: string;
+  stderr: string;
+  chunks: string[];
+  queue: Promise<void>;
+}
+
 /**
- * Drives any ACP-compatible agent over stdio.
- *
- * The outer A2A approval and the inner ACP tool permission are separate gates.
- * Inner tool permissions remain denied unless the local owner explicitly opts in.
+ * Keeps one ACP process and session per remote A2A context.
+ * A continuation therefore reaches the same existing agent memory.
  */
 export class AcpAdapter implements AgentAdapter {
   readonly id = "acp";
   readonly displayName = "ACP agent";
+  private readonly sessions = new Map<string, Promise<AcpRuntime>>();
 
   constructor(private readonly options: AcpAdapterOptions) {}
 
   async run(request: AgentRequest): Promise<AgentResult> {
+    const runtime = await this.getRuntime(request.contextId);
+    const previous = runtime.queue;
+    let release!: () => void;
+    runtime.queue = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    runtime.chunks = [];
+    const abort = () => {
+      void runtime.connection.cancel({ sessionId: runtime.sessionId });
+    };
+    request.signal.addEventListener("abort", abort, { once: true });
+    try {
+      const result = await runtime.connection.prompt({
+        sessionId: runtime.sessionId,
+        prompt: [{ type: "text", text: request.prompt }],
+      });
+      if (result.stopReason !== "end_turn") {
+        throw new Error(`ACP turn stopped with ${result.stopReason}`);
+      }
+      return {
+        text: runtime.chunks.join("").trim(),
+        sessionId: runtime.sessionId,
+      };
+    } catch (error) {
+      const stderr = runtime.stderr.trim();
+      throw new Error(stderr ? `${String(error)}\nACP stderr: ${stderr}` : String(error));
+    } finally {
+      request.signal.removeEventListener("abort", abort);
+      release();
+    }
+  }
+
+  async close(): Promise<void> {
+    const runtimes = await Promise.allSettled(this.sessions.values());
+    for (const result of runtimes) {
+      if (result.status !== "fulfilled") continue;
+      result.value.child.stdin.end();
+      result.value.child.kill("SIGTERM");
+    }
+    this.sessions.clear();
+  }
+
+  private getRuntime(contextId: string): Promise<AcpRuntime> {
+    const existing = this.sessions.get(contextId);
+    if (existing) return existing;
+    const created = this.createRuntime(contextId);
+    this.sessions.set(contextId, created);
+    created.catch(() => this.sessions.delete(contextId));
+    return created;
+  }
+
+  private async createRuntime(contextId: string): Promise<AcpRuntime> {
     const child = spawn(this.options.command, this.options.args, {
       cwd: this.options.cwd,
       shell: false,
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
-    if (!child.stdin || !child.stdout) throw new Error("ACP process did not expose stdio");
-    let stderr = "";
-    child.stderr?.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    const runtime = {} as AcpRuntime;
+    runtime.child = child;
+    runtime.stderr = "";
+    runtime.chunks = [];
+    runtime.queue = Promise.resolve();
+    child.stderr.setEncoding("utf8").on("data", (chunk) => {
+      runtime.stderr += String(chunk);
+    });
+    child.once("exit", () => {
+      const current = this.sessions.get(contextId);
+      if (current) void current.then((value) => {
+        if (value === runtime) this.sessions.delete(contextId);
+      }).catch(() => undefined);
+    });
     const stream = acp.ndJsonStream(
       Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
       Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
     );
-    const chunks: string[] = [];
     const client: acp.Client = {
       requestPermission: async ({ options }) => {
         const desiredKind = this.options.allowToolPermissions ? "allow_once" : "reject_once";
@@ -47,42 +116,20 @@ export class AcpAdapter implements AgentAdapter {
       },
       sessionUpdate: async ({ update }) => {
         if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
-          chunks.push(update.content.text);
+          runtime.chunks.push(update.content.text);
         }
       },
     };
-    const connection = new acp.ClientSideConnection(() => client, stream);
-    const abort = () => {
-      child.stdin?.end();
-      child.kill("SIGTERM");
-    };
-    request.signal.addEventListener("abort", abort, { once: true });
-    try {
-      await connection.initialize({
-        protocolVersion: acp.PROTOCOL_VERSION,
-        clientCapabilities: {},
-      });
-      const session = await connection.newSession({
-        cwd: this.options.cwd,
-        mcpServers: [],
-      });
-      const result = await connection.prompt({
-        sessionId: session.sessionId,
-        prompt: [{ type: "text", text: request.prompt }],
-      });
-      if (result.stopReason !== "end_turn") {
-        throw new Error(`ACP turn stopped with ${result.stopReason}`);
-      }
-      return { text: chunks.join("").trim(), sessionId: session.sessionId };
-    } catch (error) {
-      if (stderr.trim()) {
-        throw new Error(`${String(error)}\nACP stderr: ${stderr.trim()}`);
-      }
-      throw error;
-    } finally {
-      request.signal.removeEventListener("abort", abort);
-      child.stdin?.end();
-      child.kill("SIGTERM");
-    }
+    runtime.connection = new acp.ClientSideConnection(() => client, stream);
+    await runtime.connection.initialize({
+      protocolVersion: acp.PROTOCOL_VERSION,
+      clientCapabilities: {},
+    });
+    const session = await runtime.connection.newSession({
+      cwd: this.options.cwd,
+      mcpServers: [],
+    });
+    runtime.sessionId = session.sessionId;
+    return runtime;
   }
 }

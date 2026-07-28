@@ -1,49 +1,78 @@
 # JustAskMyAI
 
-“我不知道怎么和你说，你的 AI 去问我的 AI。”
+> Let one person's AI safely discover, contact, ask, and delegate to another person's AI.
 
-This repository is an early Node.js proof of architecture. It is intentionally a thin bridge over MCP, A2A, and existing agent runtimes.
+“I have no idea how to explain it. Just let your AI ask mine.”
+
+JustAskMyAI is not another agent framework. It does not replace Codex, Claude Code,
+Hermes, OpenClaw, Manus, AutoGen, or any other existing agent. It provides the
+identity, consent, delegation, and audit layer between personal AIs.
+
+The human remains the Principal: people decide who may contact their AI, what context
+may be disclosed, and what actions may be performed. Their AIs communicate context and
+perform bounded work within that authority.
+
+## What can be tested today
+
+- MCP integration for discovering and calling remote personal AIs
+- A2A tasks supporting ask, delegate, review, execute, continue, get, and cancel
+- Local Ed25519 identities, signed requests, a five-minute validity window, and nonce replay protection
+- Human consent bound to an exact peer, task, context, and request digest
+- Single-use, expiring approvals
+- Persistent ACP agent sessions mapped by A2A `contextId`
+- SQLite persistence for tasks, approvals, agent sessions, artifacts, and audit events
+- Metadata, redacted, and full-local audit modes
+- A tamper-evident audit hash chain
+- LAN discovery through mDNS or manual peer registration
+
+The public relay remains experimental. Do not expose a gateway to an untrusted public
+network until explicit pairing, end-to-end relay encryption, identity revocation, and
+rate limiting are implemented.
 
 ## Run
 
-```bash
+```powershell
 npm install
 npm run check
 
-# terminal 1
+# Terminal 1
 $env:JAMAI_POLICY="auto"
 npm run dev:node
 
-# terminal 2 (MCP stdio server)
+# Terminal 2: the MCP stdio server installed into an existing agent
 npm run dev:mcp
 ```
 
-Default node URL: `http://127.0.0.1:43120`.
+The default gateway URL is `http://127.0.0.1:43120`.
 
-Use an existing ACP agent instead of the mock:
+To connect an existing ACP-compatible agent:
 
 ```powershell
 $env:JAMAI_ADAPTER="acp"
 $env:JAMAI_ACP_COMMAND="hermes"
 $env:JAMAI_ACP_ARGS='["acp"]'
+$env:JAMAI_AGENT_CWD="D:\projects\my-project"
 npm run dev:node
 ```
 
-The same adapter can launch `codex-acp`, `claude-agent-acp`, Copilot ACP, or another
-ACP server by changing the command and JSON argument array. ACP tool permissions
-remain denied unless the local owner sets `JAMAI_ACP_ALLOW_TOOLS=true`.
+ACP tool permissions are denied unless the local owner explicitly sets
+`JAMAI_ACP_ALLOW_TOOLS=true`. A remote requester cannot select the local workspace or
+override the owner's policy.
 
-Useful local endpoints:
+## MCP tools
 
-- `GET /health`
-- `GET /api/peers`
-- `POST /api/peers`
-- `GET /api/approvals`
-- `POST /api/approvals/:id/approve`
-- `POST /api/approvals/:id/deny`
-- `GET /.well-known/agent-card.json`
+- `list_remote_ais`
+- `ask_remote_ai`
+- `delegate_remote_task`
+- `request_remote_review`
+- `request_remote_execution`
+- `continue_remote_task`
+- `get_remote_task`
+- `cancel_remote_task`
 
-See [architecture](./docs/architecture.md).
+The core protocol deliberately does not provide `collaborate_with_ais`. Parallel
+delegation, coordination, and plan merging belong to the caller's existing agent rather
+than the JustAskMyAI protocol.
 
-For real work across two machines, follow the
-[two-computer collaboration test](./docs/two-computer-test.md).
+See the [architecture](./docs/architecture.md) and the
+[two-computer test guide](./docs/two-computer-test.md).

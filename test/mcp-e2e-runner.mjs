@@ -46,7 +46,15 @@ try {
   await mcp.connect(transport);
   const tools = await mcp.listTools();
   const names = tools.tools.map((tool) => tool.name);
-  for (const expected of ["ask_remote_ai", "delegate_remote_task", "collaborate_with_ais"]) {
+  for (const expected of [
+    "ask_remote_ai",
+    "delegate_remote_task",
+    "request_remote_review",
+    "request_remote_execution",
+    "continue_remote_task",
+    "get_remote_task",
+    "cancel_remote_task",
+  ]) {
     if (!names.includes(expected)) throw new Error(`missing MCP tool: ${expected}`);
   }
   const result = await mcp.callTool({
@@ -54,15 +62,15 @@ try {
     arguments: {
       peerUrl: `http://127.0.0.1:${port}`,
       role: "test engineer",
-      objective: "Run the MCP collaboration smoke test",
-      acceptanceCriteria: ["Return a collaboration report"],
+      objective: "Run the MCP delegation smoke test",
+      acceptanceCriteria: ["Return a delegation result"],
     },
   });
   const output = JSON.stringify(result);
-  if (!output.includes("collaboration-report")) {
-    throw new Error(`MCP result did not contain collaboration report: ${output}`);
+  if (!output.includes("delegate-result")) {
+    throw new Error(`MCP result did not contain delegation result: ${output}`);
   }
-  console.log(JSON.stringify({ tools: names, collaborationReport: true }));
+  console.log(JSON.stringify({ tools: names, delegationResult: true }));
 } finally {
   await mcp?.close();
   worker.kill("SIGTERM");
