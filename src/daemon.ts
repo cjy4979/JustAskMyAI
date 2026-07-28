@@ -70,6 +70,14 @@ const handler = new DefaultRequestHandler(
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.get("/health", (_req, res) => res.json({ ok: true, nodeId, adapter: adapter.id }));
+app.get("/api/capabilities", (_req, res) => res.json({
+  nodeId,
+  name: config.name,
+  adapter: adapter.id,
+  canExecuteWork: adapter.id !== "mock",
+  humanApproval: config.policy,
+  acpToolPermissions: process.env.JAMAI_ACP_ALLOW_TOOLS === "true",
+}));
 app.get("/api/peers", (_req, res) => res.json(peers.list()));
 app.post("/api/peers", (req, res) => {
   const { id = randomUUID(), name, url } = req.body ?? {};

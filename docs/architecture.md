@@ -57,3 +57,12 @@ Do not reuse HADFlow's workflow/OKR/industrial-device domain, central Brain rout
 3. Run the MCP server and call `list_remote_ais`.
 4. Call `ask_remote_ai`; receive an A2A task and artifact.
 5. Repeat with `always_ask`; observe `input-required`, approve locally, then continue with the approval ID.
+
+## Collaboration tools
+
+- `ask_remote_ai`: contextual Q&A only.
+- `delegate_remote_task`: one remote computer executes a concrete role and objective.
+- `collaborate_with_ais`: several remote assignments execute concurrently; the caller's AI is the coordinator.
+
+Code work uses separate Git branches/worktrees. The bridge transports task
+context and work reports; Git transports reviewed source changes.

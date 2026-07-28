@@ -52,7 +52,48 @@ try {
     configuration: undefined,
     metadata: undefined,
   });
-  console.log(JSON.stringify({ health, card: card.name, result }));
+  const collaboration = await client.sendMessage({
+    tenant: "",
+    message: {
+      role: Role.ROLE_USER,
+      messageId: randomUUID(),
+      contextId: "",
+      taskId: "",
+      parts: [{
+        content: { $case: "text", value: "add a test" },
+        metadata: undefined,
+        filename: "",
+        mediaType: "text/plain",
+      }],
+      metadata: {
+        collaboration: {
+          version: 1,
+          collaborationId: "e2e-collaboration",
+          role: "test engineer",
+          objective: "Add a regression test",
+          acceptanceCriteria: ["Return a verified work report"],
+        },
+      },
+      extensions: [],
+      referenceTaskIds: [],
+    },
+    configuration: undefined,
+    metadata: undefined,
+  });
+  const collaborationArtifact = collaboration.artifacts?.[0];
+  if (collaborationArtifact?.name !== "collaboration-report") {
+    throw new Error("collaboration request did not return a collaboration-report artifact");
+  }
+  console.log(JSON.stringify({
+    health,
+    card: card.name,
+    result,
+    collaboration: {
+      state: collaboration.status?.state,
+      artifact: collaborationArtifact.name,
+      metadata: collaborationArtifact.metadata,
+    },
+  }));
 } finally {
   child.kill("SIGTERM");
   await Promise.race([

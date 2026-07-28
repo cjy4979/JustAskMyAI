@@ -13,6 +13,7 @@ import {
 import { randomUUID } from "node:crypto";
 import type { AgentAdapter } from "./adapters/index.js";
 import type { ApprovalStore } from "./approvals.js";
+import { buildCollaborationPrompt, parseCollaborationTask } from "./collaboration.js";
 
 export class BridgeExecutor implements AgentExecutor {
   private readonly controllers = new Map<string, AbortController>();
@@ -24,8 +25,11 @@ export class BridgeExecutor implements AgentExecutor {
 
   async execute(context: RequestContext, bus: ExecutionEventBus): Promise<void> {
     const { taskId, contextId, userMessage } = context;
-    const prompt = textFromMessage(userMessage);
     const metadata = (userMessage.metadata ?? {}) as Record<string, unknown>;
+    const collaboration = parseCollaborationTask(metadata);
+    const prompt = collaboration
+      ? buildCollaborationPrompt(collaboration)
+      : textFromMessage(userMessage);
     const approvalId = typeof metadata.approvalId === "string" ? metadata.approvalId : undefined;
     const task: Task = context.task ?? {
       id: taskId,
@@ -74,10 +78,19 @@ export class BridgeExecutor implements AgentExecutor {
         contextId,
         artifact: {
           artifactId: randomUUID(),
-          name: "answer",
-          description: `Answer from ${this.adapter.displayName}`,
+          name: collaboration ? "collaboration-report" : "answer",
+          description: collaboration
+            ? `Work report from ${collaboration.role} on ${this.adapter.displayName}`
+            : `Answer from ${this.adapter.displayName}`,
           parts: [textPart(result.text)],
-          metadata: undefined,
+          metadata: collaboration
+            ? {
+                collaborationId: collaboration.collaborationId,
+                role: collaboration.role,
+                objective: collaboration.objective,
+                agentSessionId: result.sessionId,
+              }
+            : { agentSessionId: result.sessionId },
           extensions: [],
         },
         append: false,

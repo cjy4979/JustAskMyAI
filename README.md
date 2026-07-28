@@ -44,3 +44,6 @@ Useful local endpoints:
 - `GET /.well-known/agent-card.json`
 
 See [architecture](./docs/architecture.md).
+
+For real work across two machines, follow the
+[two-computer collaboration test](./docs/two-computer-test.md).
