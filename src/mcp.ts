@@ -11,9 +11,15 @@ import {
   type DelegationMode,
 } from "./protocol/delegated-task.js";
 import { GatewayStore } from "./storage/sqlite.js";
-import { GatewayIdentity } from "./protocol/signed-request.js";
+import {
+  encodeSignedRequest,
+  GatewayIdentity,
+  JAMAI_AUTH_HEADER,
+  JAMAI_EXTENSION_URI,
+  peerIdFromPublicKey,
+} from "./protocol/signed-request.js";
 
-const daemonUrl = process.env.JAMAI_DAEMON_URL ?? "http://127.0.0.1:43120";
+const daemonUrl = process.env.JAMAI_DAEMON_URL ?? "http://127.0.0.1:43121";
 const server = new McpServer({ name: "just-ask-my-ai", version: "0.1.0" });
 const store = new GatewayStore();
 const identity = new GatewayIdentity(store);
@@ -99,13 +105,24 @@ server.registerTool(
     inputSchema: {
       peerUrl: z.string().url(),
       taskId: z.string().min(1),
+      contextId: z.string().min(1),
       historyLength: z.number().int().min(0).max(100).default(20),
     },
   },
-  async ({ peerUrl, taskId, historyLength }) => {
+  async ({ peerUrl, taskId, contextId, historyLength }) => {
     const client = await createClient(peerUrl);
+    const remote = await getRemoteIdentity(peerUrl);
+    const requestAuth = identity.signRequest({
+      audiencePeerId: remote.peerId,
+      action: "task.get",
+      taskId,
+      contextId,
+    });
     return text(JSON.stringify(
-      summarizeResult(await client.getTask({ tenant: "", id: taskId, historyLength })),
+      summarizeResult(await client.getTask(
+        { tenant: "", id: taskId, historyLength },
+        { serviceParameters: { [JAMAI_AUTH_HEADER]: encodeSignedRequest(requestAuth) } },
+      )),
       null,
       2,
     ));
@@ -119,11 +136,22 @@ server.registerTool(
     inputSchema: {
       peerUrl: z.string().url(),
       taskId: z.string().min(1),
+      contextId: z.string().min(1),
     },
   },
-  async ({ peerUrl, taskId }) => {
+  async ({ peerUrl, taskId, contextId }) => {
     const client = await createClient(peerUrl);
-    const result = await client.cancelTask({ tenant: "", id: taskId, metadata: undefined });
+    const remote = await getRemoteIdentity(peerUrl);
+    const requestAuth = identity.signRequest({
+      audiencePeerId: remote.peerId,
+      action: "task.cancel",
+      taskId,
+      contextId,
+    });
+    const result = await client.cancelTask(
+      { tenant: "", id: taskId, metadata: undefined },
+      { serviceParameters: { [JAMAI_AUTH_HEADER]: encodeSignedRequest(requestAuth) } },
+    );
     store.appendAudit({
       eventType: "task.cancel-requested",
       principalId,
@@ -197,9 +225,11 @@ async function sendRemoteTask(input: {
 }): Promise<unknown> {
   try {
     const client = await createClient(input.peerUrl);
+    const remote = await getRemoteIdentity(input.peerUrl);
+    const messageId = randomUUID();
     const message: Message = {
       role: Role.ROLE_USER,
-      messageId: randomUUID(),
+      messageId,
       contextId: input.contextId ?? "",
       taskId: input.taskId ?? "",
       parts: [textPart(input.delegation.objective)],
@@ -207,9 +237,16 @@ async function sendRemoteTask(input: {
       metadata: {
         senderPeerId: localPeerId,
         delegation: input.delegation,
-        requestAuth: identity.sign({
-          delegation: input.delegation,
-          text: input.delegation.objective,
+        requestAuth: identity.signRequest({
+          audiencePeerId: remote.peerId,
+          action: input.taskId ? "task.continue" : "task.send",
+          messageId,
+          taskId: input.taskId,
+          contextId: input.contextId,
+          payload: {
+            delegation: input.delegation,
+            text: input.delegation.objective,
+          },
         }),
         ...(input.approvalId ? { approvalId: input.approvalId } : {}),
       },
@@ -296,6 +333,29 @@ function recordOutbound(
 async function createClient(peerUrl: string) {
   const factory = new ClientFactory({ transports: [new JsonRpcTransportFactory()] });
   return factory.createFromUrl(peerUrl);
+}
+
+async function getRemoteIdentity(peerUrl: string): Promise<{ peerId: string; publicKey: string }> {
+  const response = await fetch(new URL("/.well-known/agent-card.json", peerUrl));
+  if (!response.ok) throw new Error(`Remote Agent Card returned ${response.status}`);
+  const card = await response.json() as {
+    capabilities?: {
+      extensions?: Array<{ uri?: string; params?: Record<string, unknown> }>;
+    };
+  };
+  const extension = card.capabilities?.extensions?.find((item) => item.uri === JAMAI_EXTENSION_URI);
+  const peerId = extension?.params?.peerId;
+  const publicKey = extension?.params?.publicKey;
+  if (typeof peerId !== "string" || typeof publicKey !== "string") {
+    throw new Error("Remote gateway does not advertise a JustAskMyAI identity");
+  }
+  if (peerIdFromPublicKey(publicKey) !== peerId) {
+    throw new Error("Remote Agent Card peer ID does not match its public key");
+  }
+  if (!store.isPeerPaired(peerId, publicKey)) {
+    throw new Error("Remote gateway is not paired. Pair it through the local management API first.");
+  }
+  return { peerId, publicKey };
 }
 
 async function daemonFetch(path: string): Promise<unknown> {

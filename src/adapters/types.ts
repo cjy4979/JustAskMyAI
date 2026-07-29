@@ -3,11 +3,20 @@ export interface AgentRequest {
   contextId: string;
   taskId: string;
   signal: AbortSignal;
+  approvedScopes: string[];
 }
 
 export interface AgentResult {
   text: string;
   sessionId?: string;
+  permissionDecisions?: Array<{
+    toolCallId: string;
+    toolName?: string;
+    toolKind?: string;
+    allowed: boolean;
+    matchedScope?: string;
+    reason: string;
+  }>;
 }
 
 export interface AgentAdapter {

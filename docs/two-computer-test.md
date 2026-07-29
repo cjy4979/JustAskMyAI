@@ -27,11 +27,17 @@ npm run dev:node
 
 B chooses `JAMAI_AGENT_CWD`; A cannot choose an arbitrary directory on B.
 
-From A:
+From A, verify only the public Agent Card:
 
 ```powershell
-Invoke-RestMethod http://192.168.1.52:43122/health
-Invoke-RestMethod http://192.168.1.52:43122/api/capabilities
+Invoke-RestMethod http://192.168.1.52:43122/.well-known/agent-card.json
+```
+
+On B, verify the localhost-only management listener:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:43121/health
+Invoke-RestMethod http://127.0.0.1:43121/api/capabilities
 ```
 
 ## 2. Start A's gateway
@@ -40,20 +46,34 @@ Invoke-RestMethod http://192.168.1.52:43122/api/capabilities
 npm install
 npm run build
 $env:JAMAI_NAME="Alice's AI"
+$env:JAMAI_HOST="0.0.0.0"
 $env:JAMAI_PORT="43120"
+$env:JAMAI_PUBLIC_URL="http://192.168.1.51:43120"
 $env:JAMAI_POLICY="auto"
 npm run dev:node
 ```
 
-If mDNS has not found B:
+Pair B from A:
 
 ```powershell
 Invoke-RestMethod `
   -Method Post `
   -ContentType "application/json" `
-  -Uri http://127.0.0.1:43120/api/peers `
+  -Uri http://127.0.0.1:43121/api/peers `
   -Body '{"name":"Bob AI","url":"http://192.168.1.52:43122"}'
 ```
+
+Pair A from B:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -ContentType "application/json" `
+  -Uri http://127.0.0.1:43121/api/peers `
+  -Body '{"name":"Alice AI","url":"http://192.168.1.51:43120"}'
+```
+
+Pairing is a local human action. mDNS discovery alone does not grant trust.
 
 ## 3. Connect the MCP on A
 
@@ -66,7 +86,7 @@ node G:\JustAskMyAI\dist\src\mcp.js
 For a visible smoke test:
 
 ```powershell
-$env:JAMAI_DAEMON_URL="http://127.0.0.1:43120"
+$env:JAMAI_DAEMON_URL="http://127.0.0.1:43121"
 npx @modelcontextprotocol/inspector node dist/src/mcp.js
 ```
 
@@ -95,10 +115,10 @@ The first response is `INPUT_REQUIRED` with `approvalId`, `taskId`, and `context
 On B:
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:43122/api/approvals
+Invoke-RestMethod http://127.0.0.1:43121/api/approvals
 Invoke-RestMethod `
   -Method Post `
-  http://127.0.0.1:43122/api/approvals/<approvalId>/approve
+  http://127.0.0.1:43121/api/approvals/<approvalId>/approve
 ```
 
 On A call `continue_remote_task` using the exact original delegation fields plus its
@@ -119,9 +139,9 @@ previous turn. The artifact metadata should retain the same `agentSessionId`.
 On B:
 
 ```powershell
-Invoke-RestMethod "http://127.0.0.1:43122/api/tasks"
-Invoke-RestMethod "http://127.0.0.1:43122/api/audit?taskId=<taskId>"
-Invoke-RestMethod "http://127.0.0.1:43122/api/audit/verify"
+Invoke-RestMethod "http://127.0.0.1:43121/api/tasks"
+Invoke-RestMethod "http://127.0.0.1:43121/api/audit?taskId=<taskId>"
+Invoke-RestMethod "http://127.0.0.1:43121/api/audit/verify"
 ```
 
 The final verification should return `"valid": true`.

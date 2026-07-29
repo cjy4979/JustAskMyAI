@@ -8,9 +8,19 @@ import {
 import { canonicalJson, type DelegatedTask } from "./delegated-task.js";
 import type { GatewayStore } from "../storage/sqlite.js";
 
+export const JAMAI_EXTENSION_URI = "urn:justaskmyai:delegation:v1";
+export const JAMAI_AUTH_HEADER = "x-jamai-auth";
+
+export type SignedAction = "task.send" | "task.continue" | "task.get" | "task.cancel";
+
 export interface SignedRequest {
   version: 1;
-  peerId: string;
+  issuerPeerId: string;
+  audiencePeerId: string;
+  action: SignedAction;
+  messageId?: string;
+  taskId?: string;
+  contextId?: string;
   publicKey: string;
   sentAt: string;
   nonce: string;
@@ -18,9 +28,13 @@ export interface SignedRequest {
   signature: string;
 }
 
-interface SignedPayload {
-  delegation: DelegatedTask;
-  text: string;
+export interface SignRequestInput {
+  audiencePeerId: string;
+  action: SignedAction;
+  messageId?: string;
+  taskId?: string;
+  contextId?: string;
+  payload?: unknown;
 }
 
 export class GatewayIdentity {
@@ -43,13 +57,29 @@ export class GatewayIdentity {
     }
     this.peerId = peerIdFromPublicKey(this.publicKey);
     store.setMeta("peerId", this.peerId);
+    store.pairPeer({
+      peerId: this.peerId,
+      publicKey: this.publicKey,
+      name: "This gateway",
+    });
   }
 
-  sign(payload: SignedPayload): SignedRequest {
+  signRequest(input: SignRequestInput): SignedRequest {
     const sentAt = new Date().toISOString();
     const nonce = randomUUID();
-    const payloadHash = digestPayload(payload);
-    const body = { version: 1 as const, peerId: this.peerId, sentAt, nonce, payloadHash };
+    const payloadHash = digestPayload(input.payload);
+    const body = {
+      version: 1 as const,
+      issuerPeerId: this.peerId,
+      audiencePeerId: input.audiencePeerId,
+      action: input.action,
+      messageId: input.messageId,
+      taskId: input.taskId,
+      contextId: input.contextId,
+      sentAt,
+      nonce,
+      payloadHash,
+    };
     return {
       ...body,
       publicKey: this.publicKey,
@@ -60,89 +90,171 @@ export class GatewayIdentity {
 
 export function verifySignedRequest(
   value: unknown,
-  payload: SignedPayload,
+  expected: {
+    audiencePeerId: string;
+    action: SignedAction;
+    messageId?: string;
+    taskId?: string;
+    contextId?: string;
+    payload?: unknown;
+  },
   store: GatewayStore,
   nowMs = Date.now(),
-): { ok: true; peerId: string } | { ok: false; reason: string } {
-  if (!value || typeof value !== "object") return { ok: false, reason: "missing request signature" };
-  const raw = value as Record<string, unknown>;
+): { ok: true; peerId: string; request: SignedRequest } | { ok: false; reason: string } {
+  const parsed = parseSignedRequest(value);
+  if (!parsed) return { ok: false, reason: "missing or malformed request signature" };
+  if (peerIdFromPublicKey(parsed.publicKey) !== parsed.issuerPeerId) {
+    return { ok: false, reason: "issuer peer ID does not match public key" };
+  }
+  if (parsed.audiencePeerId !== expected.audiencePeerId) {
+    return { ok: false, reason: "request signature targets a different gateway" };
+  }
   if (
-    raw.version !== 1
-    || typeof raw.peerId !== "string"
-    || typeof raw.publicKey !== "string"
-    || typeof raw.sentAt !== "string"
-    || typeof raw.nonce !== "string"
-    || typeof raw.payloadHash !== "string"
-    || typeof raw.signature !== "string"
+    parsed.action !== expected.action
+    || parsed.messageId !== expected.messageId
+    || parsed.taskId !== expected.taskId
+    || parsed.contextId !== expected.contextId
   ) {
-    return { ok: false, reason: "malformed request signature" };
+    return { ok: false, reason: "signed action or resource binding does not match request" };
   }
-  if (peerIdFromPublicKey(raw.publicKey) !== raw.peerId) {
-    return { ok: false, reason: "peer ID does not match public key" };
-  }
-  const sentAt = Date.parse(raw.sentAt);
+  const sentAt = Date.parse(parsed.sentAt);
   if (!Number.isFinite(sentAt) || Math.abs(nowMs - sentAt) > 5 * 60_000) {
     return { ok: false, reason: "request signature is outside the five-minute time window" };
   }
-  if (digestPayload(payload) !== raw.payloadHash) {
+  if (digestPayload(expected.payload) !== parsed.payloadHash) {
     return { ok: false, reason: "signed payload digest does not match request" };
   }
-  const body = {
-    version: 1,
-    peerId: raw.peerId,
-    sentAt: raw.sentAt,
-    nonce: raw.nonce,
-    payloadHash: raw.payloadHash,
-  };
+  const body = signingBody(parsed);
   let valid = false;
   try {
     valid = verify(
       null,
       Buffer.from(canonicalJson(body)),
-      raw.publicKey,
-      Buffer.from(raw.signature, "base64"),
+      parsed.publicKey,
+      Buffer.from(parsed.signature, "base64"),
     );
   } catch {
     return { ok: false, reason: "invalid public key or signature encoding" };
   }
   if (!valid) return { ok: false, reason: "request signature verification failed" };
-  if (!store.acceptPeerKey(raw.peerId, raw.publicKey)) {
-    return { ok: false, reason: "peer key conflicts with previously observed identity" };
+  if (!store.isPeerPaired(parsed.issuerPeerId, parsed.publicKey)) {
+    return { ok: false, reason: "issuer peer is not explicitly paired with this gateway" };
   }
-  if (!store.consumeRequestNonce(raw.peerId, raw.nonce, raw.sentAt)) {
+  if (!store.consumeRequestNonce(parsed.issuerPeerId, parsed.nonce, parsed.sentAt)) {
     return { ok: false, reason: "request nonce has already been used" };
   }
-  return { ok: true, peerId: raw.peerId };
+  return { ok: true, peerId: parsed.issuerPeerId, request: parsed };
+}
+
+export function encodeSignedRequest(value: SignedRequest): string {
+  return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+}
+
+export function decodeSignedRequest(value: string | string[] | undefined): unknown {
+  if (typeof value !== "string") return undefined;
+  try {
+    return JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+  } catch {
+    return undefined;
+  }
 }
 
 export function peerIdFromPublicKey(publicKey: string): string {
   return `peer_${createHash("sha256").update(publicKey).digest("hex").slice(0, 32)}`;
 }
 
-function digestPayload(payload: SignedPayload): string {
-  const normalized = {
-    text: payload.text,
-    delegation: {
-      version: payload.delegation.version,
-      delegationId: payload.delegation.delegationId,
-      mode: payload.delegation.mode,
-      objective: payload.delegation.objective,
-      role: payload.delegation.role ?? null,
-      context: payload.delegation.context ?? null,
-      acceptanceCriteria: payload.delegation.acceptanceCriteria ?? [],
-      expectedResult: payload.delegation.expectedResult
-        ? {
-            type: payload.delegation.expectedResult.type,
-            mediaTypes: payload.delegation.expectedResult.mediaTypes ?? [],
-          }
-        : null,
-      authority: payload.delegation.authority
-        ? {
-            allowed: payload.delegation.authority.allowed,
-            denied: payload.delegation.authority.denied,
-          }
-        : null,
-    },
+function parseSignedRequest(value: unknown): SignedRequest | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as Record<string, unknown>;
+  if (
+    raw.version !== 1
+    || typeof raw.issuerPeerId !== "string"
+    || typeof raw.audiencePeerId !== "string"
+    || !["task.send", "task.continue", "task.get", "task.cancel"].includes(String(raw.action))
+    || typeof raw.publicKey !== "string"
+    || typeof raw.sentAt !== "string"
+    || typeof raw.nonce !== "string"
+    || typeof raw.payloadHash !== "string"
+    || typeof raw.signature !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    version: 1,
+    issuerPeerId: raw.issuerPeerId,
+    audiencePeerId: raw.audiencePeerId,
+    action: raw.action as SignedAction,
+    messageId: optionalString(raw.messageId),
+    taskId: optionalString(raw.taskId),
+    contextId: optionalString(raw.contextId),
+    publicKey: raw.publicKey,
+    sentAt: raw.sentAt,
+    nonce: raw.nonce,
+    payloadHash: raw.payloadHash,
+    signature: raw.signature,
   };
-  return createHash("sha256").update(canonicalJson(normalized)).digest("hex");
+}
+
+function signingBody(value: SignedRequest): Omit<SignedRequest, "publicKey" | "signature"> {
+  return {
+    version: value.version,
+    issuerPeerId: value.issuerPeerId,
+    audiencePeerId: value.audiencePeerId,
+    action: value.action,
+    messageId: value.messageId,
+    taskId: value.taskId,
+    contextId: value.contextId,
+    sentAt: value.sentAt,
+    nonce: value.nonce,
+    payloadHash: value.payloadHash,
+  };
+}
+
+function digestPayload(payload: unknown): string {
+  return createHash("sha256").update(canonicalJson(normalizePayload(payload))).digest("hex");
+}
+
+function normalizePayload(payload: unknown): unknown {
+  if (!isDelegationPayload(payload)) return payload ?? null;
+  return {
+    text: payload.text,
+    delegation: normalizeDelegation(payload.delegation),
+  };
+}
+
+function normalizeDelegation(delegation: DelegatedTask): unknown {
+  return {
+    version: delegation.version,
+    delegationId: delegation.delegationId,
+    mode: delegation.mode,
+    objective: delegation.objective,
+    role: delegation.role ?? null,
+    context: delegation.context ?? null,
+    acceptanceCriteria: delegation.acceptanceCriteria ?? [],
+    expectedResult: delegation.expectedResult
+      ? {
+          type: delegation.expectedResult.type,
+          mediaTypes: delegation.expectedResult.mediaTypes ?? [],
+        }
+      : null,
+    authority: delegation.authority
+      ? {
+          allowed: delegation.authority.allowed,
+          denied: delegation.authority.denied,
+        }
+      : null,
+  };
+}
+
+function isDelegationPayload(value: unknown): value is { delegation: DelegatedTask; text: string } {
+  return Boolean(
+    value
+    && typeof value === "object"
+    && "delegation" in value
+    && "text" in value,
+  );
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
 }

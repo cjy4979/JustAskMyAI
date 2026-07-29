@@ -2,6 +2,7 @@ import * as acp from "@agentclientprotocol/sdk";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import type { AgentAdapter, AgentRequest, AgentResult } from "./types.js";
+import { matchingToolScope } from "../policy/tool-scope.js";
 
 export interface AcpAdapterOptions {
   command: string;
@@ -17,6 +18,8 @@ interface AcpRuntime {
   stderr: string;
   chunks: string[];
   queue: Promise<void>;
+  approvedScopes: Set<string>;
+  permissionDecisions: NonNullable<AgentResult["permissionDecisions"]>;
 }
 
 /**
@@ -37,6 +40,8 @@ export class AcpAdapter implements AgentAdapter {
     runtime.queue = new Promise<void>((resolve) => { release = resolve; });
     await previous;
     runtime.chunks = [];
+    runtime.approvedScopes = new Set(request.approvedScopes);
+    runtime.permissionDecisions = [];
     const abort = () => {
       void runtime.connection.cancel({ sessionId: runtime.sessionId });
     };
@@ -52,6 +57,7 @@ export class AcpAdapter implements AgentAdapter {
       return {
         text: runtime.chunks.join("").trim(),
         sessionId: runtime.sessionId,
+        permissionDecisions: runtime.permissionDecisions,
       };
     } catch (error) {
       const stderr = runtime.stderr.trim();
@@ -93,6 +99,8 @@ export class AcpAdapter implements AgentAdapter {
     runtime.stderr = "";
     runtime.chunks = [];
     runtime.queue = Promise.resolve();
+    runtime.approvedScopes = new Set();
+    runtime.permissionDecisions = [];
     child.stderr.setEncoding("utf8").on("data", (chunk) => {
       runtime.stderr += String(chunk);
     });
@@ -107,9 +115,25 @@ export class AcpAdapter implements AgentAdapter {
       Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
     );
     const client: acp.Client = {
-      requestPermission: async ({ options }) => {
-        const desiredKind = this.options.allowToolPermissions ? "allow_once" : "reject_once";
+      requestPermission: async ({ options, toolCall }) => {
+        const scope = matchingToolScope(toolCall.kind, toolCall.name, runtime.approvedScopes);
+        const allowed = Boolean(this.options.allowToolPermissions && scope);
+        const desiredKind = allowed ? "allow_once" : "reject_once";
         const option = options.find((item) => item.kind === desiredKind);
+        runtime.permissionDecisions.push({
+          toolCallId: toolCall.toolCallId,
+          toolName: toolCall.name ?? undefined,
+          toolKind: toolCall.kind ?? undefined,
+          allowed: Boolean(allowed && option),
+          matchedScope: scope,
+          reason: !this.options.allowToolPermissions
+            ? "local ACP tool permissions are disabled"
+            : !scope
+              ? "tool action is outside approved scopes"
+              : option
+                ? `matched approved scope ${scope}`
+                : "agent did not offer the required permission option",
+        });
         return option
           ? { outcome: { outcome: "selected", optionId: option.optionId } }
           : { outcome: { outcome: "cancelled" } };

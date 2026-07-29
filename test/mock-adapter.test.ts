@@ -8,6 +8,7 @@ test("mock adapter preserves context", async () => {
     contextId: "ctx-1",
     taskId: "task-1",
     signal: new AbortController().signal,
+    approvedScopes: [],
   });
   assert.match(result.text, /hello/);
   assert.equal(result.sessionId, "ctx-1");

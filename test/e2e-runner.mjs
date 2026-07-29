@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { GatewayIdentity } from "../dist/src/protocol/signed-request.js";
 import { GatewayStore } from "../dist/src/storage/sqlite.js";
 
-const requesterStore = new GatewayStore(":memory:");
+const requesterStore = new GatewayStore();
 const requesterIdentity = new GatewayIdentity(requesterStore);
 
 const child = spawn(process.execPath, ["dist/src/daemon.js"], {
@@ -21,7 +21,7 @@ try {
   let health;
   for (let attempt = 0; attempt < 40; attempt += 1) {
     try {
-      const response = await fetch("http://127.0.0.1:43120/health");
+      const response = await fetch("http://127.0.0.1:43121/health");
       if (response.ok) {
         health = await response.json();
         break;
@@ -34,6 +34,7 @@ try {
 
   const cardResponse = await fetch("http://127.0.0.1:43120/.well-known/agent-card.json");
   const card = await cardResponse.json();
+  const remotePeerId = card.capabilities.extensions[0].params.peerId;
   const client = await new ClientFactory({
     transports: [new JsonRpcTransportFactory()],
   }).createFromUrl("http://127.0.0.1:43120");
@@ -66,9 +67,11 @@ try {
     acceptanceCriteria: ["Return a verified work report"],
     expectedResult: { type: "report" },
   };
-  const delegationMessage = (contextId = "", taskId = "", approvalId) => ({
+  const delegationMessage = (contextId = "", taskId = "", approvalId) => {
+    const messageId = randomUUID();
+    return {
       role: Role.ROLE_USER,
-      messageId: randomUUID(),
+      messageId,
       contextId,
       taskId,
       parts: [{
@@ -80,15 +83,23 @@ try {
       metadata: {
         senderPeerId: requesterIdentity.peerId,
         delegation: delegatedTask,
-        requestAuth: requesterIdentity.sign({
-          delegation: delegatedTask,
-          text: "add a test",
+        requestAuth: requesterIdentity.signRequest({
+          audiencePeerId: remotePeerId,
+          action: taskId ? "task.continue" : "task.send",
+          messageId,
+          taskId: taskId || undefined,
+          contextId: contextId || undefined,
+          payload: {
+            delegation: delegatedTask,
+            text: "add a test",
+          },
         }),
         ...(approvalId ? { approvalId } : {}),
       },
       extensions: [],
       referenceTaskIds: [],
-  });
+    };
+  };
   const initialDelegation = await client.sendMessage({
     tenant: "",
     message: delegationMessage(),
@@ -100,7 +111,7 @@ try {
     throw new Error(`delegation did not request owner consent: ${JSON.stringify(initialDelegation)}`);
   }
   const approvalResponse = await fetch(
-    `http://127.0.0.1:43120/api/approvals/${approvalId}/approve`,
+    `http://127.0.0.1:43121/api/approvals/${approvalId}/approve`,
     { method: "POST" },
   );
   if (!approvalResponse.ok) throw new Error("owner approval endpoint failed");

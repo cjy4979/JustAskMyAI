@@ -19,14 +19,18 @@ perform bounded work within that authority.
 - Local Ed25519 identities, signed requests, a five-minute validity window, and nonce replay protection
 - Human consent bound to an exact peer, task, context, and request digest
 - Single-use, expiring approvals
-- Persistent ACP agent sessions mapped by A2A `contextId`
-- SQLite persistence for tasks, approvals, agent sessions, artifacts, and audit events
+- Context-bound ACP session continuity while the gateway process remains alive
+- SQLite persistence for A2A tasks, approvals, agent session mappings, artifacts, and audit events
 - Metadata, redacted, and full-local audit modes
 - A tamper-evident audit hash chain
 - LAN discovery through mDNS or manual peer registration
+- Explicit local-owner pairing against the remote Agent Card key
+- Separate public A2A and localhost-only management listeners
+- Signed and audience-bound send, continue, get, and cancel operations
+- ACP tool permission enforcement against approved scopes and local policy
 
 The public relay remains experimental. Do not expose a gateway to an untrusted public
-network until explicit pairing, end-to-end relay encryption, identity revocation, and
+network until end-to-end relay encryption, identity revocation, and
 rate limiting are implemented.
 
 ## Run
@@ -43,7 +47,8 @@ npm run dev:node
 npm run dev:mcp
 ```
 
-The default gateway URL is `http://127.0.0.1:43120`.
+The default public A2A URL is `http://127.0.0.1:43120`. Local management is
+available only at `http://127.0.0.1:43121`.
 
 To connect an existing ACP-compatible agent:
 
@@ -56,8 +61,17 @@ npm run dev:node
 ```
 
 ACP tool permissions are denied unless the local owner explicitly sets
-`JAMAI_ACP_ALLOW_TOOLS=true`. A remote requester cannot select the local workspace or
-override the owner's policy.
+`JAMAI_ACP_ALLOW_TOOLS=true`. Even then, each requested ACP tool kind must match an
+approved scope such as `read-workspace`, `edit-workspace`, `run-tests`, `network`,
+`tool:<kind>`, or `tool:<name>`. A remote requester cannot select the local workspace
+or override the owner's policy.
+
+## Current limitations
+
+- SQLite records ACP session IDs, but ACP sessions are not resumed after gateway restart.
+- The audit hash chain detects local modification but is not non-repudiable; signed external
+  checkpoints are not implemented yet.
+- Pairing is explicit, but peer revocation and key rotation are not implemented yet.
 
 ## MCP tools
 

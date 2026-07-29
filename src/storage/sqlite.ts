@@ -117,19 +117,46 @@ export class GatewayStore {
     `).run(key, value);
   }
 
-  acceptPeerKey(peerId: string, publicKey: string): boolean {
+  pairPeer(input: {
+    peerId: string;
+    publicKey: string;
+    name?: string;
+    url?: string;
+  }): void {
+    const now = new Date().toISOString();
     const existing = this.db.prepare("SELECT public_key FROM peer_identities WHERE peer_id = ?")
-      .get(peerId) as { public_key: string } | undefined;
-    if (existing) {
-      if (existing.public_key !== publicKey) return false;
-      this.db.prepare("UPDATE peer_identities SET last_seen_at = ? WHERE peer_id = ?")
-        .run(new Date().toISOString(), peerId);
-      return true;
+      .get(input.peerId) as { public_key: string } | undefined;
+    if (existing && existing.public_key !== input.publicKey) {
+      throw new Error("peer ID is already paired to a different public key");
     }
     this.db.prepare(`
-      INSERT INTO peer_identities (peer_id, public_key, first_seen_at, last_seen_at)
-      VALUES (?, ?, ?, ?)
-    `).run(peerId, publicKey, new Date().toISOString(), new Date().toISOString());
+      INSERT INTO peer_identities (
+        peer_id, public_key, name, url, trust_status, first_seen_at, last_seen_at
+      ) VALUES (?, ?, ?, ?, 'paired', ?, ?)
+      ON CONFLICT(peer_id) DO UPDATE SET
+        name = COALESCE(excluded.name, peer_identities.name),
+        url = COALESCE(excluded.url, peer_identities.url),
+        trust_status = 'paired',
+        last_seen_at = excluded.last_seen_at
+    `).run(
+      input.peerId,
+      input.publicKey,
+      input.name ?? null,
+      input.url ?? null,
+      now,
+      now,
+    );
+  }
+
+  isPeerPaired(peerId: string, publicKey: string): boolean {
+    const existing = this.db.prepare(`
+      SELECT public_key, trust_status FROM peer_identities WHERE peer_id = ?
+    `).get(peerId) as { public_key: string; trust_status: string } | undefined;
+    if (!existing || existing.public_key !== publicKey || existing.trust_status !== "paired") {
+      return false;
+    }
+    this.db.prepare("UPDATE peer_identities SET last_seen_at = ? WHERE peer_id = ?")
+      .run(new Date().toISOString(), peerId);
     return true;
   }
 
@@ -445,6 +472,16 @@ export class GatewayStore {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS a2a_tasks (
+        tenant TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        context_id TEXT NOT NULL,
+        state INTEGER NOT NULL,
+        task_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (tenant, task_id)
+      );
+
       CREATE TABLE IF NOT EXISTS approval_grants (
         id TEXT PRIMARY KEY,
         peer_id TEXT NOT NULL,
@@ -471,6 +508,9 @@ export class GatewayStore {
       CREATE TABLE IF NOT EXISTS peer_identities (
         peer_id TEXT PRIMARY KEY,
         public_key TEXT NOT NULL,
+        name TEXT,
+        url TEXT,
+        trust_status TEXT NOT NULL DEFAULT 'unpaired',
         first_seen_at TEXT NOT NULL,
         last_seen_at TEXT NOT NULL
       );
@@ -524,6 +564,15 @@ export class GatewayStore {
       CREATE INDEX IF NOT EXISTS idx_approvals_task ON approval_grants(task_id);
       CREATE INDEX IF NOT EXISTS idx_audit_task ON audit_events(task_id, sequence);
     `);
+    this.ensureColumn("peer_identities", "name", "TEXT");
+    this.ensureColumn("peer_identities", "url", "TEXT");
+    this.ensureColumn("peer_identities", "trust_status", "TEXT NOT NULL DEFAULT 'unpaired'");
+  }
+
+  private ensureColumn(table: string, column: string, definition: string): void {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (columns.some((item) => item.name === column)) return;
+    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 }
 

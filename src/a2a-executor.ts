@@ -29,7 +29,7 @@ export class BridgeExecutor implements AgentExecutor {
     private readonly adapter: AgentAdapter,
     private readonly approvals: ApprovalPolicy,
     private readonly store: GatewayStore,
-    private readonly identity: { principalId: string; agentId: string },
+    private readonly identity: { peerId: string; principalId: string; agentId: string },
   ) {}
 
   async execute(context: RequestContext, bus: ExecutionEventBus): Promise<void> {
@@ -41,7 +41,14 @@ export class BridgeExecutor implements AgentExecutor {
       ? buildDelegationPrompt(delegation)
       : rawPrompt;
     const signedIdentity = delegation
-      ? verifySignedRequest(metadata.requestAuth, { delegation, text: rawPrompt }, this.store)
+      ? verifySignedRequest(metadata.requestAuth, {
+          audiencePeerId: this.identity.peerId,
+          action: context.task ? "task.continue" : "task.send",
+          messageId: userMessage.messageId,
+          taskId: context.task ? taskId : undefined,
+          contextId: context.task ? contextId : undefined,
+          payload: { delegation, text: rawPrompt },
+        }, this.store)
       : { ok: false as const, reason: "missing or malformed delegation envelope" };
     const peerId = signedIdentity.ok ? signedIdentity.peerId : "unverified-peer";
     const approvalId = typeof metadata.approvalId === "string" ? metadata.approvalId : undefined;
@@ -208,7 +215,35 @@ export class BridgeExecutor implements AgentExecutor {
     const controller = new AbortController();
     this.controllers.set(taskId, controller);
     try {
-      const result = await this.adapter.run({ prompt, taskId, contextId, signal: controller.signal });
+      const approvedScopes = this.approvals.effectiveScopes(
+        consumedApproval,
+        delegation?.authority?.allowed ?? [],
+      );
+      const result = await this.adapter.run({
+        prompt,
+        taskId,
+        contextId,
+        signal: controller.signal,
+        approvedScopes,
+      });
+      for (const decision of result.permissionDecisions ?? []) {
+        this.audit("tool.policy-decision", {
+          peerId,
+          taskId,
+          contextId,
+          delegationId: delegation?.delegationId,
+          approvalId: consumedApproval?.id,
+          action: decision.toolName ?? decision.toolKind ?? "unknown-tool",
+          resource: decision.toolCallId,
+          decision: decision.allowed ? "allowed" : "denied",
+          decisionReason: decision.reason,
+          metadata: {
+            toolKind: decision.toolKind,
+            matchedScope: decision.matchedScope,
+            approvedScopes,
+          },
+        });
+      }
       if (result.sessionId) {
         this.store.upsertAgentSession({
           contextId,

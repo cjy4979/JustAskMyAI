@@ -27,4 +27,8 @@ export class ApprovalPolicy {
   resolve(id: string, decision: "approved" | "denied"): StoredApproval | undefined {
     return this.store.resolveApproval(id, decision);
   }
+
+  effectiveScopes(approval: StoredApproval | undefined, requestedScopes: string[]): string[] {
+    return this.mode === "auto" ? requestedScopes : approval?.approvedScopes ?? [];
+  }
 }

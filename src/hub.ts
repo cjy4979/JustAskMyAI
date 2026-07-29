@@ -14,7 +14,7 @@ interface Route {
   envelope: unknown;
 }
 
-const port = Number(process.env.JAMAI_HUB_PORT ?? 43121);
+const port = Number(process.env.JAMAI_HUB_PORT ?? 43130);
 const nodes = new Map<string, WebSocket>();
 const groups = new Map<string, Set<string>>();
 const server = createServer((_req, res) => {
