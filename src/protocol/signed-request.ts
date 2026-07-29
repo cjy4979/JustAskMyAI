@@ -17,7 +17,12 @@ export type SignedAction =
   | "task.continue"
   | "task.get"
   | "task.cancel"
-  | "group.manifest.get";
+  | "group.manifest.get"
+  | "session.open"
+  | "session.message"
+  | "session.get"
+  | "session.close"
+  | "writeback.propose";
 
 export interface SignedRequest {
   version: 1;
@@ -258,6 +263,11 @@ function parseSignedRequest(value: unknown): SignedRequest | undefined {
       "task.get",
       "task.cancel",
       "group.manifest.get",
+      "session.open",
+      "session.message",
+      "session.get",
+      "session.close",
+      "writeback.propose",
     ].includes(String(raw.action))
     || typeof raw.publicKey !== "string"
     || typeof raw.sentAt !== "string"

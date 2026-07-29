@@ -9,16 +9,22 @@ import type { GatewayStore } from "../storage/sqlite.js";
 import {
   GROUP_OPERATIONS,
   type AgentSponsorship,
+  type ApprovalProof,
   type DisclosureEnvelope,
   type GroupEnvelope,
   type GroupManifest,
+  type GroupMember,
   type GroupOperation,
   type GroupReceipt,
   type GroupTarget,
   type SignedGroupManifest,
   type Workgroup,
   type GroupThread,
+  type GovernanceChange,
+  type OwnerTransferAcceptance,
+  type SignedGovernanceProposal,
 } from "./types.js";
+import { flattenJsonLeaves, validateJsonPath } from "./disclosure.js";
 
 export function digestValue(value: unknown): string {
   return createHash("sha256").update(canonicalJson(value)).digest("hex");
@@ -82,12 +88,85 @@ export function verifySponsorship(
   return { ok: true };
 }
 
+export function createOwnerTransferAcceptance(input: {
+  groupId: string;
+  baseManifestDigest: string;
+  fromOwnerMemberId: string;
+  toOwnerMemberId: string;
+}, signer: Pick<GatewayIdentity, "signStatement">): OwnerTransferAcceptance {
+  const body = {
+    version: 1 as const,
+    ...input,
+    acceptedAt: new Date().toISOString(),
+  };
+  return { ...body, proof: signer.signStatement(body) };
+}
+
+export function ownerTransferBody(
+  acceptance: OwnerTransferAcceptance,
+): Omit<OwnerTransferAcceptance, "proof"> {
+  const { proof: _proof, ...body } = acceptance;
+  return body;
+}
+
+export function createGovernanceProposal(input: {
+  groupId: string;
+  baseManifestDigest: string;
+  proposedByMemberId: string;
+  change: GovernanceChange;
+}, signer: Pick<GatewayIdentity, "signStatement">): SignedGovernanceProposal {
+  const body = {
+    version: 1 as const,
+    id: randomUUID(),
+    ...input,
+    createdAt: new Date().toISOString(),
+  };
+  return { ...body, proof: signer.signStatement(body) };
+}
+
+export function governanceProposalBody(
+  proposal: SignedGovernanceProposal,
+): Omit<SignedGovernanceProposal, "proof"> {
+  const { proof: _proof, ...body } = proposal;
+  return body;
+}
+
+export function verifyGovernanceProposal(input: {
+  proposal: SignedGovernanceProposal;
+  manifest: SignedGroupManifest;
+  store: GatewayStore;
+}): { ok: true } | { ok: false; reason: string } {
+  const { proposal, manifest, store } = input;
+  if (
+    proposal.version !== 1
+    || proposal.groupId !== manifest.manifest.workgroup.id
+    || proposal.baseManifestDigest !== manifest.manifestDigest
+  ) {
+    return { ok: false, reason: "governance proposal does not target the installed manifest" };
+  }
+  const member = manifest.manifest.members.find((candidate) =>
+    candidate.id === proposal.proposedByMemberId
+    && candidate.status === "active"
+    && candidate.roles.some((role) => role === "admin" || role === "owner"));
+  if (!member) return { ok: false, reason: "proposal signer is not an active Admin or Owner" };
+  const verified = verifySignedStatement(
+    proposal.proof,
+    governanceProposalBody(proposal),
+    store,
+  );
+  if (!verified.ok) return verified;
+  return verified.peerId === member.gatewayPeerId
+    ? { ok: true }
+    : { ok: false, reason: "proposal proof does not match the proposing member" };
+}
+
 export function signGroupManifest(input: {
   manifest: GroupManifest;
   previousManifestDigest?: string;
   issuedByMemberId: string;
   validForMs: number;
   issuedAt?: string;
+  ownerTransferAcceptance?: OwnerTransferAcceptance;
 }, signer: Pick<GatewayIdentity, "signStatement">): SignedGroupManifest {
   const issuedAt = input.issuedAt ?? new Date().toISOString();
   const body = {
@@ -98,6 +177,7 @@ export function signGroupManifest(input: {
     issuedByMemberId: input.issuedByMemberId,
     issuedAt,
     validUntil: new Date(Date.now() + input.validForMs).toISOString(),
+    ownerTransferAcceptance: input.ownerTransferAcceptance,
   };
   return { ...body, proof: signer.signStatement(body) };
 }
@@ -134,19 +214,23 @@ export function verifySignedGroupManifest(input: {
   }
   const proof = verifySignedStatement(signed.proof, signedManifestBody(signed), store);
   if (!proof.ok) return proof;
-  const issuer = signed.manifest.members.find((member) =>
+  const nextIssuer = signed.manifest.members.find((member) =>
     member.id === signed.issuedByMemberId && member.status === "active");
+  const activeOwners = signed.manifest.members.filter((member) =>
+    member.status === "active" && member.roles.includes("owner"));
   if (
-    !issuer
-    || issuer.gatewayPeerId !== proof.peerId
-    || !issuer.roles.some((role) => role === "owner" || role === "admin")
+    activeOwners.length === 0
+    || !activeOwners.some((member) =>
+      member.principalId === signed.manifest.workgroup.ownerPrincipalId)
   ) {
-    return { ok: false, reason: "manifest issuer is not an active Owner or Admin" };
+    return { ok: false, reason: "manifest violates active Group Owner invariants" };
   }
   if (!current) {
     if (
-      !issuer.roles.includes("owner")
-      || issuer.principalId !== signed.manifest.workgroup.ownerPrincipalId
+      !nextIssuer
+      || nextIssuer.gatewayPeerId !== proof.peerId
+      || !nextIssuer.roles.includes("owner")
+      || nextIssuer.principalId !== signed.manifest.workgroup.ownerPrincipalId
     ) {
       return { ok: false, reason: "initial manifest must be signed by the Group Owner" };
     }
@@ -158,12 +242,50 @@ export function verifySignedGroupManifest(input: {
       member.id === signed.issuedByMemberId
       && member.status === "active"
       && member.gatewayPeerId === proof.peerId
-      && member.roles.some((role) => role === "owner" || role === "admin"));
+      && member.roles.includes("owner")
+      && member.principalId === current.manifest.workgroup.ownerPrincipalId);
     if (!currentIssuer) {
-      return { ok: false, reason: "manifest issuer was not authorized by the previous manifest" };
+      return { ok: false, reason: "manifest issuer was not the Owner in the previous manifest" };
     }
     const oldGroup = current.manifest.workgroup;
     const nextGroup = signed.manifest.workgroup;
+    const ownerChanged = oldGroup.ownerPrincipalId !== nextGroup.ownerPrincipalId;
+    if (ownerChanged) {
+      const oldOwner = currentIssuer;
+      const newOwner = activeOwners.find((member) =>
+        member.principalId === nextGroup.ownerPrincipalId);
+      const acceptance = signed.ownerTransferAcceptance;
+      if (
+        !newOwner
+        || !acceptance
+        || acceptance.groupId !== nextGroup.id
+        || acceptance.baseManifestDigest !== current.manifestDigest
+        || acceptance.fromOwnerMemberId !== oldOwner.id
+        || acceptance.toOwnerMemberId !== newOwner.id
+      ) {
+        return { ok: false, reason: "Owner transfer lacks a transition-bound acceptance proof" };
+      }
+      const accepted = verifySignedStatement(
+        acceptance.proof,
+        ownerTransferBody(acceptance),
+        store,
+      );
+      if (!accepted.ok || accepted.peerId !== newOwner.gatewayPeerId) {
+        return {
+          ok: false,
+          reason: accepted.ok
+            ? "Owner transfer acceptance signer does not match the new Owner"
+            : accepted.reason,
+        };
+      }
+    } else if (
+      !nextIssuer
+      || nextIssuer.gatewayPeerId !== proof.peerId
+      || !nextIssuer.roles.includes("owner")
+      || nextIssuer.principalId !== nextGroup.ownerPrincipalId
+    ) {
+      return { ok: false, reason: "manifest issuer is not the continuing primary Group Owner" };
+    }
     if (signed.manifestDigest === current.manifestDigest) {
       if (
         nextGroup.policyVersion !== oldGroup.policyVersion
@@ -181,6 +303,9 @@ export function verifySignedGroupManifest(input: {
         || policyDelta + membershipDelta !== 1
       ) {
         return { ok: false, reason: "manifest changes must advance exactly one governance version" };
+      }
+      if (ownerChanged && (policyDelta !== 0 || membershipDelta !== 1)) {
+        return { ok: false, reason: "Owner transfer must be one atomic membership change" };
       }
     }
   }
@@ -200,17 +325,111 @@ export function verifySignedGroupManifest(input: {
 
 export function createDisclosureEnvelope(
   context: unknown,
-  fields: string[],
-  redactedFields: string[],
+  paths: string[],
+  redactedPaths: string[],
   approvalDigest?: string,
 ): DisclosureEnvelope {
   return {
-    version: 1,
-    fields: [...new Set(fields)].sort(),
-    redactedFields: [...new Set(redactedFields)].sort(),
+    version: 2,
+    paths: [...new Set(paths.map(validateJsonPath))].sort(),
+    redactedPaths: [...new Set(redactedPaths.map(validateJsonPath))].sort(),
     contextDigest: digestValue(context ?? null),
     approvalDigest,
   };
+}
+
+export function createApprovalProof(input: {
+  taskDigest: string;
+  approverPrincipalId: string;
+  approverMemberId: string;
+  approvedScopes: string[];
+  deniedScopes: string[];
+}, signer: Pick<GatewayIdentity, "signStatement">): ApprovalProof {
+  const body = {
+    version: 1 as const,
+    ...input,
+    approvedScopes: [...new Set(input.approvedScopes)],
+    deniedScopes: [...new Set(input.deniedScopes)],
+    signedAt: new Date().toISOString(),
+  };
+  return { ...body, proof: signer.signStatement(body) };
+}
+
+export function approvalProofBody(
+  approval: ApprovalProof,
+): Omit<ApprovalProof, "proof"> {
+  const { proof: _proof, ...body } = approval;
+  return body;
+}
+
+export function verifyApprovalProof(input: {
+  approval: ApprovalProof;
+  taskDigest: string;
+  members: GroupMember[];
+  store: GatewayStore;
+}): { ok: true; member: GroupMember } | { ok: false; reason: string } {
+  const member = input.members.find((candidate) =>
+    candidate.id === input.approval.approverMemberId
+    && candidate.principalId === input.approval.approverPrincipalId
+    && candidate.status === "active");
+  if (!member || input.approval.version !== 1 || input.approval.taskDigest !== input.taskDigest) {
+    return { ok: false, reason: "approval proof is not bound to an active approver and task" };
+  }
+  const signedAt = Date.parse(input.approval.signedAt);
+  if (!Number.isFinite(signedAt) || Math.abs(Date.now() - signedAt) > 5 * 60_000) {
+    return { ok: false, reason: "approval proof is outside the five-minute validity window" };
+  }
+  const verified = verifySignedStatement(
+    input.approval.proof,
+    approvalProofBody(input.approval),
+    input.store,
+  );
+  if (!verified.ok) return verified;
+  return verified.peerId === member.gatewayPeerId
+    ? { ok: true, member }
+    : { ok: false, reason: "approval proof signer does not match approver member" };
+}
+
+export function groupApprovalSubjectDigest(
+  envelope: GroupEnvelope,
+  delegation: unknown,
+): string {
+  const {
+    approvalProofs: _proofs,
+    approvalSubjectDigest: _subject,
+    ...baseEnvelope
+  } = envelope;
+  const task = delegation && typeof delegation === "object"
+    ? delegation as Record<string, unknown>
+    : undefined;
+  const expected = task?.expectedResult && typeof task.expectedResult === "object"
+    ? task.expectedResult as Record<string, unknown>
+    : undefined;
+  const authority = task?.authority && typeof task.authority === "object"
+    ? task.authority as Record<string, unknown>
+    : undefined;
+  const normalizedDelegation = task
+    ? {
+        version: task.version,
+        delegationId: task.delegationId,
+        mode: task.mode,
+        objective: task.objective,
+        role: task.role ?? null,
+        context: task.context ?? null,
+        acceptanceCriteria: task.acceptanceCriteria ?? [],
+        expectedResult: expected
+          ? { type: expected.type, mediaTypes: expected.mediaTypes ?? [] }
+          : null,
+        authority: authority
+          ? {
+              allowed: authority.allowed ?? [],
+              denied: authority.denied ?? [],
+              resources: authority.resources ?? [],
+            }
+          : null,
+      }
+    : null;
+  return digestValue({ envelope: baseEnvelope, delegation: normalizedDelegation });
 }
 
 export function validateDisclosure(
@@ -228,17 +447,17 @@ export function validateDisclosure(
   if (disclosure.contextDigest !== digestValue(context ?? null)) {
     return { ok: false, reason: "disclosure digest does not match transmitted context" };
   }
-  if (context && typeof context === "object" && !Array.isArray(context)) {
-    const actualFields = Object.keys(context as Record<string, unknown>).sort();
-    const allowedFields = [...disclosure.fields].sort();
-    if (disclosure.redactedFields.some((field) => actualFields.includes(field))) {
-      return { ok: false, reason: "redacted disclosure field was transmitted" };
-    }
-    if (canonicalJson(actualFields) !== canonicalJson(allowedFields)) {
-      return { ok: false, reason: "transmitted context contains undeclared disclosure fields" };
-    }
-  } else if (disclosure.fields.length > 0) {
-    return { ok: false, reason: "scalar context cannot declare object disclosure fields" };
+  const actualPaths = context === undefined
+    ? []
+    : [...flattenJsonLeaves(context).keys()].sort();
+  const allowedPaths = [...disclosure.paths].sort();
+  if (disclosure.redactedPaths.some((redacted) =>
+    actualPaths.some((path) =>
+      path === redacted || path.startsWith(`${redacted}.`) || path.startsWith(`${redacted}[`)))) {
+    return { ok: false, reason: "redacted disclosure path was transmitted" };
+  }
+  if (canonicalJson(actualPaths) !== canonicalJson(allowedPaths)) {
+    return { ok: false, reason: "transmitted context contains undeclared disclosure paths" };
   }
   return { ok: true };
 }
@@ -250,6 +469,8 @@ export function createGroupEnvelope(input: {
   target: GroupTarget;
   operation: GroupOperation;
   disclosure?: DisclosureEnvelope;
+  approvalSubjectDigest?: string;
+  approvalProofs?: ApprovalProof[];
 }): GroupEnvelope {
   return {
     version: 2,
@@ -266,6 +487,8 @@ export function createGroupEnvelope(input: {
     target: input.target,
     operation: input.operation,
     disclosure: input.disclosure,
+    approvalSubjectDigest: input.approvalSubjectDigest,
+    approvalProofs: input.approvalProofs,
   };
 }
 
@@ -308,6 +531,12 @@ export function parseGroupEnvelope(value: unknown): GroupEnvelope | undefined {
     target,
     operation: raw.operation as GroupOperation,
     disclosure,
+    approvalSubjectDigest: typeof raw.approvalSubjectDigest === "string"
+      ? raw.approvalSubjectDigest
+      : undefined,
+    approvalProofs: Array.isArray(raw.approvalProofs)
+      ? raw.approvalProofs as ApprovalProof[]
+      : undefined,
   };
 }
 
@@ -371,17 +600,17 @@ function parseDisclosure(value: unknown): DisclosureEnvelope | undefined {
   if (!value || typeof value !== "object") return undefined;
   const raw = value as Record<string, unknown>;
   if (
-    raw.version !== 1
-    || !stringArray(raw.fields)
-    || !stringArray(raw.redactedFields)
+    raw.version !== 2
+    || !stringArray(raw.paths)
+    || !stringArray(raw.redactedPaths)
     || typeof raw.contextDigest !== "string"
   ) {
     return undefined;
   }
   return {
-    version: 1,
-    fields: raw.fields as string[],
-    redactedFields: raw.redactedFields as string[],
+    version: 2,
+    paths: raw.paths as string[],
+    redactedPaths: raw.redactedPaths as string[],
     contextDigest: raw.contextDigest,
     approvalDigest: typeof raw.approvalDigest === "string"
       ? raw.approvalDigest

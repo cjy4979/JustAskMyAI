@@ -1,9 +1,12 @@
 import type {
+  ApprovalProof,
   GroupEnvelope,
   GroupMember,
   GroupRoleGrant,
   Workgroup,
 } from "./types.js";
+import type { GatewayStore } from "../storage/sqlite.js";
+import { verifyApprovalProof } from "./protocol.js";
 
 export function validateGroupEnvelope(input: {
   envelope: GroupEnvelope;
@@ -89,6 +92,84 @@ export function composeGroupAuthority(input: {
   };
 }
 
+export function evaluateApprovalQuorum(input: {
+  mode: "receiver" | "receiver-and-owner" | "two-person";
+  requiredApprovals?: number;
+  proofs: ApprovalProof[];
+  taskDigest: string;
+  members: GroupMember[];
+  ownerPrincipalId: string;
+  receiverPrincipalId: string;
+  store: GatewayStore;
+}): {
+  ok: true;
+  approvedScopes?: string[];
+  deniedScopes: string[];
+  approverPrincipalIds: string[];
+} | { ok: false; reason: string } {
+  if (input.mode === "receiver") {
+    return { ok: true, deniedScopes: [], approverPrincipalIds: [] };
+  }
+  const verified = input.proofs.map((approval) => ({
+    approval,
+    result: verifyApprovalProof({
+      approval,
+      taskDigest: input.taskDigest,
+      members: input.members,
+      store: input.store,
+    }),
+  }));
+  const invalid = verified.find((item) => !item.result.ok);
+  if (invalid && !invalid.result.ok) return invalid.result;
+  const unique = new Map<string, ApprovalProof>();
+  for (const item of verified) {
+    unique.set(item.approval.approverPrincipalId, item.approval);
+  }
+  if (input.mode === "receiver-and-owner" && !unique.has(input.ownerPrincipalId)) {
+    return { ok: false, reason: "group task requires a signed primary Owner approval proof" };
+  }
+  if (input.mode === "two-person") {
+    const requiredExternal = Math.max(1, (input.requiredApprovals ?? 2) - 1);
+    const external = [...unique.keys()].filter((principalId) =>
+      principalId !== input.receiverPrincipalId);
+    if (external.length < requiredExternal) {
+      return {
+        ok: false,
+        reason: `group task requires ${requiredExternal} distinct preflight Human approval proof(s)`,
+      };
+    }
+  }
+  const proofs = [...unique.values()];
+  const approvedScopes = proofs.length > 0
+    ? proofs.map((proof) => proof.approvedScopes)
+      .reduce((allowed, scopes) => allowed.filter((scope) => scopes.includes(scope)))
+    : undefined;
+  return {
+    ok: true,
+    approvedScopes,
+    deniedScopes: uniqueStrings(proofs.flatMap((proof) => proof.deniedScopes)),
+    approverPrincipalIds: [...unique.keys()],
+  };
+}
+
+export function resolveApprovalRequirement(grants: GroupRoleGrant[]): {
+  mode: "receiver" | "receiver-and-owner" | "two-person";
+  requiredApprovals: number;
+} {
+  const mode = grants.some((grant) => grant.approvalRule?.mode === "two-person")
+    ? "two-person"
+    : grants.some((grant) => grant.approvalRule?.mode === "receiver-and-owner")
+      ? "receiver-and-owner"
+      : "receiver";
+  return {
+    mode,
+    requiredApprovals: Math.max(
+      2,
+      ...grants.map((grant) => grant.approvalRule?.requiredApprovals ?? 2),
+    ),
+  };
+}
+
 function targetMatches(envelope: GroupEnvelope, member: GroupMember): boolean {
   if ("memberId" in envelope.target) return envelope.target.memberId === member.id;
   if ("role" in envelope.target) return member.roles.includes(envelope.target.role);
@@ -103,6 +184,10 @@ function matchesGrant(scope: string, grants: string[]): boolean {
 }
 
 function unique(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+function uniqueStrings(values: string[]): string[] {
   return [...new Set(values)];
 }
 

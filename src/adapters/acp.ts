@@ -25,6 +25,7 @@ interface AcpRuntime {
   queue: Promise<void>;
   approvedScopes: Set<string>;
   deniedScopes: Set<string>;
+  degradedRehydration: boolean;
   onPermissionDecision?: (decision: PermissionDecision) => Promise<void>;
 }
 
@@ -35,12 +36,23 @@ interface AcpRuntime {
 export class AcpAdapter implements AgentAdapter {
   readonly id = "acp";
   readonly displayName = "ACP agent";
+  readonly capabilities = {
+    isolatedSessions: true,
+    sessionResume: true,
+    nativeMemoryWriteControl: (
+      process.env.JAMAI_ACP_MEMORY_ISOLATION === "confirmed" ? "controlled" : "unknown"
+    ) as "controlled" | "unknown",
+    separateMemoryNamespace: process.env.JAMAI_ACP_MEMORY_ISOLATION === "confirmed",
+    toolPermissionHooks: true,
+    structuredContextualOutput: false,
+  };
   private readonly sessions = new Map<string, Promise<AcpRuntime>>();
 
   constructor(private readonly options: AcpAdapterOptions) {}
 
   async run(request: AgentRequest): Promise<AgentResult> {
-    const runtime = await this.getRuntime(request.contextId);
+    const runtimeKey = request.externalSessionId ?? request.contextId;
+    const runtime = await this.getRuntime(runtimeKey, request.resumeSessionId);
     const previous = runtime.queue;
     let release!: () => void;
     runtime.queue = new Promise<void>((resolve) => { release = resolve; });
@@ -64,6 +76,7 @@ export class AcpAdapter implements AgentAdapter {
       return {
         text: runtime.chunks.join("").trim(),
         sessionId: runtime.sessionId,
+        degradedRehydration: runtime.degradedRehydration,
       };
     } catch (error) {
       const stderr = runtime.stderr.trim();
@@ -84,16 +97,16 @@ export class AcpAdapter implements AgentAdapter {
     this.sessions.clear();
   }
 
-  private getRuntime(contextId: string): Promise<AcpRuntime> {
+  private getRuntime(contextId: string, resumeSessionId?: string): Promise<AcpRuntime> {
     const existing = this.sessions.get(contextId);
     if (existing) return existing;
-    const created = this.createRuntime(contextId);
+    const created = this.createRuntime(contextId, resumeSessionId);
     this.sessions.set(contextId, created);
     created.catch(() => this.sessions.delete(contextId));
     return created;
   }
 
-  private async createRuntime(contextId: string): Promise<AcpRuntime> {
+  private async createRuntime(contextId: string, resumeSessionId?: string): Promise<AcpRuntime> {
     const child = spawn(this.options.command, this.options.args, {
       cwd: this.options.cwd,
       shell: false,
@@ -107,6 +120,7 @@ export class AcpAdapter implements AgentAdapter {
     runtime.queue = Promise.resolve();
     runtime.approvedScopes = new Set();
     runtime.deniedScopes = new Set();
+    runtime.degradedRehydration = false;
     child.stderr.setEncoding("utf8").on("data", (chunk) => {
       runtime.stderr += String(chunk);
     });
@@ -141,15 +155,26 @@ export class AcpAdapter implements AgentAdapter {
       },
     };
     runtime.connection = new acp.ClientSideConnection(() => client, stream);
-    await runtime.connection.initialize({
+    const initialized = await runtime.connection.initialize({
       protocolVersion: acp.PROTOCOL_VERSION,
       clientCapabilities: {},
     });
-    const session = await runtime.connection.newSession({
-      cwd: this.options.cwd,
-      mcpServers: [],
-    });
-    runtime.sessionId = session.sessionId;
+    const canResume = Boolean(
+      (initialized.agentCapabilities as { sessionCapabilities?: { resume?: unknown } })
+        ?.sessionCapabilities?.resume,
+    );
+    if (resumeSessionId && canResume) {
+      await runtime.connection.resumeSession({
+        sessionId: resumeSessionId,
+        cwd: this.options.cwd,
+        mcpServers: [],
+      });
+      runtime.sessionId = resumeSessionId;
+    } else {
+      const session = await runtime.connection.newSession({ cwd: this.options.cwd, mcpServers: [] });
+      runtime.sessionId = session.sessionId;
+      runtime.degradedRehydration = Boolean(resumeSessionId);
+    }
     return runtime;
   }
 }

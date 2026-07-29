@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import type { AgentAdapter, AgentRequest, AgentResult } from "./types.js";
+import type { AgentAdapterCapabilities } from "../session/types.js";
 
 export interface ProcessAdapterOptions {
   id: string;
@@ -18,6 +19,14 @@ export interface ProcessAdapterOptions {
 export class ProcessAdapter implements AgentAdapter {
   readonly id: string;
   readonly displayName: string;
+  readonly capabilities: AgentAdapterCapabilities = {
+    isolatedSessions: false,
+    sessionResume: false,
+    nativeMemoryWriteControl: "unknown",
+    separateMemoryNamespace: false,
+    toolPermissionHooks: false,
+    structuredContextualOutput: false,
+  };
 
   constructor(private readonly options: ProcessAdapterOptions) {
     this.id = options.id;

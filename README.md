@@ -30,14 +30,31 @@ perform bounded work within that authority.
 - ACP tool permission enforcement against approved scopes and local policy
 - Persistent workgroups, members, roles, and collaboration threads
 - Gateway-signed Human-to-Agent sponsorship bindings
-- Owner/Admin-signed Group Manifest changes linked by previous digest
+- Primary-Owner-signed Group Manifest changes linked by previous digest
+- Signed Admin governance proposals and Owner approval
+- Dual-signed primary Owner transfer, with the new Owner acceptance bound into the manifest
+- Governance sibling-fork detection, durable recording, and fail-closed rejection
 - Authenticated automatic manifest synchronization, leases, and revocation denylist enforcement
 - Signed Group Envelopes bound to the sender, target, policy version, and membership version
-- Sender-side Human approval, field selection, redaction declaration, and over-disclosure checks
+- Sender-side Human approval, nested JSON Path selection, actual path exclusion,
+  heuristic secret screening, and over-disclosure checks
 - Role grants for operations, scopes, explicit denies, resources, and approval rules
+- Task-bound signed Human `ApprovalProof` collection for Owner and two-person quorum rules
 - Single-member and unambiguous single-role group routing
-- Ed25519-signed accountability receipts binding request, authority, disclosure, approval,
-  tool decisions, and artifact digests
+- Ed25519-signed receipts for completed, failed, and cancelled tasks, binding request,
+  authority, disclosure, approval, tool decisions, and artifact digests
+- Local receipt evidence records with field-selective localhost disclosure
+- Owner-published capability profiles and requestable Context Collection metadata
+- Persistent External Sessions for multi-turn Human-to-Agent and Agent-to-Agent access
+- Session leases, caller/purpose/grant binding, pause, revoke, close, and 7-day hard limits
+- Explicit Context Collections backed by SQLite FTS5, with collection and sensitivity ceilings
+- Isolated External Thread Memory that never becomes Owner or Project Context automatically
+- Structured contextual answers with validated evidence references and authority ceilings
+- Egress escalation for unauthorized references, restricted context, and secret patterns
+- Owner-reviewed writeback proposals that create new provenance-bound records
+- Guest invitation links with hashed single-use tokens, scoped grants, HttpOnly cookies,
+  expiration, rate limiting, and SSE events
+- A localhost Owner Console at `http://127.0.0.1:43121/chat`
 
 The public relay remains experimental. Do not expose a gateway to an untrusted public
 network until end-to-end relay encryption, identity revocation, and
@@ -76,6 +93,18 @@ approved scope such as `read-workspace`, `edit-workspace`, `run-tests`, `network
 `tool:<kind>`, or `tool:<name>`. A remote requester cannot select the local workspace
 or override the owner's policy.
 
+Context-rich External Sessions also fail closed unless ACP memory isolation is explicitly
+declared:
+
+```powershell
+$env:JAMAI_ACP_MEMORY_ISOLATION="confirmed"
+```
+
+JAMA always creates a separate ACP session for an External Session. It never connects a
+non-owner caller to an Owner's native agent session. If ACP cannot resume after a restart,
+JAMA creates a new isolated session, rebuilds it from the stored External Thread and current
+Context Projection, and records a degraded-rehydration audit event.
+
 Denied scopes take precedence over allowed scopes, including wildcard grants. `run-tests`
 matches only a dedicated test tool name such as `pytest`, `jest`, or `run-tests`; it never
 authorizes a generic terminal. Broad execution requires an explicit scope such as
@@ -93,9 +122,10 @@ Invoke-RestMethod `
 
 ## Current limitations
 
-- SQLite records ACP session IDs, but ACP sessions are not resumed after gateway restart.
+- ACP resume depends on the selected agent advertising `session/resume`. Without it, JAMA
+  uses audited degraded rehydration from its own External Thread and Context Projection.
 - The audit hash chain detects local modification but is not independently anchored. Group
-  completion receipts are signed by the receiving gateway, but external audit checkpoints
+  terminal receipts are signed by the receiving gateway, but external audit checkpoints
   are not implemented yet.
 - Group membership revocation is enforced. Gateway key revocation and key rotation are not
   implemented yet.
@@ -104,11 +134,20 @@ Invoke-RestMethod `
 - A new member bootstraps from an Owner-signed manifest through localhost. Subsequent
   manifests synchronize automatically. If the Owner is unreachable, an installed manifest
   remains usable only until its lease expires; the default lease is five minutes.
-- `receiver-and-owner` and `two-person` approval rules are represented and fail closed, but
-  collection of multiple per-task approval proofs is not implemented yet.
+- Governance sibling forks are detected, recorded, and rejected. Automatic fork resolution
+  is not implemented; the primary Owner is the single manifest writer.
+- `ApprovalProof` exchange is protocol- and MCP-supported, but there is no centralized
+  approval broker. Agents exchange signed proofs as part of the bounded task request.
+- JSON Path disclosure is structural and includes heuristic secret screening. It is not a
+  semantic privacy classifier, content-aware file redactor, or zero-knowledge disclosure system.
 - Unsigned Group Layer snapshots created by an earlier prototype are intentionally not
   trusted or upgraded automatically; recreate the group or import a new Owner-signed
   checkpoint.
+- Context retrieval is lexical FTS5 retrieval over explicitly registered content. It does not
+  scan native private agent sessions or use an external vector database.
+- The Egress Guard is defense in depth; it does not claim complete semantic leak detection.
+- Guest access is intended for LAN use or a TLS reverse proxy. Bare HTTP public deployment is
+  not a supported security boundary.
 
 `npm run check` launches isolated Alice and Bob gateways with separate databases and
 identities, performs bilateral pairing, then runs A2A and MCP delegation tests.
@@ -125,8 +164,19 @@ identities, performs bilateral pairing, then runs A2A and MCP delegation tests.
 - `cancel_remote_task`
 - `list_workgroups`
 - `create_group_thread`
+- `create_group_approval_proof`
 - `delegate_group_task`
 - `list_group_receipts`
+- `discover_agent_capabilities`
+- `open_external_session`
+- `send_external_message`
+- `request_external_task`
+- `get_external_session`
+- `close_external_session`
+- `list_context_collections`
+- `propose_memory_writeback`
+- `list_writeback_proposals`
+- `resolve_writeback_proposal`
 
 The core protocol deliberately does not provide `collaborate_with_ais`. Parallel
 delegation, coordination, and plan merging belong to the caller's existing agent rather
@@ -137,3 +187,5 @@ See the [architecture](./docs/architecture.md), the
 [delegation extension v1](./docs/protocol-v1.md), and the
 [two-computer test guide](./docs/two-computer-test.md). Workgroup setup and protocol
 boundaries are described in the [Group Layer guide](./docs/group-layer.md).
+External Session isolation, Context Projection, provenance, and guest invitations are
+described in the [External Session guide](./docs/external-sessions.md).

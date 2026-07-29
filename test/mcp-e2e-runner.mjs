@@ -90,8 +90,19 @@ try {
     "cancel_remote_task",
     "list_workgroups",
     "create_group_thread",
+    "create_group_approval_proof",
     "delegate_group_task",
     "list_group_receipts",
+    "discover_agent_capabilities",
+    "open_external_session",
+    "send_external_message",
+    "request_external_task",
+    "get_external_session",
+    "close_external_session",
+    "list_context_collections",
+    "propose_memory_writeback",
+    "list_writeback_proposals",
+    "resolve_writeback_proposal",
   ]) {
     if (!names.includes(expected)) throw new Error(`missing MCP tool: ${expected}`);
   }
@@ -102,6 +113,261 @@ try {
   if (!JSON.stringify(workgroups).includes("Dual gateway release team")) {
     throw new Error("Alice MCP cannot read the installed workgroup");
   }
+
+  const simulationCollection = await postJson(`${bob.managementUrl}/api/context-collections`, {
+    name: "Bob simulation records",
+    description: "Owner-approved simulation context",
+    sourceType: "project-record",
+    defaultSensitivity: "internal",
+    tags: ["simulation"],
+  });
+  await postJson(
+    `${bob.managementUrl}/api/context-collections/${simulationCollection.id}/items`,
+    {
+      summary: "Approved simulation pressure window is 42-45 kPa.",
+      content: "Project record: the approved simulation pressure window is 42-45 kPa.",
+      authority: "owner-confirmed",
+      sensitivity: "internal",
+    },
+  );
+  const webSessionResult = await postJson(`${alice.managementUrl}/api/remote-external-sessions`, {
+    peerId: bobIdentity.peerId,
+    purpose: "Human paired-gateway simulation question",
+    collectionIds: [simulationCollection.id],
+    allowedActions: ["ask"],
+  });
+  if (webSessionResult.session?.callerType !== "human") {
+    throw new Error("localhost paired-gateway chat did not create a Human External Session");
+  }
+  const webAnswer = await postJson(
+    `${alice.managementUrl}/api/remote-external-sessions/${webSessionResult.session.id}/messages`,
+    {
+      peerId: bobIdentity.peerId,
+      operation: "ask",
+      message: "What simulation pressure window is approved?",
+    },
+  );
+  if (!JSON.stringify(webAnswer).includes("answer")) {
+    throw new Error("localhost paired-gateway Web Chat did not reach the remote AI");
+  }
+  const capabilities = await mcp.callTool({
+    name: "discover_agent_capabilities",
+    arguments: { peerUrl: bob.publicUrl },
+  });
+  if (!JSON.stringify(capabilities).includes("Bob simulation records")) {
+    throw new Error("remote Capability Directory did not expose requestable collection metadata");
+  }
+  const opened = await mcp.callTool({
+    name: "open_external_session",
+    arguments: {
+      peerUrl: bob.publicUrl,
+      purpose: "Clarify and validate the simulation-dependent process design",
+      collectionIds: [simulationCollection.id],
+      exactContentAllowed: true,
+      allowedActions: ["ask", "task"],
+    },
+  });
+  const openedText = opened.content?.find((item) => item.type === "text")?.text;
+  const externalSession = openedText ? JSON.parse(openedText).session : undefined;
+  if (!externalSession?.id || externalSession.status !== "active") {
+    throw new Error(`External Session did not become active: ${JSON.stringify(opened)}`);
+  }
+  const externalAnswer = await mcp.callTool({
+    name: "send_external_message",
+    arguments: {
+      peerUrl: bob.publicUrl,
+      sessionId: externalSession.id,
+      message: "What pressure window is in the approved simulation record?",
+    },
+  });
+  if (!JSON.stringify(externalAnswer).includes("evidenceCoverage")) {
+    throw new Error(`External Session did not return a contextual answer: ${JSON.stringify(externalAnswer)}`);
+  }
+  const externalTask = await mcp.callTool({
+    name: "request_external_task",
+    arguments: {
+      peerUrl: bob.publicUrl,
+      sessionId: externalSession.id,
+      objective: "Review whether 44 kPa is inside the approved pressure window",
+      acceptanceCriteria: ["Return the conclusion in the same External Thread"],
+      expectedArtifactType: "report",
+    },
+  });
+  const externalTaskText = externalTask.content?.find((item) => item.type === "text")?.text;
+  const externalTaskResult = externalTaskText ? JSON.parse(externalTaskText) : {};
+  if (!externalTaskResult.artifact?.id || !externalTaskResult.taskId) {
+    throw new Error(`External Session task failed: ${JSON.stringify(externalTask)}`);
+  }
+  const externalState = await mcp.callTool({
+    name: "get_external_session",
+    arguments: { peerUrl: bob.publicUrl, sessionId: externalSession.id },
+  });
+  const externalStateText = externalState.content?.find((item) => item.type === "text")?.text;
+  const externalThread = externalStateText ? JSON.parse(externalStateText) : {};
+  if (
+    externalThread.events?.length !== 5
+    || externalThread.events[4]?.sequence !== 5
+    || externalThread.events[4]?.type !== "artifact"
+  ) {
+    throw new Error(`External Thread was not persistent across interactions: ${JSON.stringify(externalState)}`);
+  }
+  const proposed = await mcp.callTool({
+    name: "propose_memory_writeback",
+    arguments: {
+      peerUrl: bob.publicUrl,
+      sessionId: externalSession.id,
+      targetCollectionId: simulationCollection.id,
+      proposedContent: "Owner should review a proposed nominal process pressure of 44 kPa.",
+      proposedSummary: "Proposed nominal process pressure: 44 kPa.",
+      evidenceRefs: [],
+    },
+  });
+  const proposedText = proposed.content?.find((item) => item.type === "text")?.text;
+  const writeback = proposedText ? JSON.parse(proposedText) : undefined;
+  if (!writeback?.id || writeback.status !== "pending") {
+    throw new Error(`writeback was not held for owner review: ${JSON.stringify(proposed)}`);
+  }
+  const resolutionPending = await bobMcp.callTool({
+    name: "resolve_writeback_proposal",
+    arguments: { proposalId: writeback.id, decision: "accepted" },
+  });
+  const resolutionPendingText = resolutionPending.content
+    ?.find((item) => item.type === "text")?.text;
+  const resolutionTicket = resolutionPendingText ? JSON.parse(resolutionPendingText) : {};
+  if (resolutionTicket.status !== "LOCAL_HUMAN_APPROVAL_REQUIRED") {
+    throw new Error("MCP writeback resolution bypassed local Human approval");
+  }
+  await postJson(
+    `${bob.managementUrl}/api/approvals/${resolutionTicket.approvalId}/approve`,
+    { approvedScopes: ["writeback:accepted"], deniedScopes: [] },
+  );
+  const resolved = await bobMcp.callTool({
+    name: "resolve_writeback_proposal",
+    arguments: {
+      proposalId: writeback.id,
+      decision: "accepted",
+      approvalId: resolutionTicket.approvalId,
+    },
+  });
+  if (!JSON.stringify(resolved).includes("resolvedItemId")) {
+    throw new Error(`owner-approved writeback did not create a new item: ${JSON.stringify(resolved)}`);
+  }
+  await mcp.callTool({
+    name: "close_external_session",
+    arguments: { peerUrl: bob.publicUrl, sessionId: externalSession.id },
+  });
+  const closedSend = await mcp.callTool({
+    name: "send_external_message",
+    arguments: {
+      peerUrl: bob.publicUrl,
+      sessionId: externalSession.id,
+      message: "This must be rejected after close.",
+    },
+  });
+  if (!closedSend.isError) throw new Error("closed External Session accepted another message");
+
+  const groupedOpened = await mcp.callTool({
+    name: "open_external_session",
+    arguments: {
+      peerUrl: bob.publicUrl,
+      purpose: "Group-governed simulation clarification",
+      groupId: createdGroup.manifest.workgroup.id,
+      collectionIds: [simulationCollection.id],
+      allowedActions: ["ask"],
+    },
+  });
+  const groupedOpenedText = groupedOpened.content?.find((item) => item.type === "text")?.text;
+  const groupedExternalSession = groupedOpenedText
+    ? JSON.parse(groupedOpenedText).session
+    : undefined;
+  if (!groupedExternalSession?.groupId) {
+    throw new Error(`Group-governed External Session failed to open: ${JSON.stringify(groupedOpened)}`);
+  }
+
+  await putJson(`${bob.managementUrl}/api/agent-profile`, { allowGuest: true });
+  const guestInvite = await postJson(`${bob.managementUrl}/api/session-invites`, {
+    purpose: "Guest simulation clarification",
+    collectionIds: [simulationCollection.id],
+    sensitivityCeiling: "internal",
+    allowedActions: ["ask"],
+    mode: "pre-authorized",
+    maxSessionSeconds: 600,
+  });
+  const guestToken = guestInvite.url.split("#")[1];
+  if (!guestToken || guestInvite.url.includes("?")) {
+    throw new Error("guest invitation token was not placed exclusively in the URL fragment");
+  }
+  const guestRedeemResponse = await fetch(`${bob.publicUrl}/guest/redeem`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: guestToken }),
+  });
+  if (guestRedeemResponse.status !== 201) {
+    throw new Error(`guest invitation redemption failed: ${await guestRedeemResponse.text()}`);
+  }
+  const guestCookie = guestRedeemResponse.headers.get("set-cookie");
+  const guestSession = await guestRedeemResponse.json();
+  if (!guestCookie?.includes("HttpOnly") || !guestCookie.includes("SameSite=Strict")) {
+    throw new Error("guest cookie is missing HttpOnly or SameSite protection");
+  }
+  const guestAnswerResponse = await fetch(
+    `${bob.publicUrl}/guest/sessions/${guestSession.id}/messages`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie: guestCookie },
+      body: JSON.stringify({ message: "Is 44 kPa inside the approved window?" }),
+    },
+  );
+  if (!guestAnswerResponse.ok || !JSON.stringify(await guestAnswerResponse.json()).includes("answer")) {
+    throw new Error("guest External Session did not return an answer");
+  }
+  const replayedInvite = await fetch(`${bob.publicUrl}/guest/redeem`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: guestToken }),
+  });
+  if (replayedInvite.status !== 400) throw new Error("guest invitation was redeemable twice");
+
+  const requestOnlyInvite = await postJson(`${bob.managementUrl}/api/session-invites`, {
+    purpose: "Owner-gated guest clarification",
+    collectionIds: [simulationCollection.id],
+    allowedActions: ["ask"],
+    mode: "request-only",
+    maxSessionSeconds: 600,
+  });
+  const gatedRedeem = await fetch(`${bob.publicUrl}/guest/redeem`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: requestOnlyInvite.url.split("#")[1] }),
+  });
+  const gatedCookie = gatedRedeem.headers.get("set-cookie");
+  const gatedSession = await gatedRedeem.json();
+  if (gatedSession.status !== "awaiting_owner_consent") {
+    throw new Error("request-only guest invitation bypassed Owner consent");
+  }
+  const deniedBeforeConsent = await fetch(
+    `${bob.publicUrl}/guest/sessions/${gatedSession.id}/messages`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie: gatedCookie },
+      body: JSON.stringify({ message: "This is too early." }),
+    },
+  );
+  if (deniedBeforeConsent.status !== 401) {
+    throw new Error("request-only guest could send before Owner consent");
+  }
+  await postJson(`${bob.managementUrl}/api/external-sessions/${gatedSession.id}/status`, {
+    status: "active",
+  });
+  const allowedAfterConsent = await fetch(
+    `${bob.publicUrl}/guest/sessions/${gatedSession.id}/messages`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie: gatedCookie },
+      body: JSON.stringify({ message: "Owner has now approved this session." }),
+    },
+  );
+  if (!allowedAfterConsent.ok) throw new Error("Owner-approved guest session remained blocked");
 
   const result = await mcp.callTool({
     name: "delegate_remote_task",
@@ -170,8 +436,8 @@ try {
       projectStatus: "tests passing",
       privateNote: "must never cross the gateway",
     },
-    disclosureFields: ["projectStatus"],
-    redactedFields: ["privateNote"],
+    disclosurePaths: ["$.projectStatus"],
+    redactedPaths: ["$.privateNote"],
     allowedActions: [],
     deniedActions: [],
   };
@@ -191,8 +457,8 @@ try {
   await postJson(
     `${alice.managementUrl}/api/approvals/${disclosureTicket.approvalId}/approve`,
     {
-      approvedScopes: ["disclose:projectStatus"],
-      deniedScopes: ["disclose:privateNote"],
+      approvedScopes: ["disclose:$.projectStatus"],
+      deniedScopes: ["disclose:$.privateNote"],
     },
   );
   const disclosureResult = await mcp.callTool({
@@ -205,6 +471,79 @@ try {
   const disclosureOutput = JSON.stringify(disclosureResult);
   if (!disclosureOutput.includes("COMPLETED") || disclosureOutput.includes("must never cross")) {
     throw new Error(`controlled disclosure failed: ${disclosureOutput}`);
+  }
+
+  const approvalPolicy = structuredClone(
+    (await getJson(
+      `${alice.managementUrl}/api/groups/${createdGroup.manifest.workgroup.id}`,
+    )).workgroup.rolePolicy,
+  );
+  approvalPolicy.owner.approvalRule = { mode: "receiver-and-owner" };
+  await putJson(
+    `${alice.managementUrl}/api/groups/${createdGroup.manifest.workgroup.id}/policy`,
+    { rolePolicy: approvalPolicy },
+  );
+  const staleGroupedSession = await mcp.callTool({
+    name: "send_external_message",
+    arguments: {
+      peerUrl: bob.publicUrl,
+      sessionId: groupedExternalSession.id,
+      message: "This must fail because the Group policy epoch changed.",
+    },
+  });
+  if (!staleGroupedSession.isError) {
+    throw new Error("Group epoch change did not invalidate the existing External Session");
+  }
+  const governedArguments = {
+    groupId: createdGroup.manifest.workgroup.id,
+    threadId: groupThread.id,
+    targetMemberId: bobMember.id,
+    delegationId: "governed-e2e-delegation",
+    objective: "Execute only after the primary Owner signs the exact task digest",
+    allowedActions: [],
+    deniedActions: ["network"],
+  };
+  const proofRequired = await mcp.callTool({
+    name: "delegate_group_task",
+    arguments: governedArguments,
+  });
+  const proofRequiredText = proofRequired.content?.find((item) => item.type === "text")?.text;
+  const proofRequest = proofRequiredText ? JSON.parse(proofRequiredText) : {};
+  if (proofRequest.status !== "GROUP_APPROVAL_PROOFS_REQUIRED") {
+    throw new Error(`multi-Human proof was not required: ${JSON.stringify(proofRequired)}`);
+  }
+  const localProofPending = await mcp.callTool({
+    name: "create_group_approval_proof",
+    arguments: {
+      groupId: createdGroup.manifest.workgroup.id,
+      taskDigest: proofRequest.approvalSubjectDigest,
+      requestedScopes: [],
+    },
+  });
+  const localProofPendingText = localProofPending.content
+    ?.find((item) => item.type === "text")?.text;
+  const localProofTicket = localProofPendingText ? JSON.parse(localProofPendingText) : {};
+  await postJson(
+    `${alice.managementUrl}/api/approvals/${localProofTicket.approvalId}/approve`,
+    { approvedScopes: [], deniedScopes: [] },
+  );
+  const signedProofResult = await mcp.callTool({
+    name: "create_group_approval_proof",
+    arguments: {
+      groupId: createdGroup.manifest.workgroup.id,
+      taskDigest: proofRequest.approvalSubjectDigest,
+      requestedScopes: [],
+      approvalId: localProofTicket.approvalId,
+    },
+  });
+  const signedProofText = signedProofResult.content?.find((item) => item.type === "text")?.text;
+  const signedProof = signedProofText ? JSON.parse(signedProofText).approvalProof : undefined;
+  const governedResult = await mcp.callTool({
+    name: "delegate_group_task",
+    arguments: { ...governedArguments, approvalProofs: [signedProof] },
+  });
+  if (!JSON.stringify(governedResult).includes("COMPLETED")) {
+    throw new Error(`signed multi-Human approval did not authorize task: ${JSON.stringify(governedResult)}`);
   }
 
   const fetched = await mcp.callTool({
@@ -324,6 +663,7 @@ try {
     groupTask: true,
     signedGroupReceipt: true,
     controlledDisclosure: true,
+    signedMultiHumanApproval: true,
     revocationControlsRejected: true,
     staleMemberSendRejected: true,
     unsignedControlsRejected: true,
@@ -348,6 +688,7 @@ function gateway(name, publicPort, managementPort, dbPath) {
       JAMAI_DB_PATH: dbPath,
       JAMAI_POLICY: "auto",
       JAMAI_ADAPTER: "mock",
+      JAMAI_ENABLE_GUEST_INVITES: "true",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -393,6 +734,16 @@ async function getJson(url) {
 async function postJson(url, body) {
   const response = await fetch(url, {
     method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) throw new Error(`${url} returned ${response.status}: ${await response.text()}`);
+  return response.json();
+}
+
+async function putJson(url, body) {
+  const response = await fetch(url, {
+    method: "PUT",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });

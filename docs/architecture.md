@@ -77,9 +77,16 @@ Each gateway keeps a local copy of a workgroup manifest:
 workgroup + role policy + members + policy version + membership version
 ```
 
-The manifest is not trusted merely because a Human imported it. It is signed by a current
-Owner/Admin and linked to the previous manifest digest. Every active member also carries a
-Gateway-signed Human Principal, Agent, and Gateway sponsorship binding.
+The manifest is not trusted merely because a Human imported it. The primary Owner is the
+single manifest writer, and every update links to the previous manifest digest. Admins can
+sign governance proposals but cannot apply them. Primary Owner transfer requires the old
+Owner signature plus a transition-bound acceptance signature from the new Owner. Every
+active member also carries a Gateway-signed Human Principal, Agent, and Gateway sponsorship
+binding.
+
+Valid sibling manifests with the same parent are recorded as governance forks and rejected.
+The protocol does not automatically resolve a fork; single-writer governance avoids treating
+Admin concurrency as consensus.
 
 Receivers request signed updates from the Owner before every Group operation. Updates advance
 one governance version, and a manifest lease bounds offline stale-state acceptance. Learned
@@ -95,12 +102,16 @@ Role routing is intentionally deterministic: `delegate_group_task` accepts a mem
 or a role that resolves to exactly one active remote member. It does not fan out, schedule a
 team, merge plans, or resolve Agent conflicts.
 
-Object context uses field selection, a redaction declaration, a sender Human approval, and a
-disclosure digest. The receiver rejects undeclared or changed fields.
+Structured context uses restricted JSON Path leaf selection, actual exclusion of declared
+redactions, heuristic secret screening, a sender Human approval, and a disclosure digest.
+The receiver rejects undeclared, redacted, or changed paths.
 
-On completion, the receiving gateway signs a v2 receipt over governance versions, requester,
-responder, request, accepted authority, disclosure, approval, tool-decision, and artifact
-digests. The sender verifies the Ed25519 proof against its pinned peer key before storing it.
+At every terminal state, the receiving gateway signs a v2 receipt over governance versions,
+requester, responder, request, accepted authority, disclosure, approval, tool-decision, and
+artifact digests. The sender verifies the Ed25519 proof against its pinned peer key before
+storing it. The receiver also retains digest-matched local evidence. Selected evidence fields
+can be read from the localhost management listener; a signed digest remains an attestation
+until the corresponding evidence is disclosed.
 
 ## Identity and request integrity
 
@@ -131,6 +142,7 @@ authority is:
 sender sponsorship
 INTERSECT group role grant
 INTERSECT task request
+INTERSECT signed multi-Human approval proof constraints
 INTERSECT receiver Human approval
 INTERSECT local owner policy
 INTERSECT actual ACP tool name/kind
@@ -151,8 +163,8 @@ Audit records the responsibility chain, not private chain-of-thought:
 - lifecycle events and timestamps
 - redacted operational metadata
 
-Events form a local SHA-256 integrity chain. Group completion additionally produces a
-remote-gateway-signed receipt. The localhost-only
+Events form a local SHA-256 integrity chain. Every terminal Group task additionally produces
+a remote-gateway-signed receipt. The localhost-only
 `GET /api/audit/verify` endpoint verifies it. Content modes are `metadata`, `redacted`
 (default), and `full-local`. A database owner can rebuild the local chain, so independently
 anchored audit checkpoints remain future work.

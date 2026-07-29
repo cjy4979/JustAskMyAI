@@ -2,50 +2,59 @@ import { randomUUID } from "node:crypto";
 import {
   encodeSignedRequest,
   JAMAI_AUTH_HEADER,
+  verifySignedStatement,
   type GatewayIdentity,
 } from "../protocol/signed-request.js";
 import type { GatewayStore } from "../storage/sqlite.js";
 import {
   createSponsorship,
   digestValue,
+  createGovernanceProposal,
+  governanceProposalBody,
+  ownerTransferBody,
   parseGroupReceipt,
   signGroupManifest,
   verifySignedGroupManifest,
   verifySponsorship,
+  verifyGovernanceProposal,
 } from "./protocol.js";
 import type {
   AgentSponsorship,
   GroupManifest,
   GroupMember,
   GroupReceipt,
+  GroupReceiptEvidence,
   GroupRoleGrant,
   GroupThread,
+  GovernanceChange,
+  OwnerTransferAcceptance,
+  SignedGovernanceProposal,
   SignedGroupManifest,
   Workgroup,
 } from "./types.js";
 
 export const DEFAULT_ROLE_POLICY: Record<string, GroupRoleGrant> = {
   owner: {
-    operations: ["task", "message", "artifact", "decision"],
+    operations: ["task", "message", "artifact", "decision", "context"],
     allowedScopes: ["*"],
     deniedScopes: [],
     approvalRule: { mode: "receiver" },
   },
   admin: {
-    operations: ["task", "message", "artifact", "decision"],
-    allowedScopes: ["read-workspace", "edit-workspace", "run-tests"],
+    operations: ["task", "message", "artifact", "decision", "context"],
+    allowedScopes: ["read-workspace", "edit-workspace", "run-tests", "context:read"],
     deniedScopes: ["deploy", "push"],
     approvalRule: { mode: "receiver" },
   },
   member: {
-    operations: ["task", "message", "artifact"],
-    allowedScopes: ["read-workspace", "edit-workspace", "run-tests"],
+    operations: ["task", "message", "artifact", "context"],
+    allowedScopes: ["read-workspace", "edit-workspace", "run-tests", "context:read"],
     deniedScopes: ["deploy", "push"],
     approvalRule: { mode: "receiver" },
   },
   reviewer: {
-    operations: ["message", "artifact", "decision"],
-    allowedScopes: ["read-workspace"],
+    operations: ["message", "artifact", "decision", "context"],
+    allowedScopes: ["read-workspace", "context:read"],
     deniedScopes: ["edit-workspace", "network", "deploy", "push"],
     approvalRule: { mode: "receiver" },
   },
@@ -158,6 +167,13 @@ export class GroupStore {
     id?: string;
     issuedByMemberId: string;
   }): { member: GroupMember; signedManifest: SignedGroupManifest } {
+    return this.withTransaction(() => this.applyMemberChange(input));
+  }
+
+  private applyMemberChange(input: Omit<GroupMember, "id" | "createdAt" | "updatedAt"> & {
+    id?: string;
+    issuedByMemberId: string;
+  }): { member: GroupMember; signedManifest: SignedGroupManifest } {
     const group = this.getWorkgroup(input.groupId);
     if (!group) throw new Error("workgroup not found");
     this.requireGovernanceAuthority(input.groupId, input.issuedByMemberId);
@@ -178,6 +194,13 @@ export class GroupStore {
       throw new Error("member ID already belongs to another workgroup");
     }
     const existing = this.getMember(input.groupId, id);
+    const changesOwnerRole = input.roles.includes("owner") !== Boolean(existing?.roles.includes("owner"));
+    if (changesOwnerRole) {
+      throw new Error("Owner role changes require the dual-signed owner transfer flow");
+    }
+    if (existing?.roles.includes("owner") && input.status !== "active") {
+      throw new Error("an Owner cannot be suspended or removed outside owner transfer");
+    }
     this.insertMember({
       ...input,
       id,
@@ -214,6 +237,14 @@ export class GroupStore {
     rolePolicy: Record<string, GroupRoleGrant>;
     issuedByMemberId: string;
   }): SignedGroupManifest {
+    return this.withTransaction(() => this.applyRolePolicyChange(input));
+  }
+
+  private applyRolePolicyChange(input: {
+    groupId: string;
+    rolePolicy: Record<string, GroupRoleGrant>;
+    issuedByMemberId: string;
+  }): SignedGroupManifest {
     this.requireGovernanceAuthority(input.groupId, input.issuedByMemberId);
     validateRolePolicy(input.rolePolicy);
     const now = new Date().toISOString();
@@ -223,6 +254,159 @@ export class GroupStore {
       WHERE id = ?
     `).run(JSON.stringify(input.rolePolicy), now, input.groupId);
     return this.issueManifest(input.groupId, input.issuedByMemberId);
+  }
+
+  createProposal(input: {
+    groupId: string;
+    proposedByMemberId: string;
+    change: GovernanceChange;
+  }): SignedGovernanceProposal {
+    const signer = this.requireSigner();
+    const manifest = this.getSignedManifest(input.groupId);
+    if (!manifest) throw new Error("signed group manifest not found");
+    const proposer = this.getMember(input.groupId, input.proposedByMemberId);
+    if (
+      !proposer
+      || proposer.status !== "active"
+      || proposer.gatewayPeerId !== signer.peerId
+      || !proposer.roles.some((role) => role === "admin" || role === "owner")
+    ) {
+      throw new Error("only a local active Admin or Owner can create a governance proposal");
+    }
+    const proposal = createGovernanceProposal({
+      groupId: input.groupId,
+      baseManifestDigest: manifest.manifestDigest,
+      proposedByMemberId: proposer.id,
+      change: input.change,
+    }, signer);
+    this.storeProposal(proposal);
+    return proposal;
+  }
+
+  importProposal(proposal: SignedGovernanceProposal): SignedGovernanceProposal {
+    const manifest = this.getSignedManifest(proposal.groupId);
+    if (!manifest) throw new Error("signed group manifest not found");
+    const verified = verifyGovernanceProposal({ proposal, manifest, store: this.gateway });
+    if (!verified.ok) throw new Error(verified.reason);
+    this.storeProposal(proposal);
+    return proposal;
+  }
+
+  listProposals(groupId: string): Array<SignedGovernanceProposal & { status: string }> {
+    return (this.gateway.db.prepare(`
+      SELECT signed_json, status FROM group_governance_proposals
+      WHERE group_id = ? ORDER BY created_at ASC
+    `).all(groupId) as Array<{ signed_json: string; status: string }>).map((row) => ({
+      ...JSON.parse(row.signed_json) as SignedGovernanceProposal,
+      status: row.status,
+    }));
+  }
+
+  approveProposal(
+    proposalId: string,
+    ownerMemberId: string,
+  ): SignedGroupManifest {
+    return this.withTransaction(() =>
+      this.applyApprovedProposal(proposalId, ownerMemberId));
+  }
+
+  private applyApprovedProposal(
+    proposalId: string,
+    ownerMemberId: string,
+  ): SignedGroupManifest {
+    const row = this.gateway.db.prepare(`
+      SELECT signed_json, status FROM group_governance_proposals WHERE id = ?
+    `).get(proposalId) as { signed_json: string; status: string } | undefined;
+    if (!row || row.status !== "pending") throw new Error("pending proposal not found");
+    const proposal = JSON.parse(row.signed_json) as SignedGovernanceProposal;
+    this.requireGovernanceAuthority(proposal.groupId, ownerMemberId);
+    const current = this.getSignedManifest(proposal.groupId)!;
+    const verified = verifyGovernanceProposal({ proposal, manifest: current, store: this.gateway });
+    if (!verified.ok) throw new Error(verified.reason);
+    let signed: SignedGroupManifest;
+    if (proposal.change.kind === "policy") {
+      signed = this.applyRolePolicyChange({
+        groupId: proposal.groupId,
+        rolePolicy: proposal.change.rolePolicy,
+        issuedByMemberId: ownerMemberId,
+      });
+    } else {
+      const member = proposal.change.member;
+      const result = this.applyMemberChange({
+        ...member,
+        issuedByMemberId: ownerMemberId,
+      });
+      signed = result.signedManifest;
+    }
+    this.gateway.db.prepare(`
+      UPDATE group_governance_proposals SET status = 'approved', resolved_at = ?
+      WHERE id = ?
+    `).run(new Date().toISOString(), proposalId);
+    return signed;
+  }
+
+  transferPrimaryOwner(input: {
+    groupId: string;
+    fromOwnerMemberId: string;
+    toOwnerMemberId: string;
+    acceptance: OwnerTransferAcceptance;
+  }): SignedGroupManifest {
+    return this.withTransaction(() => this.applyOwnerTransfer(input));
+  }
+
+  private applyOwnerTransfer(input: {
+    groupId: string;
+    fromOwnerMemberId: string;
+    toOwnerMemberId: string;
+    acceptance: OwnerTransferAcceptance;
+  }): SignedGroupManifest {
+    const current = this.getSignedManifest(input.groupId);
+    if (!current) throw new Error("signed group manifest not found");
+    const from = this.requireGovernanceAuthority(input.groupId, input.fromOwnerMemberId);
+    const target = this.getMember(input.groupId, input.toOwnerMemberId);
+    if (!target || target.status !== "active") throw new Error("new Owner must be an active member");
+    const acceptance = input.acceptance;
+    if (
+      acceptance.groupId !== input.groupId
+      || acceptance.baseManifestDigest !== current.manifestDigest
+      || acceptance.fromOwnerMemberId !== from.id
+      || acceptance.toOwnerMemberId !== target.id
+    ) {
+      throw new Error("Owner transfer acceptance is bound to a different transition");
+    }
+    const verified = verifySignedStatement(
+      acceptance.proof,
+      ownerTransferBody(acceptance),
+      this.gateway,
+    );
+    if (!verified.ok || verified.peerId !== target.gatewayPeerId) {
+      throw new Error(verified.ok ? "new Owner proof does not match target member" : verified.reason);
+    }
+    const now = new Date().toISOString();
+    this.gateway.db.prepare(`
+      UPDATE group_members SET roles_json = ?, updated_at = ? WHERE group_id = ? AND id = ?
+    `).run(
+      JSON.stringify([...new Set([...target.roles, "owner"])]),
+      now,
+      input.groupId,
+      target.id,
+    );
+    if (from.id !== target.id) {
+      this.gateway.db.prepare(`
+        UPDATE group_members SET roles_json = ?, updated_at = ? WHERE group_id = ? AND id = ?
+      `).run(
+        JSON.stringify(from.roles.filter((role) => role !== "owner")),
+        now,
+        input.groupId,
+        from.id,
+      );
+    }
+    this.gateway.db.prepare(`
+      UPDATE workgroups
+      SET owner_principal_id = ?, membership_version = membership_version + 1, updated_at = ?
+      WHERE id = ?
+    `).run(target.principalId, now, input.groupId);
+    return this.issueManifest(input.groupId, from.id, false, true, acceptance);
   }
 
   getSignedManifest(groupId: string): SignedGroupManifest | undefined {
@@ -274,6 +458,24 @@ export class GroupStore {
   ): SignedGroupManifest {
     const groupId = signed?.manifest?.workgroup?.id;
     const current = groupId ? this.getSignedManifest(groupId) : undefined;
+    if (
+      current
+      && signed.previousManifestDigest
+      && signed.previousManifestDigest !== current.manifestDigest
+    ) {
+      const parent = this.getManifestByDigest(groupId, signed.previousManifestDigest);
+      if (parent) {
+        const branch = verifySignedGroupManifest({
+          signed,
+          current: parent,
+          store: this.gateway,
+        });
+        if (branch.ok) {
+          this.recordFork(current, signed);
+          throw new Error("governance fork detected and recorded");
+        }
+      }
+    }
     const verified = verifySignedGroupManifest({ signed, current, store: this.gateway });
     if (!verified.ok) throw new Error(verified.reason);
     const currentLocal = current?.manifest.members.some((member) =>
@@ -364,6 +566,22 @@ export class GroupStore {
     return Boolean(this.gateway.db.prepare(`
       SELECT 1 FROM group_revocations WHERE group_id = ? AND gateway_peer_id = ?
     `).get(groupId, peerId));
+  }
+
+  listForks(groupId: string): Array<Record<string, unknown>> {
+    return (this.gateway.db.prepare(`
+      SELECT * FROM group_governance_forks
+      WHERE group_id = ? ORDER BY detected_at ASC
+    `).all(groupId) as Row[]).map((row) => ({
+      id: String(row.id),
+      groupId: String(row.group_id),
+      parentDigest: String(row.parent_digest),
+      installedDigest: String(row.installed_digest),
+      conflictingDigest: String(row.conflicting_digest),
+      conflictingManifest: JSON.parse(String(row.conflicting_signed_json)),
+      detectedAt: String(row.detected_at),
+      status: String(row.status),
+    }));
   }
 
   bindTask(binding: GroupTaskBinding): void {
@@ -485,7 +703,27 @@ export class GroupStore {
     `).all(groupId) as Row[]).map(mapThread);
   }
 
-  storeReceipt(receipt: GroupReceipt): void {
+  storeReceipt(receipt: GroupReceipt, evidence?: GroupReceiptEvidence): void {
+    if (evidence) {
+      if (digestValue(evidence.authority) !== receipt.acceptedAuthorityDigest) {
+        throw new Error("receipt authority evidence does not match its signed digest");
+      }
+      if (receipt.approvalDigest && digestValue(evidence.approvals) !== receipt.approvalDigest) {
+        throw new Error("receipt approval evidence does not match its signed digest");
+      }
+      if (
+        receipt.toolDecisionDigest
+        && digestValue(evidence.toolDecisions ?? []) !== receipt.toolDecisionDigest
+      ) {
+        throw new Error("receipt tool evidence does not match its signed digest");
+      }
+      if (
+        evidence.terminal
+        && digestValue(evidence.terminal) !== receipt.artifactDigest
+      ) {
+        throw new Error("receipt terminal evidence does not match its artifact digest");
+      }
+    }
     this.gateway.db.prepare(`
       INSERT INTO group_receipts (
         id, group_id, thread_id, task_id, event_digest, acknowledged_by_json,
@@ -503,6 +741,36 @@ export class GroupStore {
       JSON.stringify(receipt.proof),
       JSON.stringify(receipt),
     );
+    if (evidence) {
+      this.gateway.db.prepare(`
+        INSERT INTO group_receipt_evidence (
+          receipt_id, group_id, evidence_json, created_at
+        ) VALUES (?, ?, ?, ?)
+        ON CONFLICT(receipt_id) DO UPDATE SET evidence_json = excluded.evidence_json
+      `).run(
+        receipt.id,
+        receipt.groupId,
+        JSON.stringify(evidence),
+        new Date().toISOString(),
+      );
+    }
+  }
+
+  getReceiptEvidence(
+    groupId: string,
+    receiptId: string,
+    fields?: Array<keyof GroupReceiptEvidence>,
+  ): Partial<GroupReceiptEvidence> | undefined {
+    const row = this.gateway.db.prepare(`
+      SELECT evidence_json FROM group_receipt_evidence
+      WHERE group_id = ? AND receipt_id = ?
+    `).get(groupId, receiptId) as { evidence_json: string } | undefined;
+    if (!row) return undefined;
+    const evidence = JSON.parse(row.evidence_json) as GroupReceiptEvidence;
+    if (!fields || fields.length === 0) return evidence;
+    return Object.fromEntries(fields
+      .filter((field) => field in evidence)
+      .map((field) => [field, evidence[field]])) as Partial<GroupReceiptEvidence>;
   }
 
   listReceipts(groupId: string, threadId?: string): GroupReceipt[] {
@@ -533,9 +801,20 @@ export class GroupStore {
     groupId: string,
     issuedByMemberId: string,
     renewal = false,
+    authorizedByPreviousManifest = false,
+    ownerTransferAcceptance?: OwnerTransferAcceptance,
   ): SignedGroupManifest {
     const signer = this.requireSigner();
-    const issuer = this.requireGovernanceAuthority(groupId, issuedByMemberId);
+    const issuer = authorizedByPreviousManifest
+      ? this.getMember(groupId, issuedByMemberId)
+      : this.requireGovernanceAuthority(groupId, issuedByMemberId);
+    if (
+      !issuer
+      || issuer.status !== "active"
+      || (!ownerTransferAcceptance && !issuer.roles.includes("owner"))
+    ) {
+      throw new Error("manifest issuer is not an active Owner");
+    }
     if (issuer.gatewayPeerId !== signer.peerId) {
       throw new Error("manifest authority is not controlled by this gateway");
     }
@@ -549,6 +828,7 @@ export class GroupStore {
       issuedAt: previous
         ? new Date(Math.max(Date.now(), Date.parse(previous.issuedAt) + 1)).toISOString()
         : undefined,
+      ownerTransferAcceptance,
     }, signer);
     const verified = verifySignedGroupManifest({ signed, current: previous, store: this.gateway });
     if (!verified.ok) throw new Error(verified.reason);
@@ -584,6 +864,71 @@ export class GroupStore {
       signed.previousManifestDigest ?? null,
       JSON.stringify(signed),
       signed.issuedAt,
+    );
+  }
+
+  private getManifestByDigest(
+    groupId: string,
+    manifestDigest: string,
+  ): SignedGroupManifest | undefined {
+    const row = this.gateway.db.prepare(`
+      SELECT signed_json FROM group_manifest_history
+      WHERE group_id = ? AND manifest_digest = ?
+      ORDER BY sequence DESC LIMIT 1
+    `).get(groupId, manifestDigest) as { signed_json: string } | undefined;
+    return row ? JSON.parse(row.signed_json) as SignedGroupManifest : undefined;
+  }
+
+  private recordFork(
+    installed: SignedGroupManifest,
+    conflicting: SignedGroupManifest,
+  ): void {
+    const id = digestValue({
+      installed: installed.manifestDigest,
+      conflicting: conflicting.manifestDigest,
+    });
+    this.gateway.db.prepare(`
+      INSERT OR IGNORE INTO group_governance_forks (
+        id, group_id, parent_digest, installed_digest, conflicting_digest,
+        conflicting_signed_json, detected_at, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'detected')
+    `).run(
+      id,
+      installed.manifest.workgroup.id,
+      conflicting.previousManifestDigest!,
+      installed.manifestDigest,
+      conflicting.manifestDigest,
+      JSON.stringify(conflicting),
+      new Date().toISOString(),
+    );
+    this.gateway.appendAudit({
+      eventType: "group.governance-fork-detected",
+      principalId: this.gateway.getMeta("principalId") ?? "unknown-principal",
+      agentId: this.gateway.getMeta("agentId") ?? "unknown-agent",
+      peerId: conflicting.proof.issuerPeerId,
+      action: "reject-governance-fork",
+      resource: installed.manifest.workgroup.id,
+      decision: "denied",
+      inputDigest: installed.manifestDigest,
+      outputDigest: conflicting.manifestDigest,
+      metadata: { parentDigest: conflicting.previousManifestDigest },
+    });
+  }
+
+  private storeProposal(proposal: SignedGovernanceProposal): void {
+    this.gateway.db.prepare(`
+      INSERT INTO group_governance_proposals (
+        id, group_id, base_manifest_digest, proposed_by_member_id,
+        signed_json, status, created_at
+      ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+      ON CONFLICT(id) DO NOTHING
+    `).run(
+      proposal.id,
+      proposal.groupId,
+      proposal.baseManifestDigest,
+      proposal.proposedByMemberId,
+      JSON.stringify(proposal),
+      proposal.createdAt,
     );
   }
 
@@ -710,20 +1055,24 @@ export class GroupStore {
   }
 
   private findLocalAuthority(groupId: string): GroupMember | undefined {
+    const group = this.getWorkgroup(groupId);
     return this.listMembers(groupId).find((member) =>
       member.status === "active"
       && member.gatewayPeerId === this.signer?.peerId
-      && member.roles.some((role) => role === "owner" || role === "admin"));
+      && member.roles.includes("owner")
+      && member.principalId === group?.ownerPrincipalId);
   }
 
   private requireGovernanceAuthority(groupId: string, memberId: string): GroupMember {
+    const group = this.getWorkgroup(groupId);
     const member = this.getMember(groupId, memberId);
     if (
       !member
       || member.status !== "active"
-      || !member.roles.some((role) => role === "owner" || role === "admin")
+      || !member.roles.includes("owner")
+      || member.principalId !== group?.ownerPrincipalId
     ) {
-      throw new Error("governance change requires an active Owner or Admin");
+      throw new Error("governance change requires the primary Group Owner");
     }
     return member;
   }
@@ -734,6 +1083,18 @@ export class GroupStore {
   > {
     if (!this.signer) throw new Error("group manifest signing is unavailable");
     return this.signer;
+  }
+
+  private withTransaction<T>(operation: () => T): T {
+    this.gateway.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = operation();
+      this.gateway.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.gateway.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   private migrate(): void {
@@ -788,6 +1149,13 @@ export class GroupStore {
         receipt_json TEXT NOT NULL DEFAULT '{}',
         FOREIGN KEY(group_id) REFERENCES workgroups(id)
       );
+      CREATE TABLE IF NOT EXISTS group_receipt_evidence (
+        receipt_id TEXT PRIMARY KEY,
+        group_id TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(receipt_id) REFERENCES group_receipts(id)
+      );
       CREATE TABLE IF NOT EXISTS group_manifests (
         group_id TEXT PRIMARY KEY,
         manifest_digest TEXT NOT NULL,
@@ -819,6 +1187,26 @@ export class GroupStore {
         requester_member_id TEXT NOT NULL,
         requester_peer_id TEXT NOT NULL,
         created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS group_governance_proposals (
+        id TEXT PRIMARY KEY,
+        group_id TEXT NOT NULL,
+        base_manifest_digest TEXT NOT NULL,
+        proposed_by_member_id TEXT NOT NULL,
+        signed_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        resolved_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS group_governance_forks (
+        id TEXT PRIMARY KEY,
+        group_id TEXT NOT NULL,
+        parent_digest TEXT NOT NULL,
+        installed_digest TEXT NOT NULL,
+        conflicting_digest TEXT NOT NULL,
+        conflicting_signed_json TEXT NOT NULL,
+        detected_at TEXT NOT NULL,
+        status TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_group_members_peer
         ON group_members(group_id, gateway_peer_id, status);

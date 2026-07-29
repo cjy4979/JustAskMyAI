@@ -104,14 +104,16 @@ interface GroupEnvelope {
   };
   senderMemberId: string;
   target: { memberId: string } | { role: string } | { broadcast: true };
-  operation: "task" | "message" | "artifact" | "decision";
+  operation: "task" | "message" | "artifact" | "decision" | "context";
   disclosure?: {
-    version: 1;
-    fields: string[];
-    redactedFields: string[];
+    version: 2;
+    paths: string[];
+    redactedPaths: string[];
     contextDigest: string;
     approvalDigest?: string;
   };
+  approvalSubjectDigest?: string;
+  approvalProofs?: ApprovalProof[];
 }
 ```
 
@@ -122,6 +124,12 @@ remote member has that role.
 
 The Group Envelope is also part of the human approval request digest. Updating membership,
 policy, target, or thread invalidates an earlier approval.
+
+`approvalSubjectDigest` binds the normalized delegation and the Group Envelope without its
+proof list. Each `ApprovalProof` is an Ed25519 statement from an active member's Gateway and
+binds the exact digest, Human Principal, member, allowed scopes, denied scopes, and timestamp.
+`receiver-and-owner` requires the primary Owner proof. `two-person` counts distinct Human
+Principals and always includes the receiver's normal local approval.
 
 ## Signed sponsorship and manifest
 
@@ -137,19 +145,26 @@ interface SignedGroupManifest {
   issuedByMemberId: string;
   issuedAt: string;
   validUntil: string;
+  ownerTransferAcceptance?: OwnerTransferAcceptance;
   proof: SignedStatement;
 }
 ```
 
-An update must be signed by an active Owner/Admin authorized by the previously installed
-manifest, extend its digest, and advance exactly one membership or policy version. Manifest
-retrieval is authenticated with `group.manifest.get`. Invalid updates fail closed; network
-unavailability permits the last state only until its signed lease expires.
+An update must be signed by the primary Owner authorized by the previously installed
+manifest, extend its digest, and advance exactly one membership or policy version. Admins
+may sign `SignedGovernanceProposal` objects, but only the primary Owner can apply them.
+Primary Owner transfer is one atomic membership change and carries the new Owner's
+transition-bound acceptance proof inside the signed manifest.
+
+Manifest retrieval is authenticated with `group.manifest.get`. Invalid updates fail closed;
+network unavailability permits the last state only until its signed lease expires. A valid
+sibling update with the same parent is recorded as a governance fork and rejected; automatic
+fork resolution is outside this version.
 
 ## Signed Group Receipt v2
 
-On successful completion, the receiver returns `groupReceipt` in artifact metadata. The
-receipt binds:
+On completion, failure, or cancellation, the receiver returns `groupReceipt` in artifact
+metadata. The receipt binds:
 
 ```text
 group and governance versions
@@ -163,3 +178,8 @@ group and governance versions
 Its `proof` is an Ed25519 signed statement containing the issuer peer, public key, timestamp,
 nonce, and receipt payload hash. The caller verifies the proof against the explicitly pinned
 gateway key before persisting it.
+
+The digest fields are cryptographically bound attestations. The receiver retains the matching
+authority, approval, tool-decision, and terminal evidence locally. Selected evidence can be
+retrieved from the localhost-only receipt evidence endpoint when independent reconstruction
+is required.

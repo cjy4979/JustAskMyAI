@@ -3,6 +3,14 @@ import type { AgentAdapter, AgentRequest, AgentResult } from "./types.js";
 export class MockAdapter implements AgentAdapter {
   readonly id = "mock";
   readonly displayName = "Mock AI";
+  readonly capabilities = {
+    isolatedSessions: true,
+    sessionResume: true,
+    nativeMemoryWriteControl: "controlled" as const,
+    separateMemoryNamespace: true,
+    toolPermissionHooks: true,
+    structuredContextualOutput: false,
+  };
 
   async run(request: AgentRequest): Promise<AgentResult> {
     await new Promise<void>((resolve, reject) => {
@@ -14,7 +22,7 @@ export class MockAdapter implements AgentAdapter {
     });
     return {
       text: `Remote AI received: ${request.prompt}`,
-      sessionId: request.contextId,
+      sessionId: request.externalSessionId ?? request.contextId,
     };
   }
 }

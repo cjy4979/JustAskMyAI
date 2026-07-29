@@ -1,6 +1,6 @@
 import type { SignedStatement } from "../protocol/signed-request.js";
 
-export const GROUP_OPERATIONS = ["task", "message", "artifact", "decision"] as const;
+export const GROUP_OPERATIONS = ["task", "message", "artifact", "decision", "context"] as const;
 export type GroupOperation = typeof GROUP_OPERATIONS[number];
 
 export interface ApprovalRule {
@@ -72,9 +72,9 @@ export type GroupTarget =
   | { broadcast: true };
 
 export interface DisclosureEnvelope {
-  version: 1;
-  fields: string[];
-  redactedFields: string[];
+  version: 2;
+  paths: string[];
+  redactedPaths: string[];
   contextDigest: string;
   approvalDigest?: string;
 }
@@ -94,6 +94,19 @@ export interface GroupEnvelope {
   target: GroupTarget;
   operation: GroupOperation;
   disclosure?: DisclosureEnvelope;
+  approvalSubjectDigest?: string;
+  approvalProofs?: ApprovalProof[];
+}
+
+export interface ApprovalProof {
+  version: 1;
+  taskDigest: string;
+  approverPrincipalId: string;
+  approverMemberId: string;
+  approvedScopes: string[];
+  deniedScopes: string[];
+  signedAt: string;
+  proof: SignedStatement;
 }
 
 export interface GroupReceipt {
@@ -118,6 +131,21 @@ export interface GroupReceipt {
   proof: SignedStatement;
 }
 
+export interface GroupReceiptEvidence {
+  authority: {
+    approvedScopes: string[];
+    deniedScopes: string[];
+    resources: string[];
+    approvalModes: string[];
+  };
+  approvals: unknown;
+  toolDecisions?: unknown[];
+  terminal?: {
+    status: "failed" | "cancelled";
+    error: string;
+  };
+}
+
 export interface GroupManifest {
   version: 2;
   workgroup: Workgroup;
@@ -133,5 +161,37 @@ export interface SignedGroupManifest {
   issuedByMemberId: string;
   issuedAt: string;
   validUntil: string;
+  ownerTransferAcceptance?: OwnerTransferAcceptance;
+  proof: SignedStatement;
+}
+
+export interface OwnerTransferAcceptance {
+  version: 1;
+  groupId: string;
+  baseManifestDigest: string;
+  fromOwnerMemberId: string;
+  toOwnerMemberId: string;
+  acceptedAt: string;
+  proof: SignedStatement;
+}
+
+export type GovernanceChange =
+  | {
+      kind: "member";
+      member: Omit<GroupMember, "createdAt" | "updatedAt">;
+    }
+  | {
+      kind: "policy";
+      rolePolicy: Record<string, GroupRoleGrant>;
+    };
+
+export interface SignedGovernanceProposal {
+  version: 1;
+  id: string;
+  groupId: string;
+  baseManifestDigest: string;
+  proposedByMemberId: string;
+  change: GovernanceChange;
+  createdAt: string;
   proof: SignedStatement;
 }
