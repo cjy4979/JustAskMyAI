@@ -77,6 +77,15 @@ Each gateway keeps a local copy of a workgroup manifest:
 workgroup + role policy + members + policy version + membership version
 ```
 
+The manifest is not trusted merely because a Human imported it. It is signed by a current
+Owner/Admin and linked to the previous manifest digest. Every active member also carries a
+Gateway-signed Human Principal, Agent, and Gateway sponsorship binding.
+
+Receivers request signed updates from the Owner before every Group operation. Updates advance
+one governance version, and a manifest lease bounds offline stale-state acceptance. Learned
+removals persist in a denylist and apply to task creation, continuation, reads, and
+cancellation.
+
 Group tasks carry a signed envelope containing the workgroup version, collaboration thread,
 sender member, target member or role, and operation. The receiver validates the envelope
 against its local manifest and the already-authenticated peer identity. Stale manifests,
@@ -86,9 +95,12 @@ Role routing is intentionally deterministic: `delegate_group_task` accepts a mem
 or a role that resolves to exactly one active remote member. It does not fan out, schedule a
 team, merge plans, or resolve Agent conflicts.
 
-On completion, the receiving gateway signs a receipt over the group ID, thread ID, task ID,
-artifact digest, acknowledging member, and timestamp. The sender verifies the Ed25519 proof
-against its pinned peer key before storing the receipt.
+Object context uses field selection, a redaction declaration, a sender Human approval, and a
+disclosure digest. The receiver rejects undeclared or changed fields.
+
+On completion, the receiving gateway signs a v2 receipt over governance versions, requester,
+responder, request, accepted authority, disclosure, approval, tool-decision, and artifact
+digests. The sender verifies the Ed25519 proof against its pinned peer key before storing it.
 
 ## Identity and request integrity
 
@@ -116,9 +128,13 @@ The owner can reduce requested scopes and add explicit denies during approval. E
 authority is:
 
 ```text
-(human-approved scopes - explicit denied scopes)
-∩ local owner policy
-∩ actual ACP tool name/kind
+sender sponsorship
+INTERSECT group role grant
+INTERSECT task request
+INTERSECT receiver Human approval
+INTERSECT local owner policy
+INTERSECT actual ACP tool name/kind
+MINUS all explicit denials
 ```
 
 Denied scopes override wildcard allows. `run-tests` applies only to a dedicated test-tool

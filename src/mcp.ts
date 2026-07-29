@@ -22,17 +22,24 @@ import {
 import { GroupStore } from "./group/store.js";
 import {
   createGroupEnvelope,
+  createDisclosureEnvelope,
+  digestValue,
   parseGroupReceipt,
   receiptBody,
 } from "./group/protocol.js";
-import type { GroupEnvelope, GroupMember, GroupTarget } from "./group/types.js";
+import type {
+  DisclosureEnvelope,
+  GroupEnvelope,
+  GroupMember,
+  GroupTarget,
+} from "./group/types.js";
 
 const daemonUrl = process.env.JAMAI_DAEMON_URL ?? "http://127.0.0.1:43121";
 const extensionParameters = { "A2A-Extensions": JAMAI_EXTENSION_URI };
 const server = new McpServer({ name: "just-ask-my-ai", version: "0.1.0" });
 const store = new GatewayStore();
 const identity = new GatewayIdentity(store);
-const groups = new GroupStore(store);
+const groups = new GroupStore(store, identity);
 const principalId = store.getOrCreateId("principalId");
 const agentId = store.getOrCreateId("agentId");
 const localPeerId = identity.peerId;
@@ -49,6 +56,7 @@ const commonInput = {
   approvalId: z.string().optional().describe("A bound approval ID returned by the remote node"),
   allowedActions: z.array(z.string().min(1)).default([]),
   deniedActions: z.array(z.string().min(1)).default([]),
+  resources: z.array(z.string().min(1)).default([]),
 };
 
 server.registerTool(
@@ -120,14 +128,19 @@ server.registerTool(
       approvalId: z.string().optional(),
       allowedActions: z.array(z.string().min(1)).default([]),
       deniedActions: z.array(z.string().min(1)).default([]),
+      resources: z.array(z.string().min(1)).default([]),
+      disclosureFields: z.array(z.string().min(1)).optional(),
+      redactedFields: z.array(z.string().min(1)).default([]),
+      disclosureApprovalId: z.string().min(1).optional(),
     },
   },
   async (input) => {
+    await groups.refreshFromAuthority(input.groupId);
     const workgroup = groups.getWorkgroup(input.groupId);
     if (!workgroup) throw new Error("workgroup not found");
     const sender = groups.findLocalMember(input.groupId, localPeerId);
     if (!sender) throw new Error("this gateway is not an active workgroup member");
-    if (!sender.roles.some((role) => workgroup.rolePolicy[role]?.includes("task"))) {
+    if (!sender.roles.some((role) => workgroup.rolePolicy[role]?.operations.includes("task"))) {
       throw new Error("local member role does not allow group tasks");
     }
     const { member: targetMember, target } = resolveGroupTarget(
@@ -145,14 +158,54 @@ server.registerTool(
         });
     if (!thread) throw new Error("group thread not found");
     if (thread.status !== "open") throw new Error("group thread is closed");
+    const disclosedContext = selectDisclosedContext(input.context, input.disclosureFields);
+    const disclosureFields = disclosedContext && typeof disclosedContext === "object"
+      && !Array.isArray(disclosedContext)
+      ? Object.keys(disclosedContext)
+      : [];
+    const unsignedDisclosure = createDisclosureEnvelope(
+      disclosedContext,
+      disclosureFields,
+      input.redactedFields,
+    );
+    const disclosureApproval = disclosedContext === undefined
+      ? undefined
+      : consumeOrRequestDisclosureApproval({
+          approvalId: input.disclosureApprovalId,
+          groupId: input.groupId,
+          threadId: thread.id,
+          targetMember: targetMember,
+          disclosure: unsignedDisclosure,
+        });
+    if (disclosureApproval?.required) {
+      return text(JSON.stringify({
+        status: "LOCAL_DISCLOSURE_APPROVAL_REQUIRED",
+        approvalId: disclosureApproval.approvalId,
+        groupId: input.groupId,
+        threadId: thread.id,
+        disclosureDigest: unsignedDisclosure.contextDigest,
+        fields: unsignedDisclosure.fields,
+        redactedFields: unsignedDisclosure.redactedFields,
+      }, null, 2));
+    }
+    const disclosure = createDisclosureEnvelope(
+      disclosedContext,
+      disclosureFields,
+      input.redactedFields,
+      disclosureApproval?.approvalDigest,
+    );
     const groupEnvelope = createGroupEnvelope({
       workgroup,
       thread,
       senderMemberId: sender.id,
       target,
       operation: "task",
+      disclosure,
     });
-    const delegation = taskFromInput(input.mode, input.expectedResult, input);
+    const delegation = taskFromInput(input.mode, input.expectedResult, {
+      ...input,
+      context: disclosedContext,
+    });
     return text(JSON.stringify(await sendRemoteTask({
       peerUrl: targetMember.url,
       expectedPeerId: targetMember.gatewayPeerId,
@@ -340,6 +393,7 @@ function taskFromInput(
     delegationId?: string;
     allowedActions: string[];
     deniedActions: string[];
+    resources: string[];
   },
 ): DelegatedTask {
   return createDelegatedTask({
@@ -353,6 +407,7 @@ function taskFromInput(
     authority: {
       allowed: input.allowedActions,
       denied: input.deniedActions,
+      resources: input.resources,
     },
   });
 }
@@ -497,10 +552,22 @@ function recordOutbound(
 }
 
 function storeGroupReceipt(
-  input: { groupEnvelope?: GroupEnvelope; expectedPeerId?: string },
+  input: {
+    groupEnvelope?: GroupEnvelope;
+    expectedPeerId?: string;
+    delegation: DelegatedTask;
+  },
   task: Task,
 ): void {
   if (!input.groupEnvelope) return;
+  const expectedRequestDigest = delegationDigest({
+    peerId: localPeerId,
+    taskId: task.id,
+    contextId: task.contextId,
+    task: input.delegation,
+    rawPrompt: input.delegation.objective,
+    groupEnvelope: input.groupEnvelope,
+  });
   const candidates = (task.artifacts ?? [])
     .map((artifact) => ({
       receipt: parseGroupReceipt(artifact.metadata?.groupReceipt),
@@ -517,9 +584,18 @@ function storeGroupReceipt(
     if (!receipt) continue;
     if (
       receipt.groupId !== input.groupEnvelope.groupId
+      || receipt.policyVersion !== input.groupEnvelope.policyVersion
+      || receipt.membershipVersion !== input.groupEnvelope.membershipVersion
       || receipt.threadId !== input.groupEnvelope.thread.id
       || receipt.taskId !== task.id
-      || receipt.eventDigest !== candidate.artifactDigest
+      || receipt.requesterMemberId !== input.groupEnvelope.senderMemberId
+      || receipt.requestDigest !== expectedRequestDigest
+      || receipt.disclosureDigest !== (
+        input.groupEnvelope.disclosure
+          ? digestValue(input.groupEnvelope.disclosure)
+          : undefined
+      )
+      || receipt.artifactDigest !== candidate.artifactDigest
     ) {
       throw new Error("remote group receipt does not match its task, thread, or artifact");
     }
@@ -529,7 +605,8 @@ function storeGroupReceipt(
       throw new Error("group receipt was signed by a different gateway");
     }
     const acknowledgingMember = groups.listMembers(receipt.groupId).find((member) =>
-      receipt.acknowledgedBy.includes(member.id)
+      receipt.responderMemberId === member.id
+      && receipt.signedBy.includes(member.id)
       && member.status === "active"
       && member.gatewayPeerId === verified.peerId
       && groupTargetMatches(input.groupEnvelope!.target, member));
@@ -547,14 +624,125 @@ function storeGroupReceipt(
       action: "verify-group-receipt",
       resource: receipt.groupId,
       decision: "allowed",
-      outputDigest: receipt.eventDigest,
+      inputDigest: receipt.requestDigest,
+      outputDigest: receipt.artifactDigest,
       metadata: {
         threadId: receipt.threadId,
         receiptId: receipt.id,
-        acknowledgedBy: receipt.acknowledgedBy,
+        requesterMemberId: receipt.requesterMemberId,
+        responderMemberId: receipt.responderMemberId,
+        acceptedAuthorityDigest: receipt.acceptedAuthorityDigest,
+        disclosureDigest: receipt.disclosureDigest,
+        toolDecisionDigest: receipt.toolDecisionDigest,
+        approvalDigest: receipt.approvalDigest,
       },
     });
   }
+}
+
+function selectDisclosedContext(
+  context: unknown,
+  fields: string[] | undefined,
+): unknown {
+  if (context === undefined) return undefined;
+  if (!context || typeof context !== "object" || Array.isArray(context)) {
+    if (fields && fields.length > 0) {
+      throw new Error("disclosureFields can only select fields from an object context");
+    }
+    return context;
+  }
+  if (!fields) {
+    throw new Error("group object context requires explicit disclosureFields");
+  }
+  const source = context as Record<string, unknown>;
+  const unknown = fields.filter((field) => !(field in source));
+  if (unknown.length > 0) {
+    throw new Error(`disclosureFields are absent from context: ${unknown.join(", ")}`);
+  }
+  return Object.fromEntries(fields.map((field) => [field, source[field]]));
+}
+
+function consumeOrRequestDisclosureApproval(input: {
+  approvalId?: string;
+  groupId: string;
+  threadId: string;
+  targetMember: GroupMember;
+  disclosure: DisclosureEnvelope;
+}): { required: true; approvalId: string } | {
+  required: false;
+  approvalDigest: string;
+} {
+  const requestHash = digestValue({
+    groupId: input.groupId,
+    threadId: input.threadId,
+    targetMemberId: input.targetMember.id,
+    targetPeerId: input.targetMember.gatewayPeerId,
+    disclosure: input.disclosure,
+  });
+  const binding = {
+    peerId: input.targetMember.gatewayPeerId,
+    taskId: `disclosure:${requestHash.slice(0, 32)}`,
+    contextId: input.threadId,
+    requestHash,
+  };
+  const requestedScopes = input.disclosure.fields.length > 0
+    ? input.disclosure.fields.map((field) => `disclose:${field}`)
+    : ["disclose:context"];
+  const consumed = input.approvalId
+    ? store.consumeApproval(input.approvalId, binding)
+    : undefined;
+  if (consumed) {
+    if (requestedScopes.some((scope) => !consumed.approvedScopes.includes(scope))) {
+      throw new Error("local Human approved only a subset; reduce disclosureFields and request again");
+    }
+    const approvalDigest = digestValue({
+      id: consumed.id,
+      requestHash: consumed.requestHash,
+      approvedScopes: consumed.approvedScopes,
+      deniedScopes: consumed.deniedScopes,
+      resolvedAt: consumed.resolvedAt,
+    });
+    store.appendAudit({
+      eventType: "disclosure.approved",
+      principalId,
+      agentId,
+      peerId: input.targetMember.gatewayPeerId,
+      taskId: binding.taskId,
+      contextId: input.threadId,
+      approvalId: consumed.id,
+      action: "disclose-group-context",
+      resource: input.groupId,
+      decision: "approved",
+      inputDigest: input.disclosure.contextDigest,
+      outputDigest: approvalDigest,
+      metadata: {
+        fields: input.disclosure.fields,
+        redactedFields: input.disclosure.redactedFields,
+      },
+    });
+    return { required: false, approvalDigest };
+  }
+  const approval = store.createApproval({
+    ...binding,
+    requestedScopes,
+  });
+  store.appendAudit({
+    eventType: "disclosure.approval-requested",
+    principalId,
+    agentId,
+    peerId: input.targetMember.gatewayPeerId,
+    taskId: binding.taskId,
+    contextId: input.threadId,
+    approvalId: approval.id,
+    action: "disclose-group-context",
+    resource: input.groupId,
+    inputDigest: input.disclosure.contextDigest,
+    metadata: {
+      fields: input.disclosure.fields,
+      redactedFields: input.disclosure.redactedFields,
+    },
+  });
+  return { required: true, approvalId: approval.id };
 }
 
 function groupTargetMatches(target: GroupTarget, member: GroupMember): boolean {

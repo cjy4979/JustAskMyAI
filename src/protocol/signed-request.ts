@@ -12,7 +12,12 @@ import type { GroupEnvelope } from "../group/types.js";
 export const JAMAI_EXTENSION_URI = "urn:justaskmyai:delegation:v1";
 export const JAMAI_AUTH_HEADER = "x-jamai-auth";
 
-export type SignedAction = "task.send" | "task.continue" | "task.get" | "task.cancel";
+export type SignedAction =
+  | "task.send"
+  | "task.continue"
+  | "task.get"
+  | "task.cancel"
+  | "group.manifest.get";
 
 export interface SignedRequest {
   version: 1;
@@ -104,7 +109,7 @@ export class GatewayIdentity {
       issuerPeerId: this.peerId,
       signedAt: new Date().toISOString(),
       nonce: randomUUID(),
-      payloadHash: digestPayload(payload),
+      payloadHash: digestStatementPayload(payload),
     };
     return {
       ...body,
@@ -137,7 +142,7 @@ export function verifySignedStatement(
   if (peerIdFromPublicKey(raw.publicKey) !== raw.issuerPeerId) {
     return { ok: false, reason: "statement issuer does not match public key" };
   }
-  if (digestPayload(payload) !== raw.payloadHash) {
+  if (digestStatementPayload(payload) !== raw.payloadHash) {
     return { ok: false, reason: "statement payload digest does not match" };
   }
   const body = {
@@ -247,7 +252,13 @@ function parseSignedRequest(value: unknown): SignedRequest | undefined {
     raw.version !== 1
     || typeof raw.issuerPeerId !== "string"
     || typeof raw.audiencePeerId !== "string"
-    || !["task.send", "task.continue", "task.get", "task.cancel"].includes(String(raw.action))
+    || ![
+      "task.send",
+      "task.continue",
+      "task.get",
+      "task.cancel",
+      "group.manifest.get",
+    ].includes(String(raw.action))
     || typeof raw.publicKey !== "string"
     || typeof raw.sentAt !== "string"
     || typeof raw.nonce !== "string"
@@ -291,12 +302,23 @@ function digestPayload(payload: unknown): string {
   return createHash("sha256").update(canonicalJson(normalizePayload(payload))).digest("hex");
 }
 
+function digestStatementPayload(payload: unknown): string {
+  const serialized = JSON.stringify(payload ?? null);
+  const normalized = serialized === undefined ? null : JSON.parse(serialized);
+  return createHash("sha256").update(canonicalJson(normalized)).digest("hex");
+}
+
+function normalizeWireValue(value: unknown): unknown {
+  const serialized = JSON.stringify(value ?? null);
+  return serialized === undefined ? null : JSON.parse(serialized);
+}
+
 function normalizePayload(payload: unknown): unknown {
   if (!isDelegationPayload(payload)) return payload ?? null;
   return {
     text: payload.text,
     delegation: normalizeDelegation(payload.delegation),
-    groupEnvelope: payload.groupEnvelope ?? null,
+    groupEnvelope: normalizeWireValue(payload.groupEnvelope),
   };
 }
 
@@ -319,6 +341,7 @@ function normalizeDelegation(delegation: DelegatedTask): unknown {
       ? {
           allowed: delegation.authority.allowed,
           denied: delegation.authority.denied,
+          resources: delegation.authority.resources ?? [],
         }
       : null,
   };

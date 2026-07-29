@@ -11,23 +11,25 @@ import {
   type SignedAction,
 } from "./protocol/signed-request.js";
 import type { GatewayStore } from "./storage/sqlite.js";
+import type { GroupStore } from "./group/store.js";
 
 export function secureTaskControls(
   handler: A2ARequestHandler,
   store: GatewayStore,
   identity: { peerId: string; principalId: string; agentId: string },
+  groups?: GroupStore,
 ): A2ARequestHandler {
   return new Proxy(handler, {
     get(target, property, receiver) {
       if (property === "getTask") {
         return async (params: GetTaskRequest, context: ServerCallContext) => {
-          authorize("task.get", params.id, context, store, identity);
+          await authorize("task.get", params.id, context, store, identity, groups);
           return target.getTask(params, context);
         };
       }
       if (property === "cancelTask") {
         return async (params: CancelTaskRequest, context: ServerCallContext) => {
-          authorize("task.cancel", params.id, context, store, identity);
+          await authorize("task.cancel", params.id, context, store, identity, groups);
           return target.cancelTask(params, context);
         };
       }
@@ -53,13 +55,14 @@ export function secureTaskControls(
   });
 }
 
-function authorize(
+async function authorize(
   action: SignedAction,
   taskId: string,
   context: ServerCallContext,
   store: GatewayStore,
   identity: { peerId: string; principalId: string; agentId: string },
-): void {
+  groups?: GroupStore,
+): Promise<void> {
   const headers = context.state.get(STATE_HEADERS_KEY) as
     | Record<string, string | string[] | undefined>
     | undefined;
@@ -77,7 +80,7 @@ function authorize(
   }, store);
   const task = store.getRemoteTask(taskId);
   const verifiedPeerId = verified.ok ? verified.peerId : undefined;
-  const denial = !verified.ok
+  let denial = !verified.ok
     ? verified.reason
     : !task
       ? "task is not present in the gateway ledger"
@@ -86,6 +89,9 @@ function authorize(
         : task.contextId !== claimedContextId
           ? "signed context does not match task"
           : undefined;
+  if (!denial && groups && verifiedPeerId) {
+    denial = await groups.authorizeTaskControl(taskId, verifiedPeerId);
+  }
   if (denial) {
     store.appendAudit({
       eventType: "task.control-rejected",

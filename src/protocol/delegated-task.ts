@@ -19,6 +19,7 @@ export interface DelegatedTask {
   authority?: {
     allowed: string[];
     denied: string[];
+    resources?: string[];
   };
 }
 
@@ -86,6 +87,7 @@ export function buildDelegationPrompt(task: DelegatedTask): string {
       ? [
           `Caller-declared allowed actions: ${task.authority.allowed.join(", ") || "none"}`,
           `Caller-declared denied actions: ${task.authority.denied.join(", ") || "none"}`,
+          `Caller-declared resources: ${task.authority.resources?.join(", ") || "unspecified"}`,
           "Local owner policy always overrides caller-declared authority.",
           "",
         ]
@@ -108,7 +110,38 @@ export function delegationDigest(input: {
   rawPrompt: string;
   groupEnvelope?: GroupEnvelope;
 }): string {
-  return createHash("sha256").update(canonicalJson(input)).digest("hex");
+  const normalized = {
+    peerId: input.peerId,
+    taskId: input.taskId,
+    contextId: input.contextId,
+    task: input.task
+      ? {
+          version: input.task.version,
+          delegationId: input.task.delegationId,
+          mode: input.task.mode,
+          objective: input.task.objective,
+          role: input.task.role ?? null,
+          context: input.task.context ?? null,
+          acceptanceCriteria: input.task.acceptanceCriteria ?? [],
+          expectedResult: input.task.expectedResult
+            ? {
+                type: input.task.expectedResult.type,
+                mediaTypes: input.task.expectedResult.mediaTypes ?? [],
+              }
+            : null,
+          authority: input.task.authority
+            ? {
+                allowed: input.task.authority.allowed,
+                denied: input.task.authority.denied,
+                resources: input.task.authority.resources ?? [],
+              }
+            : null,
+        }
+      : null,
+    rawPrompt: input.rawPrompt,
+    groupEnvelope: input.groupEnvelope ?? null,
+  };
+  return createHash("sha256").update(canonicalJson(normalized)).digest("hex");
 }
 
 export function canonicalJson(value: unknown): string {
@@ -138,7 +171,11 @@ function parseExpectedResult(value: unknown): DelegatedTask["expectedResult"] {
 function parseAuthority(value: unknown): DelegatedTask["authority"] {
   if (!value || typeof value !== "object") return undefined;
   const raw = value as Record<string, unknown>;
-  return { allowed: stringArray(raw.allowed), denied: stringArray(raw.denied) };
+  return {
+    allowed: stringArray(raw.allowed),
+    denied: stringArray(raw.denied),
+    resources: stringArray(raw.resources),
+  };
 }
 
 function stringifyContext(value: unknown): string {

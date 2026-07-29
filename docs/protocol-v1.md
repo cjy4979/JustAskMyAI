@@ -24,7 +24,12 @@ interface SignedRequest {
   version: 1;
   issuerPeerId: string;
   audiencePeerId: string;
-  action: "task.send" | "task.continue" | "task.get" | "task.cancel";
+  action:
+    | "task.send"
+    | "task.continue"
+    | "task.get"
+    | "task.cancel"
+    | "group.manifest.get";
   messageId?: string;
   taskId?: string;
   contextId?: string;
@@ -48,6 +53,7 @@ Bindings:
 | `task.continue` | audience, message ID, task ID, context ID, delegation payload |
 | `task.get` | audience, task ID, context ID |
 | `task.cancel` | audience, task ID, context ID |
+| `group.manifest.get` | audience, group ID, installed manifest digest |
 
 Send and continue place `SignedRequest` in A2A message metadata as `requestAuth`. Get and
 cancel encode it as base64url JSON in the `x-jamai-auth` HTTP header.
@@ -86,14 +92,26 @@ An optional `groupEnvelope` in A2A message metadata is covered by the signed req
 
 ```ts
 interface GroupEnvelope {
-  version: 1;
+  version: 2;
   groupId: string;
   policyVersion: number;
   membershipVersion: number;
-  thread: { id: string; objective: string };
+  thread: {
+    id: string;
+    version: number;
+    objective: string;
+    objectiveDigest: string;
+  };
   senderMemberId: string;
   target: { memberId: string } | { role: string } | { broadcast: true };
   operation: "task" | "message" | "artifact" | "decision";
+  disclosure?: {
+    version: 1;
+    fields: string[];
+    redactedFields: string[];
+    contextDigest: string;
+    approvalDigest?: string;
+  };
 }
 ```
 
@@ -105,13 +123,41 @@ remote member has that role.
 The Group Envelope is also part of the human approval request digest. Updating membership,
 policy, target, or thread invalidates an earlier approval.
 
-## Signed Group Receipt
+## Signed sponsorship and manifest
+
+Each active member carries a Gateway-signed `AgentSponsorship`. The Group governance
+checkpoint is:
+
+```ts
+interface SignedGroupManifest {
+  version: 1;
+  manifest: GroupManifest;
+  manifestDigest: string;
+  previousManifestDigest?: string;
+  issuedByMemberId: string;
+  issuedAt: string;
+  validUntil: string;
+  proof: SignedStatement;
+}
+```
+
+An update must be signed by an active Owner/Admin authorized by the previously installed
+manifest, extend its digest, and advance exactly one membership or policy version. Manifest
+retrieval is authenticated with `group.manifest.get`. Invalid updates fail closed; network
+unavailability permits the last state only until its signed lease expires.
+
+## Signed Group Receipt v2
 
 On successful completion, the receiver returns `groupReceipt` in artifact metadata. The
 receipt binds:
 
 ```text
-groupId + threadId + taskId + eventDigest + acknowledgedBy + createdAt
+group and governance versions
++ thread and task
++ requester and responder
++ request and accepted-authority digests
++ disclosure, artifact, tool-decision, and approval digests
++ status, signers, and timestamp
 ```
 
 Its `proof` is an Ed25519 signed statement containing the issuer peer, public key, timestamp,

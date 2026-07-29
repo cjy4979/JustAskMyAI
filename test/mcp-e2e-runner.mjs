@@ -11,6 +11,7 @@ const root = mkdtempSync(path.join(tmpdir(), "jamai-mcp-dual-e2e-"));
 const alice = gateway("Alice MCP", 43220, 43221, path.join(root, "alice", "gateway.db"));
 const bob = gateway("Bob MCP", 43222, 43223, path.join(root, "bob", "gateway.db"));
 let mcp;
+let bobMcp;
 
 try {
   await Promise.all([waitReady(alice), waitReady(bob)]);
@@ -26,12 +27,12 @@ try {
   const createdGroup = await postJson(`${alice.managementUrl}/api/groups`, {
     name: "Dual gateway release team",
   });
-  const aliceMember = createdGroup.members.find(
+  const aliceMember = createdGroup.manifest.members.find(
     (member) => member.gatewayPeerId === aliceIdentity.peerId,
   );
   if (!aliceMember) throw new Error("Alice group owner member was not created");
   const memberResult = await postJson(
-    `${alice.managementUrl}/api/groups/${createdGroup.workgroup.id}/members`,
+    `${alice.managementUrl}/api/groups/${createdGroup.manifest.workgroup.id}/members`,
     {
       principalId: bobIdentity.principalId,
       agentId: bobIdentity.agentId,
@@ -40,12 +41,13 @@ try {
       url: bob.publicUrl,
       roles: ["member"],
       sponsoredBy: aliceIdentity.principalId,
+      sponsorship: bobIdentity.sponsorship,
       status: "active",
     },
   );
   const bobMember = memberResult.member;
   const groupManifest = await getJson(
-    `${alice.managementUrl}/api/groups/${createdGroup.workgroup.id}/manifest`,
+    `${alice.managementUrl}/api/groups/${createdGroup.manifest.workgroup.id}/manifest`,
   );
   await postJson(`${bob.managementUrl}/api/groups/import`, groupManifest);
 
@@ -65,6 +67,17 @@ try {
   });
   mcp = new Client({ name: "mcp-dual-e2e", version: "0.1.0" });
   await mcp.connect(transport);
+  const bobTransport = new StdioClientTransport({
+    command: process.execPath,
+    args: ["dist/src/mcp.js"],
+    env: {
+      ...Object.fromEntries(Object.entries(process.env).filter(([, value]) => value !== undefined)),
+      JAMAI_DAEMON_URL: bob.managementUrl,
+      JAMAI_DB_PATH: bob.dbPath,
+    },
+  });
+  bobMcp = new Client({ name: "mcp-revocation-e2e", version: "0.1.0" });
+  await bobMcp.connect(bobTransport);
   const tools = await mcp.listTools();
   const names = tools.tools.map((tool) => tool.name);
   for (const expected of [
@@ -114,7 +127,7 @@ try {
   const threadResult = await mcp.callTool({
     name: "create_group_thread",
     arguments: {
-      groupId: createdGroup.workgroup.id,
+      groupId: createdGroup.manifest.workgroup.id,
       objective: "Prepare the dual-gateway group release",
     },
   });
@@ -124,7 +137,7 @@ try {
   const groupResult = await mcp.callTool({
     name: "delegate_group_task",
     arguments: {
-      groupId: createdGroup.workgroup.id,
+      groupId: createdGroup.manifest.workgroup.id,
       threadId: groupThread.id,
       targetMemberId: bobMember.id,
       objective: "Verify the dual-gateway group task",
@@ -140,13 +153,58 @@ try {
   const receipts = await mcp.callTool({
     name: "list_group_receipts",
     arguments: {
-      groupId: createdGroup.workgroup.id,
+      groupId: createdGroup.manifest.workgroup.id,
       threadId: groupThread.id,
     },
   });
   const receiptsOutput = JSON.stringify(receipts);
   if (!receiptsOutput.includes(bobIdentity.peerId) || !receiptsOutput.includes("signature")) {
     throw new Error(`verified group receipt was not persisted: ${receiptsOutput}`);
+  }
+  const disclosureArguments = {
+    groupId: createdGroup.manifest.workgroup.id,
+    threadId: groupThread.id,
+    targetMemberId: bobMember.id,
+    objective: "Review only the explicitly disclosed project field",
+    context: {
+      projectStatus: "tests passing",
+      privateNote: "must never cross the gateway",
+    },
+    disclosureFields: ["projectStatus"],
+    redactedFields: ["privateNote"],
+    allowedActions: [],
+    deniedActions: [],
+  };
+  const disclosurePending = await mcp.callTool({
+    name: "delegate_group_task",
+    arguments: disclosureArguments,
+  });
+  const disclosurePendingText = disclosurePending.content
+    ?.find((item) => item.type === "text")?.text;
+  const disclosureTicket = disclosurePendingText ? JSON.parse(disclosurePendingText) : {};
+  if (
+    disclosureTicket.status !== "LOCAL_DISCLOSURE_APPROVAL_REQUIRED"
+    || !disclosureTicket.approvalId
+  ) {
+    throw new Error(`sender disclosure approval was not required: ${JSON.stringify(disclosurePending)}`);
+  }
+  await postJson(
+    `${alice.managementUrl}/api/approvals/${disclosureTicket.approvalId}/approve`,
+    {
+      approvedScopes: ["disclose:projectStatus"],
+      deniedScopes: ["disclose:privateNote"],
+    },
+  );
+  const disclosureResult = await mcp.callTool({
+    name: "delegate_group_task",
+    arguments: {
+      ...disclosureArguments,
+      disclosureApprovalId: disclosureTicket.approvalId,
+    },
+  });
+  const disclosureOutput = JSON.stringify(disclosureResult);
+  if (!disclosureOutput.includes("COMPLETED") || disclosureOutput.includes("must never cross")) {
+    throw new Error(`controlled disclosure failed: ${disclosureOutput}`);
   }
 
   const fetched = await mcp.callTool({
@@ -186,6 +244,75 @@ try {
   }
   if (!unsignedCancelRejected) throw new Error("unsigned task.cancel was not rejected");
 
+  const bobThreadResult = await bobMcp.callTool({
+    name: "create_group_thread",
+    arguments: {
+      groupId: createdGroup.manifest.workgroup.id,
+      objective: "Verify group revocation propagation",
+    },
+  });
+  const bobThreadText = bobThreadResult.content?.find((item) => item.type === "text")?.text;
+  const bobThread = bobThreadText ? JSON.parse(bobThreadText) : {};
+  const bobDelegation = await bobMcp.callTool({
+    name: "delegate_group_task",
+    arguments: {
+      groupId: createdGroup.manifest.workgroup.id,
+      threadId: bobThread.id,
+      targetMemberId: aliceMember.id,
+      objective: "Create a task that will later be protected by revocation",
+      acceptanceCriteria: ["Return a signed receipt"],
+      allowedActions: [],
+      deniedActions: ["network"],
+    },
+  });
+  const bobDelegationText = bobDelegation.content?.find((item) => item.type === "text")?.text;
+  const bobTask = bobDelegationText ? JSON.parse(bobDelegationText) : {};
+  if (!bobTask.taskId || !bobTask.contextId || bobTask.stateName !== "COMPLETED") {
+    throw new Error(`Bob group task did not complete before revocation: ${JSON.stringify(bobDelegation)}`);
+  }
+  await postJson(
+    `${alice.managementUrl}/api/groups/${createdGroup.manifest.workgroup.id}/members`,
+    {
+      id: bobMember.id,
+      principalId: bobIdentity.principalId,
+      agentId: bobIdentity.agentId,
+      gatewayPeerId: bobIdentity.peerId,
+      displayName: "Bob MCP",
+      url: bob.publicUrl,
+      roles: ["member"],
+      sponsoredBy: aliceIdentity.principalId,
+      sponsorship: bobIdentity.sponsorship,
+      status: "removed",
+    },
+  );
+  const revokedControl = await bobMcp.callTool({
+    name: "get_remote_task",
+    arguments: {
+      peerUrl: alice.publicUrl,
+      taskId: bobTask.taskId,
+      contextId: bobTask.contextId,
+    },
+  });
+  if (
+    !revokedControl.isError
+    || !/revoked|no longer an active group member/.test(JSON.stringify(revokedControl))
+  ) {
+    throw new Error(`revoked Bob could still read a group task: ${JSON.stringify(revokedControl)}`);
+  }
+  const staleSend = await bobMcp.callTool({
+    name: "delegate_group_task",
+    arguments: {
+      groupId: createdGroup.manifest.workgroup.id,
+      targetMemberId: aliceMember.id,
+      objective: "This stale member request must be rejected",
+      allowedActions: [],
+      deniedActions: [],
+    },
+  });
+  if (!/REJECTED|authority rejected synchronization/.test(JSON.stringify(staleSend))) {
+    throw new Error(`removed Bob could still create a group task: ${JSON.stringify(staleSend)}`);
+  }
+
   console.log(JSON.stringify({
     tools: names,
     alicePeerId: aliceIdentity.peerId,
@@ -196,10 +323,14 @@ try {
     signedGet: true,
     groupTask: true,
     signedGroupReceipt: true,
+    controlledDisclosure: true,
+    revocationControlsRejected: true,
+    staleMemberSendRejected: true,
     unsignedControlsRejected: true,
   }));
 } finally {
   await mcp?.close();
+  await bobMcp?.close();
   await Promise.all([stop(alice), stop(bob)]);
   rmSync(root, { recursive: true, force: true });
 }

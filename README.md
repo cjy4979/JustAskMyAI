@@ -29,9 +29,15 @@ perform bounded work within that authority.
 - Signed and audience-bound send, continue, get, and cancel operations
 - ACP tool permission enforcement against approved scopes and local policy
 - Persistent workgroups, members, roles, and collaboration threads
+- Gateway-signed Human-to-Agent sponsorship bindings
+- Owner/Admin-signed Group Manifest changes linked by previous digest
+- Authenticated automatic manifest synchronization, leases, and revocation denylist enforcement
 - Signed Group Envelopes bound to the sender, target, policy version, and membership version
+- Sender-side Human approval, field selection, redaction declaration, and over-disclosure checks
+- Role grants for operations, scopes, explicit denies, resources, and approval rules
 - Single-member and unambiguous single-role group routing
-- Ed25519-signed completion receipts verified and stored by both gateways
+- Ed25519-signed accountability receipts binding request, authority, disclosure, approval,
+  tool decisions, and artifact digests
 
 The public relay remains experimental. Do not expose a gateway to an untrusted public
 network until end-to-end relay encryption, identity revocation, and
@@ -91,11 +97,18 @@ Invoke-RestMethod `
 - The audit hash chain detects local modification but is not independently anchored. Group
   completion receipts are signed by the receiving gateway, but external audit checkpoints
   are not implemented yet.
-- Pairing is explicit, but peer revocation and key rotation are not implemented yet.
+- Group membership revocation is enforced. Gateway key revocation and key rotation are not
+  implemented yet.
 - Initial Agent Card retrieval uses ordinary HTTP. Pairing currently pins a key; it does not
   prove a real-world identity against an active first-contact network attacker.
-- Group manifests are imported through each machine's localhost management API. Automatic,
-  signed membership synchronization is not implemented yet.
+- A new member bootstraps from an Owner-signed manifest through localhost. Subsequent
+  manifests synchronize automatically. If the Owner is unreachable, an installed manifest
+  remains usable only until its lease expires; the default lease is five minutes.
+- `receiver-and-owner` and `two-person` approval rules are represented and fail closed, but
+  collection of multiple per-task approval proofs is not implemented yet.
+- Unsigned Group Layer snapshots created by an earlier prototype are intentionally not
+  trusted or upgraded automatically; recreate the group or import a new Owner-signed
+  checkpoint.
 
 `npm run check` launches isolated Alice and Bob gateways with separate databases and
 identities, performs bilateral pairing, then runs A2A and MCP delegation tests.
