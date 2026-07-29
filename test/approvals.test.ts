@@ -39,3 +39,43 @@ test("auto mode does not create approval", () => {
   assert.equal(policy.request(binding, ["ask"]), undefined);
   store.close();
 });
+
+test("human can narrow requested scopes and add explicit denies", () => {
+  const store = new GatewayStore(":memory:");
+  const policy = new ApprovalPolicy("always_ask", store);
+  const approval = policy.request(binding, ["read-workspace", "edit-workspace", "tool:*"]);
+  assert.ok(approval);
+  const resolved = policy.resolve(approval.id, "approved", {
+    approvedScopes: ["read-workspace", "tool:*"],
+    deniedScopes: ["network"],
+  });
+  assert.deepEqual(resolved?.approvedScopes, ["read-workspace", "tool:*"]);
+  assert.deepEqual(resolved?.deniedScopes, ["network", "edit-workspace"]);
+  store.close();
+});
+
+test("human approval cannot expand caller-requested scopes", () => {
+  const store = new GatewayStore(":memory:");
+  const policy = new ApprovalPolicy("always_ask", store);
+  const approval = policy.request(binding, ["read-workspace"]);
+  assert.ok(approval);
+  assert.throws(
+    () => policy.resolve(approval.id, "approved", { approvedScopes: ["edit-workspace"] }),
+    /subset/,
+  );
+  store.close();
+});
+
+test("human can narrow a requested wildcard to specific scopes", () => {
+  const store = new GatewayStore(":memory:");
+  const policy = new ApprovalPolicy("always_ask", store);
+  const approval = policy.request(binding, ["tool:*"]);
+  assert.ok(approval);
+  const resolved = policy.resolve(approval.id, "approved", {
+    approvedScopes: ["read-workspace", "tool:pytest"],
+    deniedScopes: ["network"],
+  });
+  assert.deepEqual(resolved?.approvedScopes, ["read-workspace", "tool:pytest"]);
+  assert.deepEqual(resolved?.deniedScopes, ["network"]);
+  store.close();
+});

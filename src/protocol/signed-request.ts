@@ -7,6 +7,7 @@ import {
 } from "node:crypto";
 import { canonicalJson, type DelegatedTask } from "./delegated-task.js";
 import type { GatewayStore } from "../storage/sqlite.js";
+import type { GroupEnvelope } from "../group/types.js";
 
 export const JAMAI_EXTENSION_URI = "urn:justaskmyai:delegation:v1";
 export const JAMAI_AUTH_HEADER = "x-jamai-auth";
@@ -23,6 +24,16 @@ export interface SignedRequest {
   contextId?: string;
   publicKey: string;
   sentAt: string;
+  nonce: string;
+  payloadHash: string;
+  signature: string;
+}
+
+export interface SignedStatement {
+  version: 1;
+  issuerPeerId: string;
+  publicKey: string;
+  signedAt: string;
   nonce: string;
   payloadHash: string;
   signature: string;
@@ -86,6 +97,72 @@ export class GatewayIdentity {
       signature: sign(null, Buffer.from(canonicalJson(body)), this.privateKey).toString("base64"),
     };
   }
+
+  signStatement(payload: unknown): SignedStatement {
+    const body = {
+      version: 1 as const,
+      issuerPeerId: this.peerId,
+      signedAt: new Date().toISOString(),
+      nonce: randomUUID(),
+      payloadHash: digestPayload(payload),
+    };
+    return {
+      ...body,
+      publicKey: this.publicKey,
+      signature: sign(null, Buffer.from(canonicalJson(body)), this.privateKey).toString("base64"),
+    };
+  }
+}
+
+export function verifySignedStatement(
+  value: unknown,
+  payload: unknown,
+  store: GatewayStore,
+): { ok: true; peerId: string } | { ok: false; reason: string } {
+  if (!value || typeof value !== "object") {
+    return { ok: false, reason: "missing signed statement" };
+  }
+  const raw = value as Record<string, unknown>;
+  if (
+    raw.version !== 1
+    || typeof raw.issuerPeerId !== "string"
+    || typeof raw.publicKey !== "string"
+    || typeof raw.signedAt !== "string"
+    || typeof raw.nonce !== "string"
+    || typeof raw.payloadHash !== "string"
+    || typeof raw.signature !== "string"
+  ) {
+    return { ok: false, reason: "malformed signed statement" };
+  }
+  if (peerIdFromPublicKey(raw.publicKey) !== raw.issuerPeerId) {
+    return { ok: false, reason: "statement issuer does not match public key" };
+  }
+  if (digestPayload(payload) !== raw.payloadHash) {
+    return { ok: false, reason: "statement payload digest does not match" };
+  }
+  const body = {
+    version: 1 as const,
+    issuerPeerId: raw.issuerPeerId,
+    signedAt: raw.signedAt,
+    nonce: raw.nonce,
+    payloadHash: raw.payloadHash,
+  };
+  try {
+    if (!verify(
+      null,
+      Buffer.from(canonicalJson(body)),
+      raw.publicKey,
+      Buffer.from(raw.signature, "base64"),
+    )) {
+      return { ok: false, reason: "statement signature verification failed" };
+    }
+  } catch {
+    return { ok: false, reason: "invalid statement key or signature encoding" };
+  }
+  if (!store.isPeerPaired(raw.issuerPeerId, raw.publicKey)) {
+    return { ok: false, reason: "statement issuer is not explicitly paired" };
+  }
+  return { ok: true, peerId: raw.issuerPeerId };
 }
 
 export function verifySignedRequest(
@@ -219,6 +296,7 @@ function normalizePayload(payload: unknown): unknown {
   return {
     text: payload.text,
     delegation: normalizeDelegation(payload.delegation),
+    groupEnvelope: payload.groupEnvelope ?? null,
   };
 }
 
@@ -246,7 +324,11 @@ function normalizeDelegation(delegation: DelegatedTask): unknown {
   };
 }
 
-function isDelegationPayload(value: unknown): value is { delegation: DelegatedTask; text: string } {
+function isDelegationPayload(value: unknown): value is {
+  delegation: DelegatedTask;
+  text: string;
+  groupEnvelope?: GroupEnvelope;
+} {
   return Boolean(
     value
     && typeof value === "object"

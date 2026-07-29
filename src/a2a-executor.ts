@@ -21,6 +21,14 @@ import {
 import type { RemoteArtifact } from "./protocol/artifact.js";
 import type { GatewayStore } from "./storage/sqlite.js";
 import { verifySignedRequest } from "./protocol/signed-request.js";
+import type { GatewayIdentity } from "./protocol/signed-request.js";
+import { GroupStore } from "./group/store.js";
+import {
+  createReceipt,
+  parseGroupEnvelope,
+} from "./group/protocol.js";
+import { validateGroupEnvelope } from "./group/policy.js";
+import type { GroupMember } from "./group/types.js";
 
 export class BridgeExecutor implements AgentExecutor {
   private readonly controllers = new Map<string, AbortController>();
@@ -29,13 +37,21 @@ export class BridgeExecutor implements AgentExecutor {
     private readonly adapter: AgentAdapter,
     private readonly approvals: ApprovalPolicy,
     private readonly store: GatewayStore,
-    private readonly identity: { peerId: string; principalId: string; agentId: string },
+    private readonly identity: {
+      peerId: string;
+      principalId: string;
+      agentId: string;
+      signStatement: GatewayIdentity["signStatement"];
+    },
+    private readonly groups: GroupStore,
   ) {}
 
   async execute(context: RequestContext, bus: ExecutionEventBus): Promise<void> {
     const { taskId, contextId, userMessage } = context;
     const metadata = (userMessage.metadata ?? {}) as Record<string, unknown>;
     const delegation = parseDelegatedTask(metadata);
+    const groupEnvelope = parseGroupEnvelope(metadata.groupEnvelope);
+    const hasGroupEnvelope = metadata.groupEnvelope !== undefined;
     const rawPrompt = textFromMessage(userMessage);
     const prompt = delegation
       ? buildDelegationPrompt(delegation)
@@ -47,7 +63,11 @@ export class BridgeExecutor implements AgentExecutor {
           messageId: userMessage.messageId,
           taskId: context.task ? taskId : undefined,
           contextId: context.task ? contextId : undefined,
-          payload: { delegation, text: rawPrompt },
+          payload: {
+            delegation,
+            text: rawPrompt,
+            groupEnvelope: metadata.groupEnvelope,
+          },
         }, this.store)
       : { ok: false as const, reason: "missing or malformed delegation envelope" };
     const peerId = signedIdentity.ok ? signedIdentity.peerId : "unverified-peer";
@@ -58,6 +78,7 @@ export class BridgeExecutor implements AgentExecutor {
       contextId,
       task: delegation,
       rawPrompt,
+      groupEnvelope,
     });
     const approvalBinding = { peerId, taskId, contextId, requestHash };
     const task: Task = context.task ?? {
@@ -103,6 +124,117 @@ export class BridgeExecutor implements AgentExecutor {
       }));
       return;
     }
+    if (hasGroupEnvelope && !groupEnvelope) {
+      this.store.upsertRemoteTask({
+        id: taskId,
+        contextId,
+        delegationId: delegation?.delegationId,
+        peerId,
+        mode: delegation?.mode ?? "ask",
+        status: "rejected",
+        requestHash,
+        request: delegation,
+        result: { error: "malformed group envelope" },
+      });
+      this.audit("group.envelope-rejected", {
+        peerId,
+        taskId,
+        contextId,
+        delegationId: delegation?.delegationId,
+        action: "validate-group-envelope",
+        decision: "denied",
+        decisionReason: "malformed group envelope",
+        inputDigest: requestHash,
+      });
+      bus.publish(AgentEvent.statusUpdate({
+        taskId,
+        contextId,
+        status: {
+          state: TaskState.TASK_STATE_REJECTED,
+          timestamp: now(),
+          message: agentMessage(taskId, contextId, "malformed group envelope"),
+        },
+        metadata: { jamaiStatus: "rejected" },
+      }));
+      return;
+    }
+    let groupReceiver: GroupMember | undefined;
+    if (groupEnvelope) {
+      const validation = validateGroupEnvelope({
+        envelope: groupEnvelope,
+        workgroup: this.groups.getWorkgroup(groupEnvelope.groupId),
+        members: this.groups.listMembers(groupEnvelope.groupId),
+        senderPeerId: peerId,
+        receiverPeerId: this.identity.peerId,
+      });
+      if (!validation.ok) {
+        this.store.upsertRemoteTask({
+          id: taskId,
+          contextId,
+          delegationId: delegation?.delegationId,
+          peerId,
+          mode: delegation?.mode ?? "ask",
+          status: "rejected",
+          requestHash,
+          request: delegation,
+          result: { error: validation.reason, groupEnvelope },
+        });
+        this.audit("group.envelope-rejected", {
+          peerId,
+          taskId,
+          contextId,
+          delegationId: delegation?.delegationId,
+          action: "validate-group-envelope",
+          resource: groupEnvelope.groupId,
+          decision: "denied",
+          decisionReason: validation.reason,
+          inputDigest: requestHash,
+          metadata: {
+            groupId: groupEnvelope.groupId,
+            threadId: groupEnvelope.thread.id,
+            senderMemberId: groupEnvelope.senderMemberId,
+          },
+        });
+        bus.publish(AgentEvent.statusUpdate({
+          taskId,
+          contextId,
+          status: {
+            state: TaskState.TASK_STATE_REJECTED,
+            timestamp: now(),
+            message: agentMessage(taskId, contextId, validation.reason),
+          },
+          metadata: {
+            jamaiStatus: "rejected",
+            groupId: groupEnvelope.groupId,
+            threadId: groupEnvelope.thread.id,
+          },
+        }));
+        return;
+      }
+      groupReceiver = validation.receiver;
+      this.groups.ensureInboundThread({
+        groupId: groupEnvelope.groupId,
+        id: groupEnvelope.thread.id,
+        objective: groupEnvelope.thread.objective,
+        createdByMemberId: validation.sender.id,
+      });
+      this.audit("group.envelope-accepted", {
+        peerId,
+        taskId,
+        contextId,
+        delegationId: delegation?.delegationId,
+        action: groupEnvelope.operation,
+        resource: groupEnvelope.groupId,
+        decision: "allowed",
+        inputDigest: requestHash,
+        metadata: {
+          groupId: groupEnvelope.groupId,
+          threadId: groupEnvelope.thread.id,
+          senderMemberId: validation.sender.id,
+          receiverMemberId: validation.receiver.id,
+        },
+      });
+    }
     this.store.upsertRemoteTask({
       id: taskId,
       contextId,
@@ -125,8 +257,8 @@ export class BridgeExecutor implements AgentExecutor {
 
     const consumedApproval = this.approvals.consume(approvalId, approvalBinding);
     if (!consumedApproval) {
-      const approvedScopes = delegation?.authority?.allowed ?? [delegation?.mode ?? "ask"];
-      const approval = this.approvals.request(approvalBinding, approvedScopes);
+      const requestedScopes = delegation?.authority?.allowed ?? [delegation?.mode ?? "ask"];
+      const approval = this.approvals.request(approvalBinding, requestedScopes);
       if (approval) {
         this.store.upsertRemoteTask({
           id: taskId,
@@ -146,7 +278,10 @@ export class BridgeExecutor implements AgentExecutor {
           approvalId: approval.id,
           action: "owner-consent",
           inputDigest: requestHash,
-          metadata: { approvedScopes },
+          metadata: {
+            requestedScopes,
+            requestedDeniedScopes: delegation?.authority?.denied ?? [],
+          },
         });
         bus.publish(AgentEvent.statusUpdate({
           taskId,
@@ -219,31 +354,38 @@ export class BridgeExecutor implements AgentExecutor {
         consumedApproval,
         delegation?.authority?.allowed ?? [],
       );
+      const deniedScopes = this.approvals.effectiveDeniedScopes(
+        consumedApproval,
+        delegation?.authority?.denied ?? [],
+      );
       const result = await this.adapter.run({
         prompt,
         taskId,
         contextId,
         signal: controller.signal,
         approvedScopes,
+        deniedScopes,
+        onPermissionDecision: async (decision) => {
+          this.audit("tool.policy-decision", {
+            peerId,
+            taskId,
+            contextId,
+            delegationId: delegation?.delegationId,
+            approvalId: consumedApproval?.id,
+            action: decision.toolName ?? decision.toolKind ?? "unknown-tool",
+            resource: decision.toolCallId,
+            decision: decision.allowed ? "allowed" : "denied",
+            decisionReason: decision.reason,
+            metadata: {
+              toolKind: decision.toolKind,
+              matchedScope: decision.matchedScope,
+              deniedByScope: decision.deniedByScope,
+              approvedScopes,
+              deniedScopes,
+            },
+          });
+        },
       });
-      for (const decision of result.permissionDecisions ?? []) {
-        this.audit("tool.policy-decision", {
-          peerId,
-          taskId,
-          contextId,
-          delegationId: delegation?.delegationId,
-          approvalId: consumedApproval?.id,
-          action: decision.toolName ?? decision.toolKind ?? "unknown-tool",
-          resource: decision.toolCallId,
-          decision: decision.allowed ? "allowed" : "denied",
-          decisionReason: decision.reason,
-          metadata: {
-            toolKind: decision.toolKind,
-            matchedScope: decision.matchedScope,
-            approvedScopes,
-          },
-        });
-      }
       if (result.sessionId) {
         this.store.upsertAgentSession({
           contextId,
@@ -258,7 +400,18 @@ export class BridgeExecutor implements AgentExecutor {
         contextId,
         task: delegation,
         rawPrompt: result.text,
+        groupEnvelope,
       });
+      const groupReceipt = groupEnvelope && groupReceiver
+        ? createReceipt({
+            groupId: groupEnvelope.groupId,
+            threadId: groupEnvelope.thread.id,
+            taskId,
+            eventDigest: outputDigest,
+            acknowledgedBy: [groupReceiver.id],
+          }, this.identity)
+        : undefined;
+      if (groupReceipt) this.groups.storeReceipt(groupReceipt);
       const artifact: RemoteArtifact = {
         id: randomUUID(),
         taskId,
@@ -282,7 +435,7 @@ export class BridgeExecutor implements AgentExecutor {
         status: "completed",
         requestHash,
         request: delegation,
-        result: { artifact, agentSessionId: result.sessionId },
+        result: { artifact, agentSessionId: result.sessionId, groupReceipt },
       });
       this.audit("artifact.created", {
         peerId,
@@ -313,6 +466,13 @@ export class BridgeExecutor implements AgentExecutor {
                 agentSessionId: result.sessionId,
                 digest: outputDigest,
                 artifactKind: artifact.kind,
+                ...(groupEnvelope
+                  ? {
+                      groupId: groupEnvelope.groupId,
+                      groupThreadId: groupEnvelope.thread.id,
+                      groupReceipt,
+                    }
+                  : {}),
               }
             : { agentSessionId: result.sessionId },
           extensions: [],

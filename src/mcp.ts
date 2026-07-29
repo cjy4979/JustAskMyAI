@@ -17,12 +17,22 @@ import {
   JAMAI_AUTH_HEADER,
   JAMAI_EXTENSION_URI,
   peerIdFromPublicKey,
+  verifySignedStatement,
 } from "./protocol/signed-request.js";
+import { GroupStore } from "./group/store.js";
+import {
+  createGroupEnvelope,
+  parseGroupReceipt,
+  receiptBody,
+} from "./group/protocol.js";
+import type { GroupEnvelope, GroupMember, GroupTarget } from "./group/types.js";
 
 const daemonUrl = process.env.JAMAI_DAEMON_URL ?? "http://127.0.0.1:43121";
+const extensionParameters = { "A2A-Extensions": JAMAI_EXTENSION_URI };
 const server = new McpServer({ name: "just-ask-my-ai", version: "0.1.0" });
 const store = new GatewayStore();
 const identity = new GatewayIdentity(store);
+const groups = new GroupStore(store);
 const principalId = store.getOrCreateId("principalId");
 const agentId = store.getOrCreateId("agentId");
 const localPeerId = identity.peerId;
@@ -45,6 +55,127 @@ server.registerTool(
   "list_remote_ais",
   { description: "Discover personal AIs reachable from this JustAskMyAI gateway." },
   async () => text(JSON.stringify(await daemonFetch("/api/peers"), null, 2)),
+);
+
+server.registerTool(
+  "list_workgroups",
+  { description: "List locally installed workgroups, members, threads, and policy versions." },
+  async () => text(JSON.stringify(groups.listWorkgroups().map((workgroup) => ({
+    workgroup,
+    members: groups.listMembers(workgroup.id),
+    threads: groups.listThreads(workgroup.id),
+  })), null, 2)),
+);
+
+server.registerTool(
+  "create_group_thread",
+  {
+    description: "Create a persistent local thread inside an installed workgroup.",
+    inputSchema: {
+      groupId: z.string().min(1),
+      objective: z.string().min(1),
+    },
+  },
+  async ({ groupId, objective }) => {
+    const localMember = groups.findLocalMember(groupId, localPeerId);
+    if (!localMember) throw new Error("this gateway is not an active workgroup member");
+    const thread = groups.createThread({
+      groupId,
+      objective,
+      createdByMemberId: localMember.id,
+    });
+    store.appendAudit({
+      eventType: "group.thread-created",
+      principalId,
+      agentId,
+      action: "create-group-thread",
+      resource: groupId,
+      decision: "approved",
+      metadata: { threadId: thread.id, objective },
+    });
+    return text(JSON.stringify(thread, null, 2));
+  },
+);
+
+server.registerTool(
+  "delegate_group_task",
+  {
+    description:
+      "Delegate one bounded task to one workgroup member, or to a role that resolves to exactly one member.",
+    inputSchema: {
+      groupId: z.string().min(1),
+      threadId: z.string().min(1).optional(),
+      threadObjective: z.string().min(1).optional(),
+      targetMemberId: z.string().min(1).optional(),
+      targetRole: z.string().min(1).optional(),
+      mode: z.enum(["ask", "delegate", "review", "execute"]).default("delegate"),
+      objective: z.string().min(1),
+      role: z.string().min(1).optional(),
+      context: z.unknown().optional(),
+      acceptanceCriteria: z.array(z.string().min(1)).default([]),
+      expectedResult: z.enum(["answer", "report", "patch", "artifact"]).default("artifact"),
+      delegationId: z.string().optional(),
+      contextId: z.string().optional(),
+      taskId: z.string().optional(),
+      approvalId: z.string().optional(),
+      allowedActions: z.array(z.string().min(1)).default([]),
+      deniedActions: z.array(z.string().min(1)).default([]),
+    },
+  },
+  async (input) => {
+    const workgroup = groups.getWorkgroup(input.groupId);
+    if (!workgroup) throw new Error("workgroup not found");
+    const sender = groups.findLocalMember(input.groupId, localPeerId);
+    if (!sender) throw new Error("this gateway is not an active workgroup member");
+    if (!sender.roles.some((role) => workgroup.rolePolicy[role]?.includes("task"))) {
+      throw new Error("local member role does not allow group tasks");
+    }
+    const { member: targetMember, target } = resolveGroupTarget(
+      groups.listMembers(input.groupId),
+      localPeerId,
+      input.targetMemberId,
+      input.targetRole,
+    );
+    const thread = input.threadId
+      ? groups.getThread(input.groupId, input.threadId)
+      : groups.createThread({
+          groupId: input.groupId,
+          objective: input.threadObjective ?? input.objective,
+          createdByMemberId: sender.id,
+        });
+    if (!thread) throw new Error("group thread not found");
+    if (thread.status !== "open") throw new Error("group thread is closed");
+    const groupEnvelope = createGroupEnvelope({
+      workgroup,
+      thread,
+      senderMemberId: sender.id,
+      target,
+      operation: "task",
+    });
+    const delegation = taskFromInput(input.mode, input.expectedResult, input);
+    return text(JSON.stringify(await sendRemoteTask({
+      peerUrl: targetMember.url,
+      expectedPeerId: targetMember.gatewayPeerId,
+      delegation,
+      contextId: input.contextId,
+      taskId: input.taskId,
+      approvalId: input.approvalId,
+      groupEnvelope,
+    }), null, 2));
+  },
+);
+
+server.registerTool(
+  "list_group_receipts",
+  {
+    description: "List locally verified, signed completion receipts for a workgroup thread.",
+    inputSchema: {
+      groupId: z.string().min(1),
+      threadId: z.string().min(1).optional(),
+    },
+  },
+  async ({ groupId, threadId }) =>
+    text(JSON.stringify(groups.listReceipts(groupId, threadId), null, 2)),
 );
 
 registerDelegationTool(
@@ -121,7 +252,12 @@ server.registerTool(
     return text(JSON.stringify(
       summarizeResult(await client.getTask(
         { tenant: "", id: taskId, historyLength },
-        { serviceParameters: { [JAMAI_AUTH_HEADER]: encodeSignedRequest(requestAuth) } },
+        {
+          serviceParameters: {
+            ...extensionParameters,
+            [JAMAI_AUTH_HEADER]: encodeSignedRequest(requestAuth),
+          },
+        },
       )),
       null,
       2,
@@ -150,7 +286,12 @@ server.registerTool(
     });
     const result = await client.cancelTask(
       { tenant: "", id: taskId, metadata: undefined },
-      { serviceParameters: { [JAMAI_AUTH_HEADER]: encodeSignedRequest(requestAuth) } },
+      {
+        serviceParameters: {
+          ...extensionParameters,
+          [JAMAI_AUTH_HEADER]: encodeSignedRequest(requestAuth),
+        },
+      },
     );
     store.appendAudit({
       eventType: "task.cancel-requested",
@@ -218,14 +359,19 @@ function taskFromInput(
 
 async function sendRemoteTask(input: {
   peerUrl: string;
+  expectedPeerId?: string;
   delegation: DelegatedTask;
   contextId?: string;
   taskId?: string;
   approvalId?: string;
+  groupEnvelope?: GroupEnvelope;
 }): Promise<unknown> {
   try {
     const client = await createClient(input.peerUrl);
     const remote = await getRemoteIdentity(input.peerUrl);
+    if (input.expectedPeerId && remote.peerId !== input.expectedPeerId) {
+      throw new Error("group member URL resolved to a different paired gateway");
+    }
     const messageId = randomUUID();
     const message: Message = {
       role: Role.ROLE_USER,
@@ -237,6 +383,7 @@ async function sendRemoteTask(input: {
       metadata: {
         senderPeerId: localPeerId,
         delegation: input.delegation,
+        ...(input.groupEnvelope ? { groupEnvelope: input.groupEnvelope } : {}),
         requestAuth: identity.signRequest({
           audiencePeerId: remote.peerId,
           action: input.taskId ? "task.continue" : "task.send",
@@ -246,20 +393,27 @@ async function sendRemoteTask(input: {
           payload: {
             delegation: input.delegation,
             text: input.delegation.objective,
+            groupEnvelope: input.groupEnvelope,
           },
         }),
         ...(input.approvalId ? { approvalId: input.approvalId } : {}),
       },
       referenceTaskIds: [],
     };
-    const raw = await client.sendMessage({
-      tenant: "",
-      message,
-      configuration: undefined,
-      metadata: undefined,
-    });
+    const raw = await client.sendMessage(
+      {
+        tenant: "",
+        message,
+        configuration: undefined,
+        metadata: undefined,
+      },
+      { serviceParameters: extensionParameters },
+    );
     const summarized = summarizeResult(raw as Task | Message);
-    if ("status" in raw) recordOutbound(input, raw, summarized);
+    if ("status" in raw) {
+      storeGroupReceipt(input, raw);
+      recordOutbound(input, raw, summarized);
+    }
     return summarized;
   } catch (error) {
     store.appendAudit({
@@ -281,6 +435,7 @@ function recordOutbound(
   input: {
     peerUrl: string;
     delegation: DelegatedTask;
+    groupEnvelope?: GroupEnvelope;
   },
   task: Task,
   result: unknown,
@@ -291,6 +446,7 @@ function recordOutbound(
     contextId: task.contextId,
     task: input.delegation,
     rawPrompt: input.delegation.objective,
+    groupEnvelope: input.groupEnvelope,
   });
   const state = stateName(task.status?.state);
   const status = state === "COMPLETED"
@@ -326,8 +482,111 @@ function recordOutbound(
     resource: input.peerUrl,
     inputDigest: requestHash,
     outputDigest: digestJson(result),
-    metadata: { objective: input.delegation.objective, remoteState: state },
+    metadata: {
+      objective: input.delegation.objective,
+      remoteState: state,
+      ...(input.groupEnvelope
+        ? {
+            groupId: input.groupEnvelope.groupId,
+            threadId: input.groupEnvelope.thread.id,
+            target: input.groupEnvelope.target,
+          }
+        : {}),
+    },
   });
+}
+
+function storeGroupReceipt(
+  input: { groupEnvelope?: GroupEnvelope; expectedPeerId?: string },
+  task: Task,
+): void {
+  if (!input.groupEnvelope) return;
+  const candidates = (task.artifacts ?? [])
+    .map((artifact) => ({
+      receipt: parseGroupReceipt(artifact.metadata?.groupReceipt),
+      artifactDigest: typeof artifact.metadata?.digest === "string"
+        ? artifact.metadata.digest
+        : undefined,
+    }))
+    .filter((candidate) => candidate.receipt !== undefined);
+  if (stateName(task.status?.state) === "COMPLETED" && candidates.length !== 1) {
+    throw new Error(`completed group task must return exactly one signed receipt; found ${candidates.length}`);
+  }
+  for (const candidate of candidates) {
+    const receipt = candidate.receipt;
+    if (!receipt) continue;
+    if (
+      receipt.groupId !== input.groupEnvelope.groupId
+      || receipt.threadId !== input.groupEnvelope.thread.id
+      || receipt.taskId !== task.id
+      || receipt.eventDigest !== candidate.artifactDigest
+    ) {
+      throw new Error("remote group receipt does not match its task, thread, or artifact");
+    }
+    const verified = verifySignedStatement(receipt.proof, receiptBody(receipt), store);
+    if (!verified.ok) throw new Error(`invalid group receipt: ${verified.reason}`);
+    if (input.expectedPeerId && verified.peerId !== input.expectedPeerId) {
+      throw new Error("group receipt was signed by a different gateway");
+    }
+    const acknowledgingMember = groups.listMembers(receipt.groupId).find((member) =>
+      receipt.acknowledgedBy.includes(member.id)
+      && member.status === "active"
+      && member.gatewayPeerId === verified.peerId
+      && groupTargetMatches(input.groupEnvelope!.target, member));
+    if (!acknowledgingMember) {
+      throw new Error("group receipt acknowledgement does not match the signed target member");
+    }
+    groups.storeReceipt(receipt);
+    store.appendAudit({
+      eventType: "group.receipt-verified",
+      principalId,
+      agentId,
+      peerId: verified.peerId,
+      taskId: task.id,
+      contextId: task.contextId,
+      action: "verify-group-receipt",
+      resource: receipt.groupId,
+      decision: "allowed",
+      outputDigest: receipt.eventDigest,
+      metadata: {
+        threadId: receipt.threadId,
+        receiptId: receipt.id,
+        acknowledgedBy: receipt.acknowledgedBy,
+      },
+    });
+  }
+}
+
+function groupTargetMatches(target: GroupTarget, member: GroupMember): boolean {
+  if ("memberId" in target) return target.memberId === member.id;
+  if ("role" in target) return member.roles.includes(target.role);
+  return target.broadcast;
+}
+
+function resolveGroupTarget(
+  members: GroupMember[],
+  localPeerId: string,
+  targetMemberId?: string,
+  targetRole?: string,
+): { member: GroupMember; target: GroupTarget } {
+  if (Boolean(targetMemberId) === Boolean(targetRole)) {
+    throw new Error("provide exactly one of targetMemberId or targetRole");
+  }
+  if (targetMemberId) {
+    const member = members.find((candidate) =>
+      candidate.id === targetMemberId && candidate.status === "active");
+    if (!member) throw new Error("target group member is not active");
+    if (member.gatewayPeerId === localPeerId) throw new Error("target must be a remote member");
+    return { member, target: { memberId: member.id } };
+  }
+  const matches = members.filter((member) =>
+    member.status === "active"
+    && member.gatewayPeerId !== localPeerId
+    && member.roles.includes(targetRole!));
+  if (matches.length !== 1) {
+    throw new Error(`target role must resolve to exactly one remote member; found ${matches.length}`);
+  }
+  return { member: matches[0], target: { role: targetRole! } };
 }
 
 async function createClient(peerUrl: string) {

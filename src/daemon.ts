@@ -25,6 +25,8 @@ import {
   JAMAI_EXTENSION_URI,
   peerIdFromPublicKey,
 } from "./protocol/signed-request.js";
+import { GroupStore } from "./group/store.js";
+import type { GroupManifest, GroupOperation } from "./group/types.js";
 
 const config = loadConfig();
 const store = new GatewayStore();
@@ -32,9 +34,15 @@ const gatewayIdentity = new GatewayIdentity(store);
 const nodeId = gatewayIdentity.peerId;
 const principalId = store.getOrCreateId("principalId");
 const agentId = store.getOrCreateId("agentId");
-const identity = { peerId: nodeId, principalId, agentId };
+const identity = {
+  peerId: nodeId,
+  principalId,
+  agentId,
+  signStatement: gatewayIdentity.signStatement.bind(gatewayIdentity),
+};
 const adapter = createAdapter(config.adapter);
 const approvals = new ApprovalPolicy(config.policy, store);
+const groups = new GroupStore(store);
 const peers = new PeerRegistry();
 const discovery = new LanDiscovery({ id: nodeId, name: config.name, port: config.port }, peers);
 
@@ -56,7 +64,7 @@ const card: AgentCard = {
     extensions: [{
       uri: JAMAI_EXTENSION_URI,
       description: "Signed personal-AI delegation and task-control protocol.",
-      required: false,
+      required: true,
       params: {
         peerId: nodeId,
         publicKey: gatewayIdentity.publicKey,
@@ -84,7 +92,7 @@ const card: AgentCard = {
 const baseHandler = new DefaultRequestHandler(
   card,
   new SqliteA2ATaskStore(store),
-  new BridgeExecutor(adapter, approvals, store, identity),
+  new BridgeExecutor(adapter, approvals, store, identity, groups),
 );
 const handler = secureTaskControls(baseHandler, store, identity);
 
@@ -165,7 +173,25 @@ managementApp.post("/api/approvals/:id/:decision", (req, res) => {
   if (decision !== "approve" && decision !== "deny") {
     return res.status(400).json({ error: "decision must be approve or deny" });
   }
-  const approval = approvals.resolve(req.params.id, decision === "approve" ? "approved" : "denied");
+  let approval;
+  try {
+    approval = approvals.resolve(
+      req.params.id,
+      decision === "approve" ? "approved" : "denied",
+      decision === "approve"
+        ? {
+            approvedScopes: Array.isArray(req.body?.approvedScopes)
+              ? req.body.approvedScopes
+              : undefined,
+            deniedScopes: Array.isArray(req.body?.deniedScopes)
+              ? req.body.deniedScopes
+              : undefined,
+          }
+        : undefined,
+    );
+  } catch (error) {
+    return res.status(400).json({ error: String(error) });
+  }
   if (approval) {
     store.appendAudit({
       eventType: decision === "approve" ? "approval.approved" : "approval.denied",
@@ -178,7 +204,11 @@ managementApp.post("/api/approvals/:id/:decision", (req, res) => {
       action: "human-decision",
       decision: decision === "approve" ? "approved" : "denied",
       inputDigest: approval.requestHash,
-      metadata: { approvedScopes: approval.approvedScopes },
+      metadata: {
+        requestedScopes: approval.requestedScopes,
+        approvedScopes: approval.approvedScopes,
+        deniedScopes: approval.deniedScopes,
+      },
     });
   }
   return approval ? res.json(approval) : res.status(404).json({ error: "pending approval not found" });
@@ -193,6 +223,173 @@ managementApp.get("/api/audit", (req, res) => {
   res.json(store.listAudit(200, taskId));
 });
 managementApp.get("/api/audit/verify", (_req, res) => res.json(store.verifyAuditChain()));
+managementApp.get("/api/groups", (_req, res) => res.json(
+  groups.listWorkgroups().map((group) => ({
+    ...group,
+    members: groups.listMembers(group.id),
+    threads: groups.listThreads(group.id),
+  })),
+));
+managementApp.post("/api/groups", (req, res) => {
+  const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+  if (!name) return res.status(400).json({ error: "name is required" });
+  try {
+    const rolePolicy = parseRolePolicy(req.body?.rolePolicy);
+    const manifest = groups.createWorkgroup({
+      name,
+      ownerPrincipalId: principalId,
+      ownerAgentId: agentId,
+      ownerPeerId: nodeId,
+      ownerUrl: config.publicUrl,
+      rolePolicy,
+    });
+    store.appendAudit({
+      eventType: "group.created",
+      principalId,
+      agentId,
+      action: "create-workgroup",
+      resource: manifest.workgroup.id,
+      decision: "approved",
+      metadata: {
+        name,
+        policyVersion: manifest.workgroup.policyVersion,
+        membershipVersion: manifest.workgroup.membershipVersion,
+      },
+    });
+    return res.status(201).json(manifest);
+  } catch (error) {
+    return res.status(400).json({ error: String(error) });
+  }
+});
+managementApp.post("/api/groups/import", (req, res) => {
+  try {
+    const manifest = req.body as GroupManifest;
+    for (const member of manifest?.members ?? []) {
+      if (
+        member.status === "active"
+        && member.gatewayPeerId !== nodeId
+        && !store.getPairedPeer(member.gatewayPeerId)
+      ) {
+        throw new Error(`active group member is not paired: ${member.gatewayPeerId}`);
+      }
+    }
+    const imported = groups.importManifest(manifest, nodeId);
+    store.appendAudit({
+      eventType: "group.manifest-imported",
+      principalId,
+      agentId,
+      action: "import-group-manifest",
+      resource: imported.workgroup.id,
+      decision: "approved",
+      metadata: {
+        policyVersion: imported.workgroup.policyVersion,
+        membershipVersion: imported.workgroup.membershipVersion,
+        memberCount: imported.members.length,
+      },
+    });
+    return res.status(201).json(imported);
+  } catch (error) {
+    return res.status(400).json({ error: String(error) });
+  }
+});
+managementApp.get("/api/groups/:id", (req, res) => {
+  const manifest = groups.exportManifest(req.params.id);
+  return manifest ? res.json(manifest) : res.status(404).json({ error: "workgroup not found" });
+});
+managementApp.get("/api/groups/:id/manifest", (req, res) => {
+  const manifest = groups.exportManifest(req.params.id);
+  return manifest ? res.json(manifest) : res.status(404).json({ error: "workgroup not found" });
+});
+managementApp.post("/api/groups/:id/members", (req, res) => {
+  try {
+    const gatewayPeerId = requiredString(req.body?.gatewayPeerId, "gatewayPeerId");
+    const paired = gatewayPeerId === nodeId
+      ? { peerId: nodeId, url: config.publicUrl }
+      : store.getPairedPeer(gatewayPeerId);
+    if (!paired) throw new Error("group member gateway must be explicitly paired first");
+    const requestedUrl = typeof req.body?.url === "string" ? req.body.url : paired.url;
+    if (!requestedUrl) throw new Error("member url is required");
+    if (paired.url && new URL(requestedUrl).href !== new URL(paired.url).href) {
+      throw new Error("member url does not match the paired gateway url");
+    }
+    const roles = stringArray(req.body?.roles);
+    if (roles.length === 0) throw new Error("at least one role is required");
+    const workgroupBefore = groups.getWorkgroup(req.params.id);
+    if (!workgroupBefore) throw new Error("workgroup not found");
+    if (roles.some((role) => !workgroupBefore.rolePolicy[role])) {
+      throw new Error("every member role must exist in the workgroup role policy");
+    }
+    const member = groups.upsertMember({
+      id: typeof req.body?.id === "string" ? req.body.id : undefined,
+      groupId: req.params.id,
+      principalId: requiredString(req.body?.principalId, "principalId"),
+      agentId: requiredString(req.body?.agentId, "agentId"),
+      gatewayPeerId,
+      displayName: requiredString(req.body?.displayName, "displayName"),
+      url: requestedUrl,
+      roles,
+      sponsoredBy: typeof req.body?.sponsoredBy === "string"
+        ? req.body.sponsoredBy
+        : principalId,
+      status: parseMemberStatus(req.body?.status),
+    });
+    const workgroup = groups.getWorkgroup(req.params.id)!;
+    store.appendAudit({
+      eventType: "group.member-upserted",
+      principalId,
+      agentId,
+      peerId: gatewayPeerId,
+      action: "upsert-group-member",
+      resource: req.params.id,
+      decision: "approved",
+      metadata: {
+        memberId: member.id,
+        roles: member.roles,
+        status: member.status,
+        membershipVersion: workgroup.membershipVersion,
+      },
+    });
+    return res.status(201).json({ member, workgroup });
+  } catch (error) {
+    return res.status(400).json({ error: String(error) });
+  }
+});
+managementApp.get("/api/groups/:id/threads", (req, res) => {
+  if (!groups.getWorkgroup(req.params.id)) {
+    return res.status(404).json({ error: "workgroup not found" });
+  }
+  return res.json(groups.listThreads(req.params.id));
+});
+managementApp.post("/api/groups/:id/threads", (req, res) => {
+  try {
+    const localMember = groups.findLocalMember(req.params.id, nodeId);
+    if (!localMember) throw new Error("this gateway is not an active group member");
+    const thread = groups.createThread({
+      groupId: req.params.id,
+      objective: requiredString(req.body?.objective, "objective"),
+      createdByMemberId: localMember.id,
+    });
+    store.appendAudit({
+      eventType: "group.thread-created",
+      principalId,
+      agentId,
+      action: "create-group-thread",
+      resource: req.params.id,
+      decision: "approved",
+      metadata: { threadId: thread.id, objective: thread.objective },
+    });
+    return res.status(201).json(thread);
+  } catch (error) {
+    return res.status(400).json({ error: String(error) });
+  }
+});
+managementApp.get("/api/groups/:id/receipts", (req, res) => {
+  const threadId = typeof req.query.threadId === "string" ? req.query.threadId : undefined;
+  if (!groups.getWorkgroup(req.params.id)) {
+    return res.status(404).json({ error: "workgroup not found" });
+  }
+  return res.json(groups.listReceipts(req.params.id, threadId));
+});
 
 const publicServer = publicApp.listen(config.port, config.host, () => {
   discovery.start();
@@ -221,3 +418,44 @@ async function shutdown(): Promise<void> {
 }
 process.once("SIGINT", () => { void shutdown(); });
 process.once("SIGTERM", () => { void shutdown(); });
+
+function requiredString(value: unknown, name: string): string {
+  if (typeof value !== "string" || !value.trim()) throw new Error(`${name} is required`);
+  return value.trim();
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value) || !value.every((item) => typeof item === "string" && item.trim())) {
+    return [];
+  }
+  return [...new Set(value.map((item) => item.trim()))];
+}
+
+function parseMemberStatus(value: unknown): "active" | "suspended" | "removed" {
+  if (value === undefined) return "active";
+  if (value === "active" || value === "suspended" || value === "removed") return value;
+  throw new Error("status must be active, suspended, or removed");
+}
+
+function parseRolePolicy(value: unknown): Record<string, GroupOperation[]> | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("rolePolicy must be an object");
+  }
+  const result: Record<string, GroupOperation[]> = {};
+  for (const [role, operations] of Object.entries(value)) {
+    if (
+      !role.trim()
+      || !Array.isArray(operations)
+      || !operations.every((operation) =>
+        operation === "task"
+        || operation === "message"
+        || operation === "artifact"
+        || operation === "decision")
+    ) {
+      throw new Error(`invalid role policy for ${role}`);
+    }
+    result[role] = [...new Set(operations)] as GroupOperation[];
+  }
+  return result;
+}

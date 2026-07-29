@@ -40,6 +40,9 @@ Invoke-RestMethod http://127.0.0.1:43121/health
 Invoke-RestMethod http://127.0.0.1:43121/api/capabilities
 ```
 
+Compare the advertised key fingerprint (`peerId`) over a trusted side channel before pairing
+when first-contact network interception is a concern.
+
 ## 2. Start A's gateway
 
 ```powershell
@@ -118,6 +121,8 @@ On B:
 Invoke-RestMethod http://127.0.0.1:43121/api/approvals
 Invoke-RestMethod `
   -Method Post `
+  -ContentType "application/json" `
+  -Body '{"approvedScopes":["read-workspace","run-tests"],"deniedScopes":["edit-workspace","network"]}' `
   http://127.0.0.1:43121/api/approvals/<approvalId>/approve
 ```
 

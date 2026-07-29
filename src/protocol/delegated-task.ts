@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { GroupEnvelope } from "../group/types.js";
 
 export const DELEGATION_MODES = ["ask", "delegate", "review", "execute"] as const;
 export type DelegationMode = typeof DELEGATION_MODES[number];
@@ -105,6 +106,7 @@ export function delegationDigest(input: {
   contextId: string;
   task: DelegatedTask | undefined;
   rawPrompt: string;
+  groupEnvelope?: GroupEnvelope;
 }): string {
   return createHash("sha256").update(canonicalJson(input)).digest("hex");
 }

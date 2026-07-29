@@ -11,6 +11,9 @@ identity + consent + delegation + audit
 It connects existing personal Agents. It does not schedule their internal work, merge their
 plans, or become another multi-Agent framework.
 
+The optional Group Layer adds persistent membership, roles, threads, routing constraints,
+and signed receipts. It still delegates one bounded request to one existing remote Agent.
+
 ## Human position
 
 The human is the Principal, not a worker inserted into an Agent loop.
@@ -62,13 +65,44 @@ peerId + taskId + contextId + requestHash
 It expires and is consumed once. Changing the objective, context, authority, or task makes
 the previous approval invalid.
 
+A Group Envelope is included in both the request signature and `requestHash`. Changing its
+group, thread, sender, target, operation, policy version, or membership version also
+invalidates the request and any approval issued for it.
+
+## Group Layer
+
+Each gateway keeps a local copy of a workgroup manifest:
+
+```text
+workgroup + role policy + members + policy version + membership version
+```
+
+Group tasks carry a signed envelope containing the workgroup version, collaboration thread,
+sender member, target member or role, and operation. The receiver validates the envelope
+against its local manifest and the already-authenticated peer identity. Stale manifests,
+inactive members, unauthorized roles, wrong targets, and task broadcasts are rejected.
+
+Role routing is intentionally deterministic: `delegate_group_task` accepts a member target
+or a role that resolves to exactly one active remote member. It does not fan out, schedule a
+team, merge plans, or resolve Agent conflicts.
+
+On completion, the receiving gateway signs a receipt over the group ID, thread ID, task ID,
+artifact digest, acknowledging member, and timestamp. The sender verifies the Ed25519 proof
+against its pinned peer key before storing the receipt.
+
 ## Identity and request integrity
 
 Each gateway creates a local Ed25519 keypair. Its `peerId` is derived from the public-key
 fingerprint. Send, continue, get, and cancel actions bind the issuer, audience, action,
 message/task/context identity, normalized payload digest, five-minute timestamp, and one-time
 nonce. Requests are rejected on forwarding, tampering, or replay. A request is accepted only
-after the local owner has explicitly paired the remote Agent Card and key.
+after the local owner has explicitly pinned the remote Agent Card and key.
+
+The JustAskMyAI Agent Card extension is required. Clients must declare the extension on every
+A2A call. This is owner-approved key pinning, not proof of real-world identity: the initial
+HTTP Agent Card fetch can still be attacked. Short pairing codes, QR comparison, or
+organization-issued identities remain future work. The wire contract is documented in
+[Delegation Extension v1](./protocol-v1.md).
 
 ## Network boundary
 
@@ -78,9 +112,18 @@ inspection, policy state, and audit access.
 
 ## Tool policy enforcement
 
-Human-approved scopes are intersected with the local `JAMAI_ACP_ALLOW_TOOLS` policy and the
-actual ACP tool name/kind. A tool permission is allowed only when all gates permit it. Each
-decision becomes an audit event.
+The owner can reduce requested scopes and add explicit denies during approval. Effective
+authority is:
+
+```text
+(human-approved scopes - explicit denied scopes)
+∩ local owner policy
+∩ actual ACP tool name/kind
+```
+
+Denied scopes override wildcard allows. `run-tests` applies only to a dedicated test-tool
+name, never to a generic terminal. Every permission decision is committed to the audit ledger
+before `allow_once` or `reject_once` is returned; audit failure denies the tool.
 
 ## Audit
 
@@ -92,10 +135,11 @@ Audit records the responsibility chain, not private chain-of-thought:
 - lifecycle events and timestamps
 - redacted operational metadata
 
-Events form a local SHA-256 integrity chain. The localhost-only
+Events form a local SHA-256 integrity chain. Group completion additionally produces a
+remote-gateway-signed receipt. The localhost-only
 `GET /api/audit/verify` endpoint verifies it. Content modes are `metadata`, `redacted`
-(default), and `full-local`. A database owner can rebuild the chain, so this is not yet
-non-repudiable audit; signed external checkpoints are planned.
+(default), and `full-local`. A database owner can rebuild the local chain, so independently
+anchored audit checkpoints remain future work.
 
 HADFlow's useful idea was its separate run/event/tool/policy-decision ledger. This project
 keeps that audit discipline but replaces HAD's central orchestration semantics with bilateral

@@ -24,10 +24,14 @@ perform bounded work within that authority.
 - Metadata, redacted, and full-local audit modes
 - A tamper-evident audit hash chain
 - LAN discovery through mDNS or manual peer registration
-- Explicit local-owner pairing against the remote Agent Card key
+- Explicit owner-approved key pinning from the remote Agent Card
 - Separate public A2A and localhost-only management listeners
 - Signed and audience-bound send, continue, get, and cancel operations
 - ACP tool permission enforcement against approved scopes and local policy
+- Persistent workgroups, members, roles, and collaboration threads
+- Signed Group Envelopes bound to the sender, target, policy version, and membership version
+- Single-member and unambiguous single-role group routing
+- Ed25519-signed completion receipts verified and stored by both gateways
 
 The public relay remains experimental. Do not expose a gateway to an untrusted public
 network until end-to-end relay encryption, identity revocation, and
@@ -66,12 +70,35 @@ approved scope such as `read-workspace`, `edit-workspace`, `run-tests`, `network
 `tool:<kind>`, or `tool:<name>`. A remote requester cannot select the local workspace
 or override the owner's policy.
 
+Denied scopes take precedence over allowed scopes, including wildcard grants. `run-tests`
+matches only a dedicated test tool name such as `pytest`, `jest`, or `run-tests`; it never
+authorizes a generic terminal. Broad execution requires an explicit scope such as
+`tool:terminal` or `run-tools`.
+
+When approving a request, the owner may reduce its authority:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -ContentType "application/json" `
+  -Uri http://127.0.0.1:43121/api/approvals/<approvalId>/approve `
+  -Body '{"approvedScopes":["read-workspace","run-tests"],"deniedScopes":["edit-workspace","network"]}'
+```
+
 ## Current limitations
 
 - SQLite records ACP session IDs, but ACP sessions are not resumed after gateway restart.
-- The audit hash chain detects local modification but is not non-repudiable; signed external
-  checkpoints are not implemented yet.
+- The audit hash chain detects local modification but is not independently anchored. Group
+  completion receipts are signed by the receiving gateway, but external audit checkpoints
+  are not implemented yet.
 - Pairing is explicit, but peer revocation and key rotation are not implemented yet.
+- Initial Agent Card retrieval uses ordinary HTTP. Pairing currently pins a key; it does not
+  prove a real-world identity against an active first-contact network attacker.
+- Group manifests are imported through each machine's localhost management API. Automatic,
+  signed membership synchronization is not implemented yet.
+
+`npm run check` launches isolated Alice and Bob gateways with separate databases and
+identities, performs bilateral pairing, then runs A2A and MCP delegation tests.
 
 ## MCP tools
 
@@ -83,10 +110,17 @@ or override the owner's policy.
 - `continue_remote_task`
 - `get_remote_task`
 - `cancel_remote_task`
+- `list_workgroups`
+- `create_group_thread`
+- `delegate_group_task`
+- `list_group_receipts`
 
 The core protocol deliberately does not provide `collaborate_with_ais`. Parallel
 delegation, coordination, and plan merging belong to the caller's existing agent rather
-than the JustAskMyAI protocol.
+than the JustAskMyAI protocol. `delegate_group_task` still selects exactly one remote
+member. A role target must resolve to exactly one active remote member.
 
-See the [architecture](./docs/architecture.md) and the
-[two-computer test guide](./docs/two-computer-test.md).
+See the [architecture](./docs/architecture.md), the
+[delegation extension v1](./docs/protocol-v1.md), and the
+[two-computer test guide](./docs/two-computer-test.md). Workgroup setup and protocol
+boundaries are described in the [Group Layer guide](./docs/group-layer.md).

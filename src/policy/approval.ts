@@ -11,9 +11,9 @@ export class ApprovalPolicy {
     private readonly store: GatewayStore,
   ) {}
 
-  request(binding: ApprovalBinding, approvedScopes: string[]): StoredApproval | undefined {
+  request(binding: ApprovalBinding, requestedScopes: string[]): StoredApproval | undefined {
     if (this.mode === "auto") return undefined;
-    return this.store.createApproval({ ...binding, approvedScopes });
+    return this.store.createApproval({ ...binding, requestedScopes });
   }
 
   consume(id: string | undefined, binding: ApprovalBinding): StoredApproval | undefined {
@@ -24,11 +24,22 @@ export class ApprovalPolicy {
     return this.store.listApprovals();
   }
 
-  resolve(id: string, decision: "approved" | "denied"): StoredApproval | undefined {
-    return this.store.resolveApproval(id, decision);
+  resolve(
+    id: string,
+    decision: "approved" | "denied",
+    selection?: { approvedScopes?: string[]; deniedScopes?: string[] },
+  ): StoredApproval | undefined {
+    return this.store.resolveApproval(id, decision, selection);
   }
 
   effectiveScopes(approval: StoredApproval | undefined, requestedScopes: string[]): string[] {
     return this.mode === "auto" ? requestedScopes : approval?.approvedScopes ?? [];
+  }
+
+  effectiveDeniedScopes(approval: StoredApproval | undefined, requestedDeniedScopes: string[]): string[] {
+    return [...new Set([
+      ...requestedDeniedScopes,
+      ...(approval?.deniedScopes ?? []),
+    ])];
   }
 }

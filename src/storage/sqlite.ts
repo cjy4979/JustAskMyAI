@@ -45,7 +45,9 @@ export interface ApprovalBinding {
 
 export interface StoredApproval extends ApprovalBinding {
   id: string;
+  requestedScopes: string[];
   approvedScopes: string[];
+  deniedScopes: string[];
   status: "pending" | "approved" | "denied" | "consumed" | "expired";
   createdAt: string;
   resolvedAt?: string;
@@ -73,6 +75,13 @@ export interface StoredAgentSession {
   localSessionId: string;
   createdAt: string;
   lastActiveAt: string;
+}
+
+export interface PairedPeer {
+  peerId: string;
+  publicKey: string;
+  name?: string;
+  url?: string;
 }
 
 export class GatewayStore {
@@ -160,6 +169,26 @@ export class GatewayStore {
     return true;
   }
 
+  getPairedPeer(peerId: string): PairedPeer | undefined {
+    const row = this.db.prepare(`
+      SELECT peer_id, public_key, name, url, trust_status
+      FROM peer_identities WHERE peer_id = ?
+    `).get(peerId) as {
+      peer_id: string;
+      public_key: string;
+      name: string | null;
+      url: string | null;
+      trust_status: string;
+    } | undefined;
+    if (!row || row.trust_status !== "paired") return undefined;
+    return {
+      peerId: row.peer_id,
+      publicKey: row.public_key,
+      name: row.name ?? undefined,
+      url: row.url ?? undefined,
+    };
+  }
+
   consumeRequestNonce(peerId: string, nonce: string, sentAt: string): boolean {
     this.db.prepare("DELETE FROM request_nonces WHERE seen_at < ?")
       .run(new Date(Date.now() - 24 * 60 * 60_000).toISOString());
@@ -221,7 +250,7 @@ export class GatewayStore {
   }
 
   createApproval(input: ApprovalBinding & {
-    approvedScopes: string[];
+    requestedScopes: string[];
     ttlSeconds?: number;
   }): StoredApproval {
     const existing = this.db.prepare(`
@@ -235,16 +264,17 @@ export class GatewayStore {
     const id = randomUUID();
     this.db.prepare(`
       INSERT INTO approval_grants (
-        id, peer_id, task_id, context_id, request_hash, approved_scopes,
+        id, peer_id, task_id, context_id, request_hash, requested_scopes,
+        approved_scopes, denied_scopes,
         status, created_at, expires_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, '[]', '[]', 'pending', ?, ?)
     `).run(
       id,
       input.peerId,
       input.taskId,
       input.contextId,
       input.requestHash,
-      JSON.stringify(input.approvedScopes),
+      JSON.stringify(uniqueStrings(input.requestedScopes)),
       createdAt,
       expiresAt,
     );
@@ -262,13 +292,38 @@ export class GatewayStore {
       .map(mapApproval);
   }
 
-  resolveApproval(id: string, decision: "approved" | "denied"): StoredApproval | undefined {
+  resolveApproval(
+    id: string,
+    decision: "approved" | "denied",
+    selection?: { approvedScopes?: string[]; deniedScopes?: string[] },
+  ): StoredApproval | undefined {
     this.expireApprovals();
+    const approval = this.getApproval(id);
+    if (!approval || approval.status !== "pending") return undefined;
     const resolvedAt = new Date().toISOString();
+    const approvedScopes = decision === "approved"
+      ? uniqueStrings(selection?.approvedScopes ?? approval.requestedScopes)
+      : [];
+    if (approvedScopes.some((scope) => !scopeWithinRequest(scope, approval.requestedScopes))) {
+      throw new Error("approvedScopes must be a subset of requestedScopes");
+    }
+    const deniedScopes = uniqueStrings([
+      ...(selection?.deniedScopes ?? []),
+      ...approval.requestedScopes.filter((scope) =>
+        !approvedScopes.includes(scope)
+        && !(scope === "tool:*" && approvedScopes.length > 0)),
+    ]);
     const result = this.db.prepare(`
-      UPDATE approval_grants SET status = ?, resolved_at = ?
+      UPDATE approval_grants
+      SET status = ?, approved_scopes = ?, denied_scopes = ?, resolved_at = ?
       WHERE id = ? AND status = 'pending'
-    `).run(decision, resolvedAt, id);
+    `).run(
+      decision,
+      JSON.stringify(approvedScopes),
+      JSON.stringify(deniedScopes),
+      resolvedAt,
+      id,
+    );
     return result.changes === 1 ? this.getApproval(id) : undefined;
   }
 
@@ -488,7 +543,9 @@ export class GatewayStore {
         task_id TEXT NOT NULL,
         context_id TEXT NOT NULL,
         request_hash TEXT NOT NULL,
+        requested_scopes TEXT NOT NULL DEFAULT '[]',
         approved_scopes TEXT NOT NULL,
+        denied_scopes TEXT NOT NULL DEFAULT '[]',
         status TEXT NOT NULL,
         created_at TEXT NOT NULL,
         resolved_at TEXT,
@@ -567,6 +624,8 @@ export class GatewayStore {
     this.ensureColumn("peer_identities", "name", "TEXT");
     this.ensureColumn("peer_identities", "url", "TEXT");
     this.ensureColumn("peer_identities", "trust_status", "TEXT NOT NULL DEFAULT 'unpaired'");
+    this.ensureColumn("approval_grants", "requested_scopes", "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn("approval_grants", "denied_scopes", "TEXT NOT NULL DEFAULT '[]'");
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
@@ -603,18 +662,30 @@ function mapTask(row: DbRow): StoredRemoteTask {
 }
 
 function mapApproval(row: DbRow): StoredApproval {
+  const approvedScopes = (parseJson(row.approved_scopes) as string[] | undefined) ?? [];
+  const storedRequestedScopes = (parseJson(row.requested_scopes) as string[] | undefined) ?? [];
   return {
     id: String(row.id),
     peerId: String(row.peer_id),
     taskId: String(row.task_id),
     contextId: String(row.context_id),
     requestHash: String(row.request_hash),
-    approvedScopes: (parseJson(row.approved_scopes) as string[] | undefined) ?? [],
+    requestedScopes: storedRequestedScopes.length > 0 ? storedRequestedScopes : approvedScopes,
+    approvedScopes,
+    deniedScopes: (parseJson(row.denied_scopes) as string[] | undefined) ?? [],
     status: String(row.status) as StoredApproval["status"],
     createdAt: String(row.created_at),
     resolvedAt: nullableString(row.resolved_at),
     expiresAt: String(row.expires_at),
   };
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.filter((value) => typeof value === "string" && value.length > 0))];
+}
+
+function scopeWithinRequest(scope: string, requestedScopes: string[]): boolean {
+  return requestedScopes.includes(scope) || requestedScopes.includes("tool:*");
 }
 
 function mapAudit(row: DbRow): StoredAuditEvent {

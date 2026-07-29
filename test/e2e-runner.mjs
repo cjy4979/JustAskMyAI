@@ -1,73 +1,68 @@
 import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { randomUUID } from "node:crypto";
 import { ClientFactory, JsonRpcTransportFactory } from "@a2a-js/sdk/client";
 import { Role } from "@a2a-js/sdk";
-import { randomUUID } from "node:crypto";
-import { GatewayIdentity } from "../dist/src/protocol/signed-request.js";
+import {
+  encodeSignedRequest,
+  GatewayIdentity,
+  JAMAI_AUTH_HEADER,
+  JAMAI_EXTENSION_URI,
+} from "../dist/src/protocol/signed-request.js";
 import { GatewayStore } from "../dist/src/storage/sqlite.js";
 
-const requesterStore = new GatewayStore();
-const requesterIdentity = new GatewayIdentity(requesterStore);
-
-const child = spawn(process.execPath, ["dist/src/daemon.js"], {
-  cwd: process.cwd(),
-  env: { ...process.env, JAMAI_POLICY: "always_ask", JAMAI_HOST: "127.0.0.1" },
-  stdio: ["ignore", "pipe", "pipe"],
-});
-let stderr = "";
-child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+const root = mkdtempSync(path.join(tmpdir(), "jamai-dual-e2e-"));
+const alice = gateway("Alice", 43210, 43211, path.join(root, "alice", "gateway.db"), "auto");
+const bob = gateway("Bob", 43212, 43213, path.join(root, "bob", "gateway.db"), "always_ask");
+const extensionOptions = {
+  serviceParameters: { "A2A-Extensions": JAMAI_EXTENSION_URI },
+};
+let aliceStore;
 
 try {
-  let health;
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    try {
-      const response = await fetch("http://127.0.0.1:43121/health");
-      if (response.ok) {
-        health = await response.json();
-        break;
-      }
-    } catch {
-      await delay(100);
-    }
+  await Promise.all([waitReady(alice), waitReady(bob)]);
+  const [aliceIdentityResponse, bobIdentityResponse] = await Promise.all([
+    getJson(`${alice.managementUrl}/api/identity`),
+    getJson(`${bob.managementUrl}/api/identity`),
+  ]);
+  if (aliceIdentityResponse.peerId === bobIdentityResponse.peerId) {
+    throw new Error("Alice and Bob unexpectedly share an identity");
   }
-  if (!health) throw new Error(`daemon did not become ready: ${stderr}`);
+  if (alice.dbPath === bob.dbPath) throw new Error("Alice and Bob unexpectedly share a database");
 
-  const cardResponse = await fetch("http://127.0.0.1:43120/.well-known/agent-card.json");
-  const card = await cardResponse.json();
-  const remotePeerId = card.capabilities.extensions[0].params.peerId;
+  await pair(alice, "Bob", bob.publicUrl);
+  await pair(bob, "Alice", alice.publicUrl);
+
+  const leakedManagement = await fetch(`${bob.publicUrl}/api/approvals`);
+  if (leakedManagement.status !== 404) {
+    throw new Error("Bob management API is exposed on the public A2A listener");
+  }
+
+  aliceStore = new GatewayStore(alice.dbPath);
+  const aliceIdentity = new GatewayIdentity(aliceStore);
+  const bobCard = await getJson(`${bob.publicUrl}/.well-known/agent-card.json`);
+  const bobPeerId = bobCard.capabilities.extensions[0].params.peerId;
   const client = await new ClientFactory({
     transports: [new JsonRpcTransportFactory()],
-  }).createFromUrl("http://127.0.0.1:43120");
-  const result = await client.sendMessage({
-    tenant: "",
-    message: {
-      role: Role.ROLE_USER,
-      messageId: randomUUID(),
-      contextId: "",
-      taskId: "",
-      parts: [{
-        content: { $case: "text", value: "hello from e2e" },
-        metadata: undefined,
-        filename: "",
-        mediaType: "text/plain",
-      }],
-      metadata: {},
-      extensions: [],
-      referenceTaskIds: [],
-    },
-    configuration: undefined,
-    metadata: undefined,
-  });
-  const delegatedTask = {
+  }).createFromUrl(bob.publicUrl);
+  const delegation = {
     version: 1,
-    delegationId: "e2e-delegation",
+    delegationId: randomUUID(),
     mode: "delegate",
     role: "test engineer",
     objective: "Add a regression test",
     acceptanceCriteria: ["Return a verified work report"],
     expectedResult: { type: "report" },
+    authority: {
+      allowed: ["read-workspace", "edit-workspace", "tool:*"],
+      denied: ["network"],
+    },
   };
-  const delegationMessage = (contextId = "", taskId = "", approvalId) => {
+
+  const makeMessage = (contextId = "", taskId = "", approvalId) => {
     const messageId = randomUUID();
     return {
       role: Role.ROLE_USER,
@@ -75,24 +70,21 @@ try {
       contextId,
       taskId,
       parts: [{
-        content: { $case: "text", value: "add a test" },
+        content: { $case: "text", value: delegation.objective },
         metadata: undefined,
         filename: "",
         mediaType: "text/plain",
       }],
       metadata: {
-        senderPeerId: requesterIdentity.peerId,
-        delegation: delegatedTask,
-        requestAuth: requesterIdentity.signRequest({
-          audiencePeerId: remotePeerId,
+        senderPeerId: aliceIdentity.peerId,
+        delegation,
+        requestAuth: aliceIdentity.signRequest({
+          audiencePeerId: bobPeerId,
           action: taskId ? "task.continue" : "task.send",
           messageId,
           taskId: taskId || undefined,
           contextId: contextId || undefined,
-          payload: {
-            delegation: delegatedTask,
-            text: "add a test",
-          },
+          payload: { delegation, text: delegation.objective },
         }),
         ...(approvalId ? { approvalId } : {}),
       },
@@ -100,51 +92,137 @@ try {
       referenceTaskIds: [],
     };
   };
-  const initialDelegation = await client.sendMessage({
+
+  const pending = await client.sendMessage({
     tenant: "",
-    message: delegationMessage(),
+    message: makeMessage(),
     configuration: undefined,
     metadata: undefined,
-  });
-  const approvalId = initialDelegation.status?.message?.metadata?.approvalId;
+  }, extensionOptions);
+  const approvalId = pending.status?.message?.metadata?.approvalId;
   if (typeof approvalId !== "string") {
-    throw new Error(`delegation did not request owner consent: ${JSON.stringify(initialDelegation)}`);
+    throw new Error(`Bob did not request owner consent: ${JSON.stringify(pending)}`);
   }
-  const approvalResponse = await fetch(
-    `http://127.0.0.1:43121/api/approvals/${approvalId}/approve`,
-    { method: "POST" },
-  );
-  if (!approvalResponse.ok) throw new Error("owner approval endpoint failed");
-  const delegation = await client.sendMessage({
+
+  const approval = await fetch(`${bob.managementUrl}/api/approvals/${approvalId}/approve`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      approvedScopes: ["read-workspace", "tool:*"],
+      deniedScopes: ["network", "edit-workspace"],
+    }),
+  });
+  if (!approval.ok) throw new Error(`Bob approval failed: ${await approval.text()}`);
+
+  const completed = await client.sendMessage({
     tenant: "",
-    message: delegationMessage(
-      initialDelegation.contextId,
-      initialDelegation.id,
-      approvalId,
-    ),
+    message: makeMessage(pending.contextId, pending.id, approvalId),
     configuration: undefined,
     metadata: undefined,
-  });
-  const delegationArtifact = delegation.artifacts?.[0];
-  if (delegationArtifact?.name !== "delegate-result") {
-    throw new Error("delegation request did not return a delegate-result artifact");
+  }, extensionOptions);
+  const artifact = completed.artifacts?.[0];
+  if (artifact?.name !== "delegate-result") {
+    throw new Error(`delegation did not complete: ${JSON.stringify(completed)}`);
   }
-  console.log(JSON.stringify({
-    health,
-    card: card.name,
-    result,
-    delegation: {
-      approvalId,
-      state: delegation.status?.state,
-      artifact: delegationArtifact.name,
-      metadata: delegationArtifact.metadata,
+
+  const getAuth = aliceIdentity.signRequest({
+    audiencePeerId: bobPeerId,
+    action: "task.get",
+    taskId: completed.id,
+    contextId: completed.contextId,
+  });
+  const fetched = await client.getTask(
+    { tenant: "", id: completed.id, historyLength: 20 },
+    {
+      serviceParameters: {
+        "A2A-Extensions": JAMAI_EXTENSION_URI,
+        [JAMAI_AUTH_HEADER]: encodeSignedRequest(getAuth),
+      },
     },
+  );
+  if (fetched.artifacts?.[0]?.name !== "delegate-result") {
+    throw new Error("Alice could not retrieve Bob's task using signed task.get");
+  }
+  const audit = await getJson(`${bob.managementUrl}/api/audit/verify`);
+  if (!audit.valid) throw new Error("Bob audit integrity chain failed verification");
+
+  console.log(JSON.stringify({
+    alicePeerId: aliceIdentityResponse.peerId,
+    bobPeerId: bobIdentityResponse.peerId,
+    isolatedDatabases: true,
+    bilateralPairing: true,
+    humanNarrowedScopes: true,
+    state: completed.status?.state,
+    artifact: artifact.name,
+    signedGet: true,
+    auditValid: true,
   }));
 } finally {
-  requesterStore.close();
-  child.kill("SIGTERM");
+  aliceStore?.close();
+  await Promise.all([stop(alice), stop(bob)]);
+  rmSync(root, { recursive: true, force: true });
+}
+
+function gateway(name, publicPort, managementPort, dbPath, policy) {
+  const child = spawn(process.execPath, ["dist/src/daemon.js"], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      JAMAI_NAME: name,
+      JAMAI_HOST: "127.0.0.1",
+      JAMAI_PORT: String(publicPort),
+      JAMAI_PUBLIC_URL: `http://127.0.0.1:${publicPort}`,
+      JAMAI_MANAGEMENT_PORT: String(managementPort),
+      JAMAI_DB_PATH: dbPath,
+      JAMAI_POLICY: policy,
+      JAMAI_ADAPTER: "mock",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+  return {
+    name,
+    child,
+    dbPath,
+    publicUrl: `http://127.0.0.1:${publicPort}`,
+    managementUrl: `http://127.0.0.1:${managementPort}`,
+    stderr: () => stderr,
+  };
+}
+
+async function waitReady(node) {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    try {
+      const response = await fetch(`${node.managementUrl}/health`);
+      if (response.ok) return;
+    } catch {
+      await delay(100);
+    }
+  }
+  throw new Error(`${node.name} did not become ready: ${node.stderr()}`);
+}
+
+async function pair(owner, remoteName, remoteUrl) {
+  const response = await fetch(`${owner.managementUrl}/api/peers`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: remoteName, url: remoteUrl }),
+  });
+  if (!response.ok) throw new Error(`${owner.name} pairing failed: ${await response.text()}`);
+}
+
+async function getJson(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${url} returned ${response.status}`);
+  return response.json();
+}
+
+async function stop(node) {
+  if (node.child.exitCode !== null) return;
+  node.child.kill("SIGTERM");
   await Promise.race([
-    new Promise((resolve) => child.once("exit", resolve)),
-    delay(2_000).then(() => child.kill("SIGKILL")),
+    new Promise((resolve) => node.child.once("exit", resolve)),
+    delay(2_000).then(() => node.child.kill("SIGKILL")),
   ]);
 }
