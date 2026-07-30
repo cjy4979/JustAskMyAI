@@ -59,30 +59,70 @@ immutable task ID backed by a durable uniqueness constraint; duplicate IDs remai
 regardless of thread length. Event sequence allocation is atomic. Periodic checkpoints bind
 the last included sequence, constraints, and context references for restart rehydration.
 
-Context-rich execution requires `enforced` adapter isolation assurance. ACP uses a runtime
-keyed by `externalSessionId`, always starts a new session, and attempts `session/resume` after
-restart, but its environment declaration is only `operator-attested`. It therefore fails
-closed by default unless the local operator explicitly opts into that residual risk. If
-resume is unavailable, JAMA starts a new ACP session and reconstructs it from the persistent
-event thread, checkpoint, and fresh Context Projection. This is recorded as degraded
-rehydration.
+The default `managed` isolation policy accepts JAMA's Managed ACP Profile. It creates one
+process and profile namespace per `externalSessionId` and redirects HOME, XDG, AppData,
+temporary files, histories, Codex, Claude, Hermes, and other known Agent configuration paths.
+The default Workspace is a new empty directory. Profile state is destroyed when the process
+terminates, and restart uses audited degraded rehydration from JAMA's thread, checkpoint, and
+fresh Context Projection.
+
+Managed Profile assurance is `adapter-attested`: it prevents normal Agent memory
+cross-contamination but is not an OS boundary against a malicious local process that ignores
+the redirected paths. An explicit `owner-trusted` Workspace mode gives the Agent ordinary
+access to the configured project and is therefore an Owner trust decision, not Context
+Projection isolation.
+
+The optional `strict` policy accepts only `enforced` isolation. The `acp-sandbox` adapter
+launches one Docker container per External Session with an
+independent HOME/XDG namespace, read-only root filesystem, empty isolated Workspace,
+dedicated writable output, no capabilities, no network, and no Owner session mount. An
+explicit local opt-in can mount the configured Workspace read-only when the entire root is
+approved for that Session. It emits
+`MemoryIsolationEvidence` bound to the namespace and sandbox policy. Namespace state is
+destroyed when the ACP process terminates. If resume is unavailable, JAMA reconstructs a new
+session from the persistent event thread, checkpoint, and fresh Context Projection and
+records degraded rehydration.
 
 Operation grants authorize protocol verbs such as message or task. Action grants separately
 bound requested tool scopes, explicit denials, and resources. A task cannot expand the
 session action grant. Tasks with action authority require a single-use Human approval bound
 to the exact session, task ID, payload, scopes, denials, and resources.
 
+The ACP permission hook evaluates both tool scope and actual `rawInput`/`locations`.
+Resource patterns support exact values, prefixes, `path:/root/**`, `url:https://host/**`, and
+explicit denies prefixed with `!`. When an Action Grant is resource-bound but ACP exposes no
+verifiable resource, the call fails closed. The previous `per-tool` name meant runtime
+policy evaluation, not a Human prompt; new grants call this mode `runtime-policy`.
+
 ## Provenance and egress
 
 Structured answers contain claims, evidence references, source status, optional
 model-reported confidence, and JAMA-computed evidence coverage. JAMA rejects unknown evidence
 references and prevents a claim from receiving higher authority than its cited sources.
-Unstructured output is downgraded to `agent-inference` with zero evidence coverage.
+Unstructured output is accepted only when no Context was projected.
 
-The Egress Guard blocks known secret patterns, unauthorized Context references, and
-sensitivity violations for Owner escalation. Its strongest guarantee is projection:
-unauthorized Owner Context is never supplied to the model. It is not a complete semantic
-leak detector.
+An Egress Grant is separate from the Context Grant. It limits source authority, sensitivity,
+quote mode, excerpt size, evidence requirements, and categories that require Owner
+confirmation. A valid Context Grant means the model may read an item; it does not imply the
+caller may receive that item.
+
+Non-structured output from a context-rich turn fails closed. JAMA conservatively records all
+projected references as possibly disclosed and creates a durable Egress Challenge. The same
+state transition is used when the model requests Owner confirmation or violates an Egress
+Grant. Tasks move from `running` to `awaiting_owner_confirmation`; Owner release is bound to
+the draft digest, Session, Task, Context references, Egress Grant, and Authority version.
+Release appends the confirmed answer and Artifact to the thread; rejection fails the task.
+
+The Egress Guard also blocks known secret patterns and unauthorized references. Its strongest
+guarantee remains projection: unauthorized Owner Context is never supplied to the model. It
+does not claim complete semantic leak detection.
+
+## Authority versions
+
+Context, operation, action, Egress, and Group epoch authority are captured in an immutable,
+gateway-signed Authority Bundle. Approval, extension, and Group reauthorization append a new
+version linked by `previousAuthorityDigest`; old bundles remain queryable. A Group epoch
+change pauses the Session until the Owner recomputes and reissues the bundle.
 
 ## Writeback
 
@@ -90,7 +130,9 @@ A caller or Agent can only create a writeback proposal. The Owner accepts, rejec
 it superseded through localhost. Acceptance creates a new `owner-confirmed` Context Item that
 records proposer and confirming Owner and references the original External claim or evidence.
 Its sensitivity cannot be lower than any cited source. It never changes source authority or
-writes native agent memory.
+writes native agent memory. Evidence resolution follows the full local provenance closure
+through old Events, their Context references, Artifacts, and referenced writebacks rather
+than relying on the most recent thread window.
 
 ## Guest invitations
 

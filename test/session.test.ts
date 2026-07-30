@@ -171,10 +171,10 @@ test("Contextual answers cannot forge evidence or upgrade authority", () => {
   assert.equal(normalized.claims[0].agentReportedConfidence, 1);
   assert.equal(normalized.evidenceCoverage, 1);
 
-  const fallback = normalizeContextualAnswer("plain answer", [source]).answer!;
-  assert.equal(fallback.claims[0].status, "agent-inference");
-  assert.equal(fallback.evidenceCoverage, 0);
-  assert.equal(fallback.claims[0].agentReportedConfidence, null);
+  const fallback = normalizeContextualAnswer("plain answer", [source]);
+  assert.match(fallback.escalationReason ?? "", /non-structured output/);
+  assert.deepEqual(fallback.possiblyDisclosedRefs, [source.id]);
+  assert.equal(fallback.draft?.claims[0].status, "agent-inference");
   assert.match(
     normalizeContextualAnswer("Bearer abcdefghijklmnopqrstuvwxyz", []).escalationReason ?? "",
     /secret screening/,
@@ -500,5 +500,199 @@ test("writeback sensitivity cannot be downgraded and guest binding expires serve
     expiresAt: new Date(Date.now() - 1000).toISOString(),
   });
   assert.equal(env.sessions.getGuestBinding("expired-cookie"), undefined);
+  env.gateway.close();
+});
+
+test("Egress Grant blocks excerpts and Owner confirmation releases an immutable draft", () => {
+  const env = fixture();
+  const source = env.sessions.addItem({
+    collectionId: env.collection.id,
+    content: "The confidential simulation failure happened at exactly 47.25 kilopascals.",
+    summary: "A confidential failure occurred above the approved pressure window.",
+    origin: { principalId: "alice" },
+    authority: "project-record",
+    sensitivity: "internal",
+    supersedes: [],
+  });
+  const grant = {
+    ...env.egressGrant,
+    quoteMode: "summary-only" as const,
+    requireEvidenceRefs: true,
+  };
+  const normalized = normalizeContextualAnswer(JSON.stringify({
+    answer: source.content,
+    claims: [{
+      text: source.content,
+      status: "project-record",
+      evidenceRefs: [source.id],
+    }],
+  }), [source], grant);
+  assert.match(normalized.escalationReason ?? "", /source excerpt/);
+  env.sessions.registerTask({
+    sessionId: env.session.id,
+    externalTaskId: "egress-task",
+    objective: "Return the pressure conclusion",
+    requestDigest: "egress-task-digest",
+    requestedScopes: [],
+    deniedScopes: [],
+    resources: [],
+  });
+  const challenge = env.sessions.createEgressChallenge({
+    sessionId: env.session.id,
+    taskId: "egress-task",
+    draft: normalized.draft!,
+    projectedContextRefs: [source.id],
+    possiblyDisclosedRefs: normalized.possiblyDisclosedRefs ?? [source.id],
+    egressGrantId: grant.id,
+    authorityVersion: env.session.authorityVersion,
+    reason: normalized.escalationReason!,
+  });
+  assert.equal(challenge.status, "pending");
+  assert.equal(env.sessions.completeTask(
+    env.session.id,
+    "egress-task",
+    "awaiting_owner_confirmation",
+  ).status, "awaiting_owner_confirmation");
+  const released = env.sessions.resolveEgressChallenge({
+    id: challenge.id,
+    decision: "released",
+    ownerPrincipalId: "alice",
+    expectedDraftDigest: challenge.draftDigest,
+    releasedAnswer: {
+      ...challenge.draft,
+      answer: "The proposed pressure is outside the approved window.",
+    },
+  });
+  assert.equal(released.status, "released");
+  assert.equal(released.resolvedByPrincipalId, "alice");
+  assert.equal(env.sessions.listEvents(env.session.id).some((event) =>
+    event.type === "artifact"
+    && (event.content as { taskId?: string }).taskId === "egress-task"), true);
+  assert.throws(() => env.sessions.resolveEgressChallenge({
+    id: challenge.id,
+    decision: "released",
+    ownerPrincipalId: "alice",
+  }), /already resolved/);
+  env.gateway.close();
+});
+
+test("Authority Bundles form an immutable version chain across reauthorization", () => {
+  const env = fixture();
+  const initial = env.sessions.getAuthorityBundle(env.session.id)!;
+  assert.equal(initial.authorityVersion, 1);
+  env.sessions.setSessionStatus(env.session.id, "paused");
+  const approved = env.sessions.approveSession({
+    sessionId: env.session.id,
+    ownerPrincipalId: "alice",
+    allowedCollections: [env.collection.id],
+    sensitivityCeiling: "internal",
+    exactContentAllowed: false,
+    maxItems: 4,
+    maxTokens: 2000,
+    allowedOperations: ["ask"],
+    actionScopes: [],
+    deniedScopes: ["network"],
+    resources: [],
+    actionApprovalRule: "per-task",
+    egressAllowedSensitivity: "internal",
+    egressQuoteMode: "summary-only",
+    egressMaxQuoteCharacters: 0,
+    egressRequireEvidenceRefs: true,
+  });
+  const next = env.sessions.getAuthorityBundle(env.session.id)!;
+  assert.equal(approved.session.authorityVersion, 2);
+  assert.equal(next.previousAuthorityDigest, initial.authorityDigest);
+  assert.equal(env.sessions.getAuthorityBundle(env.session.id, 1)?.authorityDigest,
+    initial.authorityDigest);
+  assert.notEqual(next.authorityDigest, initial.authorityDigest);
+  env.gateway.close();
+});
+
+test("Group epoch changes pause a Session until Owner reauthorization", () => {
+  const gateway = new GatewayStore(":memory:");
+  const sessions = new SessionStore(gateway);
+  const created = sessions.createSession({
+    ownerPrincipalId: "alice",
+    ownerAgentId: "alice-agent",
+    callerType: "agent",
+    callerPrincipalId: "bob",
+    callerPeerId: "bob-peer",
+    callerTrust: "paired-gateway",
+    purpose: "Group simulation review",
+    groupId: "group-1",
+    groupPolicyVersion: 1,
+    groupMembershipVersion: 1,
+    requestedContext: {
+      collections: [],
+      sensitivity: "public",
+      mode: "summary",
+      maxItems: 1,
+      maxTokens: 256,
+    },
+    issuedContext: issuedContext([], "public", false),
+    operationGrant: {
+      allowedOperations: ["ask"],
+      issuedByOwnerPolicy: "test",
+    },
+    status: "active",
+  });
+  const paused = sessions.pauseForGroupEpoch(created.session.id, 2, 3);
+  assert.equal(paused.status, "paused");
+  const reauthorized = sessions.approveSession({
+    sessionId: paused.id,
+    ownerPrincipalId: "alice",
+    allowedCollections: [],
+    sensitivityCeiling: "public",
+    exactContentAllowed: false,
+    maxItems: 1,
+    maxTokens: 256,
+    allowedOperations: ["ask"],
+    actionScopes: [],
+    deniedScopes: [],
+    resources: [],
+    actionApprovalRule: "runtime-policy",
+    groupPolicyVersion: 2,
+    groupMembershipVersion: 3,
+  });
+  assert.equal(reauthorized.session.status, "active");
+  assert.equal(reauthorized.session.groupPolicyVersion, 2);
+  assert.equal(reauthorized.session.groupMembershipVersion, 3);
+  assert.equal(reauthorized.session.authorityVersion, 2);
+  gateway.close();
+});
+
+test("Writeback follows old Event provenance beyond the recent-thread window", () => {
+  const env = fixture();
+  const confidential = env.sessions.addItem({
+    collectionId: env.collection.id,
+    content: "Confidential source",
+    summary: "Confidential source",
+    origin: { principalId: "alice" },
+    authority: "project-record",
+    sensitivity: "confidential",
+    supersedes: [],
+  });
+  const oldAnswer = env.sessions.appendEvent(
+    env.session.id,
+    "agent-message",
+    "alice",
+    { answer: "Derived answer", disclosedContextRefs: [confidential.id] },
+    [confidential.id],
+  );
+  for (let index = 0; index < 130; index += 1) {
+    env.sessions.appendEvent(env.session.id, "caller-message", "bob", `later-${index}`, []);
+  }
+  assert.equal(env.sessions.evidenceRefBelongsToSession(env.session.id, oldAnswer.id), true);
+  const proposal = env.sessions.createWriteback({
+    sessionId: env.session.id,
+    targetCollectionId: env.collection.id,
+    proposedContent: "Derived record",
+    proposedSummary: "Derived record",
+    evidenceRefs: [oldAnswer.id],
+    requestedByPrincipalId: "bob",
+    requestedSensitivity: "public",
+  });
+  const accepted = env.sessions.resolveWriteback(proposal.id, "accepted");
+  assert.equal(env.sessions.getItem(accepted.resolvedItemId!)?.sensitivity, "confidential");
   env.gateway.close();
 });

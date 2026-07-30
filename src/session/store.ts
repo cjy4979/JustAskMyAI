@@ -1,16 +1,21 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { GatewayStore } from "../storage/sqlite.js";
 import type {
-  AgentProfile, ContextCollection, ContextGrant, ContextItem, ExternalSession,
-  ExternalSessionEvent, ExternalTaskRecord, IssuedContextGrant, RequestedContextGrant,
-  Sensitivity, SessionActionGrant, SessionCheckpoint, SessionInvite, SessionOperationGrant,
-  SessionStatus, WritebackProposal,
+  AgentProfile, ContextCollection, ContextGrant, ContextItem, EgressChallenge, EgressGrant,
+  ExternalSession, ExternalSessionEvent, ExternalTaskRecord, IssuedContextGrant,
+  RequestedContextGrant, Sensitivity, SessionActionGrant, SessionAuthorityBundle,
+  SessionCheckpoint, SessionInvite, SessionOperationGrant, SessionStatus, WritebackProposal,
 } from "./types.js";
 
 const SENSITIVITY: Sensitivity[] = ["public", "internal", "confidential", "restricted"];
 
 export class SessionStore {
-  constructor(private readonly gateway: GatewayStore) {
+  constructor(
+    private readonly gateway: GatewayStore,
+    private readonly signAuthority?: (statement: unknown) => import(
+      "../protocol/signed-request.js"
+    ).SignedStatement,
+  ) {
     this.migrate();
     this.purgeExpiredRetention();
   }
@@ -145,8 +150,18 @@ export class SessionStore {
     };
     actionGrant?: {
       allowedScopes: string[]; deniedScopes: string[]; resources: string[];
-      approvalRule: "per-session" | "per-task" | "per-tool";
+      approvalRule: "per-session" | "per-task" | "runtime-policy" | "per-tool";
       issuedByOwnerPolicy: string; issuedByPrincipalId?: string;
+    };
+    egressGrant?: {
+      allowedAuthority?: EgressGrant["allowedAuthority"];
+      allowedSensitivity?: Sensitivity;
+      quoteMode?: EgressGrant["quoteMode"];
+      maxQuoteCharacters?: number;
+      requireEvidenceRefs?: boolean;
+      requireOwnerConfirmationFor?: string[];
+      issuedByOwnerPolicy: string;
+      issuedByPrincipalId?: string;
     };
   }): {
     session: ExternalSession;
@@ -154,6 +169,7 @@ export class SessionStore {
     grant: ContextGrant;
     operationGrant: SessionOperationGrant;
     actionGrant: SessionActionGrant;
+    egressGrant: EgressGrant;
   } {
     if (!input.issuedContext) {
       throw new Error("Issued Context Grant must be created by Owner policy");
@@ -240,12 +256,46 @@ export class SessionStore {
       allowedScopes: [...new Set(input.actionGrant?.allowedScopes ?? [])],
       deniedScopes: [...new Set(input.actionGrant?.deniedScopes ?? [])],
       resources: [...new Set(input.actionGrant?.resources ?? [])],
-      approvalRule: input.actionGrant?.approvalRule ?? "per-tool",
+      approvalRule: input.actionGrant?.approvalRule === "per-tool"
+        ? "runtime-policy"
+        : input.actionGrant?.approvalRule ?? "runtime-policy",
       issuedByOwnerPolicy: input.actionGrant?.issuedByOwnerPolicy ?? "deny-by-default",
       issuedByPrincipalId: input.actionGrant?.issuedByPrincipalId,
       createdAt: now.toISOString(),
       expiresAt,
     };
+    const egressGrant: EgressGrant = {
+      id: randomUUID(),
+      sessionId,
+      allowedAuthority: [...new Set<ContextItem["authority"]>(input.egressGrant?.allowedAuthority ?? [
+        "external-claim", "agent-inference", "project-record", "owner-confirmed",
+      ])],
+      allowedSensitivity: minSensitivity(
+        grant.sensitivityCeiling,
+        input.egressGrant?.allowedSensitivity ?? grant.sensitivityCeiling,
+      ),
+      quoteMode: input.egressGrant?.quoteMode
+        ?? (grant.exactContentAllowed ? "bounded-excerpt" : "summary-only"),
+      maxQuoteCharacters: Math.min(Math.max(input.egressGrant?.maxQuoteCharacters ?? 240, 0), 4000),
+      requireEvidenceRefs: input.egressGrant?.requireEvidenceRefs ?? issuedCollections.length > 0,
+      requireOwnerConfirmationFor: [...new Set(
+        input.egressGrant?.requireOwnerConfirmationFor ?? ["restricted"],
+      )],
+      issuedByOwnerPolicy: input.egressGrant?.issuedByOwnerPolicy ?? "context-derived-default",
+      issuedByPrincipalId: input.egressGrant?.issuedByPrincipalId,
+      createdAt: now.toISOString(),
+      expiresAt,
+    };
+    const initialBundle = createAuthorityBundle({
+      sessionId,
+      authorityVersion: 1,
+      contextGrant: grant,
+      operationGrant,
+      actionGrant,
+      egressGrant,
+      groupPolicyVersion: input.groupPolicyVersion,
+      groupMembershipVersion: input.groupMembershipVersion,
+    }, this.signAuthority);
     const session: ExternalSession = {
       id: sessionId, ownerPrincipalId: input.ownerPrincipalId, ownerAgentId: input.ownerAgentId,
       callerType: input.callerType, callerPrincipalId: input.callerPrincipalId,
@@ -258,6 +308,9 @@ export class SessionStore {
       contextGrantId: grant.id,
       operationGrantId: operationGrant.id,
       actionGrantId: actionGrant.id,
+      egressGrantId: egressGrant.id,
+      authorityVersion: initialBundle.authorityVersion,
+      authorityDigest: initialBundle.authorityDigest,
       allowedActions: operationGrant.allowedOperations,
       status: input.status, createdAt: now.toISOString(), expiresAt,
     };
@@ -275,6 +328,10 @@ export class SessionStore {
       this.gateway.db.prepare(
         "INSERT INTO session_action_grants(id,session_id,grant_json,expires_at) VALUES (?,?,?,?)",
       ).run(actionGrant.id, session.id, JSON.stringify(actionGrant), expiresAt);
+      this.gateway.db.prepare(
+        "INSERT INTO session_egress_grants(id,session_id,grant_json,expires_at) VALUES (?,?,?,?)",
+      ).run(egressGrant.id, session.id, JSON.stringify(egressGrant), expiresAt);
+      this.insertAuthorityBundle(initialBundle);
       this.gateway.db.prepare(`
         INSERT INTO external_sessions(
           id,owner_agent_id,caller_principal_id,caller_peer_id,status,expires_at,session_json,created_at
@@ -286,7 +343,7 @@ export class SessionStore {
     } catch (error) {
       this.gateway.db.exec("ROLLBACK"); throw error;
     }
-    return { session, requestedGrant, grant, operationGrant, actionGrant };
+    return { session, requestedGrant, grant, operationGrant, actionGrant, egressGrant };
   }
 
   getSession(id: string): ExternalSession | undefined {
@@ -338,7 +395,42 @@ export class SessionStore {
     const row = this.gateway.db.prepare(
       "SELECT grant_json FROM session_action_grants WHERE id=?",
     ).get(id) as { grant_json: string } | undefined;
-    return row ? JSON.parse(row.grant_json) as SessionActionGrant : undefined;
+    if (!row) return undefined;
+    const grant = JSON.parse(row.grant_json) as SessionActionGrant;
+    return grant.approvalRule === "per-tool"
+      ? { ...grant, approvalRule: "runtime-policy" }
+      : grant;
+  }
+
+  getEgressGrant(id: string): EgressGrant | undefined {
+    const row = this.gateway.db.prepare(
+      "SELECT grant_json FROM session_egress_grants WHERE id=?",
+    ).get(id) as { grant_json: string } | undefined;
+    return row ? JSON.parse(row.grant_json) as EgressGrant : undefined;
+  }
+
+  getAuthorityBundle(sessionId: string, version?: number): SessionAuthorityBundle | undefined {
+    const row = version === undefined
+      ? this.gateway.db.prepare(`
+          SELECT bundle_json FROM session_authority_bundles
+          WHERE session_id=? ORDER BY authority_version DESC LIMIT 1
+        `).get(sessionId)
+      : this.gateway.db.prepare(`
+          SELECT bundle_json FROM session_authority_bundles
+          WHERE session_id=? AND authority_version=?
+        `).get(sessionId, version);
+    return row
+      ? JSON.parse((row as { bundle_json: string }).bundle_json) as SessionAuthorityBundle
+      : undefined;
+  }
+
+  private insertAuthorityBundle(bundle: SessionAuthorityBundle): void {
+    this.gateway.db.prepare(`
+      INSERT INTO session_authority_bundles(
+        id,session_id,authority_version,authority_digest,bundle_json,issued_at
+      ) VALUES (?,?,?,?,?,?)
+    `).run(bundle.id, bundle.sessionId, bundle.authorityVersion, bundle.authorityDigest,
+      JSON.stringify(bundle), bundle.issuedAt);
   }
 
   evaluateContextRequest(input: {
@@ -404,12 +496,21 @@ export class SessionStore {
     actionScopes: string[];
     deniedScopes: string[];
     resources: string[];
-    actionApprovalRule: "per-session" | "per-task" | "per-tool";
+    actionApprovalRule: "per-session" | "per-task" | "runtime-policy" | "per-tool";
+    egressAllowedAuthority?: EgressGrant["allowedAuthority"];
+    egressAllowedSensitivity?: Sensitivity;
+    egressQuoteMode?: EgressGrant["quoteMode"];
+    egressMaxQuoteCharacters?: number;
+    egressRequireEvidenceRefs?: boolean;
+    egressRequireOwnerConfirmationFor?: string[];
+    groupPolicyVersion?: number;
+    groupMembershipVersion?: number;
   }): {
     session: ExternalSession;
     grant: ContextGrant;
     operationGrant: SessionOperationGrant;
     actionGrant: SessionActionGrant;
+    egressGrant: EgressGrant;
   } {
     const session = this.getSessionRaw(input.sessionId);
     if (!session || !["awaiting_owner_consent", "paused"].includes(session.status)) {
@@ -420,7 +521,8 @@ export class SessionStore {
     const currentGrant = this.getGrant(session.contextGrantId);
     const currentOperation = this.getOperationGrant(session.operationGrantId);
     const currentAction = this.getActionGrant(session.actionGrantId);
-    if (!requested || !currentGrant || !currentOperation || !currentAction) {
+    const currentEgress = this.getEgressGrant(session.egressGrantId);
+    if (!requested || !currentGrant || !currentOperation || !currentAction || !currentEgress) {
       throw new Error("session grants are incomplete");
     }
     const requestedOperations = new Set(currentOperation.allowedOperations);
@@ -462,11 +564,58 @@ export class SessionStore {
       allowedScopes: [...new Set(input.actionScopes)],
       deniedScopes: [...new Set(input.deniedScopes)],
       resources: [...new Set(input.resources)],
-      approvalRule: input.actionApprovalRule,
+      approvalRule: input.actionApprovalRule === "per-tool"
+        ? "runtime-policy"
+        : input.actionApprovalRule,
       issuedByOwnerPolicy: "human-owner-decision",
       issuedByPrincipalId: input.ownerPrincipalId,
     };
-    const active = { ...session, status: "active" as const };
+    const requestedAuthorities = new Set(currentEgress.allowedAuthority);
+    const egressGrant: EgressGrant = {
+      ...currentEgress,
+      allowedAuthority: [...new Set(
+        input.egressAllowedAuthority ?? currentEgress.allowedAuthority,
+      )].filter((authority) => requestedAuthorities.has(authority)),
+      allowedSensitivity: minSensitivity(
+        currentEgress.allowedSensitivity,
+        input.egressAllowedSensitivity ?? currentEgress.allowedSensitivity,
+      ),
+      quoteMode: narrowerQuoteMode(
+        currentEgress.quoteMode,
+        input.egressQuoteMode ?? currentEgress.quoteMode,
+      ),
+      maxQuoteCharacters: Math.min(
+        currentEgress.maxQuoteCharacters,
+        Math.max(input.egressMaxQuoteCharacters ?? currentEgress.maxQuoteCharacters, 0),
+      ),
+      requireEvidenceRefs:
+        currentEgress.requireEvidenceRefs || (input.egressRequireEvidenceRefs ?? false),
+      requireOwnerConfirmationFor: [...new Set([
+        ...currentEgress.requireOwnerConfirmationFor,
+        ...(input.egressRequireOwnerConfirmationFor ?? []),
+      ])],
+      issuedByOwnerPolicy: "human-owner-decision",
+      issuedByPrincipalId: input.ownerPrincipalId,
+    };
+    const bundle = createAuthorityBundle({
+      sessionId: session.id,
+      authorityVersion: session.authorityVersion + 1,
+      previousAuthorityDigest: session.authorityDigest,
+      contextGrant: grant,
+      operationGrant,
+      actionGrant,
+      egressGrant,
+      groupPolicyVersion: input.groupPolicyVersion ?? session.groupPolicyVersion,
+      groupMembershipVersion: input.groupMembershipVersion ?? session.groupMembershipVersion,
+    }, this.signAuthority);
+    const active = {
+      ...session,
+      status: "active" as const,
+      authorityVersion: bundle.authorityVersion,
+      authorityDigest: bundle.authorityDigest,
+      groupPolicyVersion: input.groupPolicyVersion ?? session.groupPolicyVersion,
+      groupMembershipVersion: input.groupMembershipVersion ?? session.groupMembershipVersion,
+    };
     this.gateway.db.exec("BEGIN IMMEDIATE");
     try {
       this.gateway.db.prepare("UPDATE context_grants SET grant_json=? WHERE id=?")
@@ -475,6 +624,9 @@ export class SessionStore {
         .run(JSON.stringify(operationGrant), operationGrant.id);
       this.gateway.db.prepare("UPDATE session_action_grants SET grant_json=? WHERE id=?")
         .run(JSON.stringify(actionGrant), actionGrant.id);
+      this.gateway.db.prepare("UPDATE session_egress_grants SET grant_json=? WHERE id=?")
+        .run(JSON.stringify(egressGrant), egressGrant.id);
+      this.insertAuthorityBundle(bundle);
       this.gateway.db.prepare(
         "UPDATE external_sessions SET status='active',session_json=? WHERE id=?",
       ).run(JSON.stringify(active), active.id);
@@ -487,8 +639,11 @@ export class SessionStore {
       status: "active",
       issuedContextGrantDigest: digest(grant),
       actionGrantDigest: digest(actionGrant),
+      egressGrantDigest: digest(egressGrant),
+      authorityVersion: bundle.authorityVersion,
+      authorityDigest: bundle.authorityDigest,
     }, []);
-    return { session: active, grant, operationGrant, actionGrant };
+    return { session: active, grant, operationGrant, actionGrant, egressGrant };
   }
 
   setSessionStatus(id: string, status: SessionStatus): ExternalSession {
@@ -524,6 +679,29 @@ export class SessionStore {
     return next;
   }
 
+  pauseForGroupEpoch(
+    id: string,
+    currentPolicyVersion: number,
+    currentMembershipVersion: number,
+  ): ExternalSession {
+    const current = this.getSessionRaw(id);
+    if (!current) throw new Error("external session not found");
+    if (current.status !== "active") return current;
+    const paused = { ...current, status: "paused" as const };
+    this.gateway.db.prepare(
+      "UPDATE external_sessions SET status='paused',session_json=? WHERE id=?",
+    ).run(JSON.stringify(paused), id);
+    this.appendEvent(id, "status", current.ownerPrincipalId, {
+      status: "paused",
+      reason: "group-authority-epoch-changed",
+      previousPolicyVersion: current.groupPolicyVersion,
+      previousMembershipVersion: current.groupMembershipVersion,
+      observedPolicyVersion: currentPolicyVersion,
+      observedMembershipVersion: currentMembershipVersion,
+    }, []);
+    return paused;
+  }
+
   extendSession(id: string, additionalSeconds: number): ExternalSession {
     const current = this.getSessionRaw(id);
     if (!current) throw new Error("external session not found");
@@ -535,10 +713,34 @@ export class SessionStore {
     const expiresAt = new Date(Math.min(Date.parse(current.expiresAt) + seconds * 1000, maximum))
       .toISOString();
     if (expiresAt === current.expiresAt) throw new Error("external session reached its 7-day maximum");
-    const next = { ...current, expiresAt };
     const grant = this.getGrant(current.contextGrantId);
-    if (!grant) throw new Error("context grant not found");
+    const operationGrant = this.getOperationGrant(current.operationGrantId);
+    const actionGrant = this.getActionGrant(current.actionGrantId);
+    const egressGrant = this.getEgressGrant(current.egressGrantId);
+    if (!grant || !operationGrant || !actionGrant || !egressGrant) {
+      throw new Error("session authority grants are incomplete");
+    }
     const nextGrant = { ...grant, expiresAt };
+    const nextOperation = { ...operationGrant, expiresAt };
+    const nextAction = { ...actionGrant, expiresAt };
+    const nextEgress = { ...egressGrant, expiresAt };
+    const bundle = createAuthorityBundle({
+      sessionId: current.id,
+      authorityVersion: current.authorityVersion + 1,
+      previousAuthorityDigest: current.authorityDigest,
+      contextGrant: nextGrant,
+      operationGrant: nextOperation,
+      actionGrant: nextAction,
+      egressGrant: nextEgress,
+      groupPolicyVersion: current.groupPolicyVersion,
+      groupMembershipVersion: current.groupMembershipVersion,
+    }, this.signAuthority);
+    const next = {
+      ...current,
+      expiresAt,
+      authorityVersion: bundle.authorityVersion,
+      authorityDigest: bundle.authorityDigest,
+    };
     this.gateway.db.exec("BEGIN IMMEDIATE");
     try {
       this.gateway.db.prepare(
@@ -548,21 +750,26 @@ export class SessionStore {
         "UPDATE context_grants SET expires_at=?, grant_json=? WHERE id=?",
       ).run(expiresAt, JSON.stringify(nextGrant), grant.id);
       for (const [table, id, value] of [
-        ["session_operation_grants", current.operationGrantId,
-          { ...this.getOperationGrant(current.operationGrantId)!, expiresAt }],
-        ["session_action_grants", current.actionGrantId,
-          { ...this.getActionGrant(current.actionGrantId)!, expiresAt }],
+        ["session_operation_grants", current.operationGrantId, nextOperation],
+        ["session_action_grants", current.actionGrantId, nextAction],
+        ["session_egress_grants", current.egressGrantId, nextEgress],
       ] as const) {
         this.gateway.db.prepare(
           `UPDATE ${table} SET expires_at=?, grant_json=? WHERE id=?`,
         ).run(expiresAt, JSON.stringify(value), id);
       }
+      this.insertAuthorityBundle(bundle);
       this.gateway.db.exec("COMMIT");
     } catch (error) {
       this.gateway.db.exec("ROLLBACK");
       throw error;
     }
-    this.appendEvent(id, "status", current.ownerPrincipalId, { status: current.status, expiresAt }, []);
+    this.appendEvent(id, "status", current.ownerPrincipalId, {
+      status: current.status,
+      expiresAt,
+      authorityVersion: bundle.authorityVersion,
+      authorityDigest: bundle.authorityDigest,
+    }, []);
     return next;
   }
 
@@ -616,6 +823,24 @@ export class SessionStore {
       .map((row) => JSON.parse(row.event_json) as ExternalSessionEvent).reverse();
   }
 
+  getSessionEvent(sessionId: string, eventId: string): ExternalSessionEvent | undefined {
+    const row = this.gateway.db.prepare(`
+      SELECT event_json FROM external_session_events WHERE session_id=? AND id=?
+    `).get(sessionId, eventId) as { event_json: string } | undefined;
+    return row ? JSON.parse(row.event_json) as ExternalSessionEvent : undefined;
+  }
+
+  evidenceRefBelongsToSession(sessionId: string, ref: string): boolean {
+    const item = this.getItem(ref);
+    if (item) {
+      return item.origin.sessionId === sessionId
+        || item.authority !== "external-claim";
+    }
+    return Boolean(this.getSessionEvent(sessionId, ref))
+      || this.listWritebacks().some((proposal) =>
+        proposal.id === ref && proposal.sessionId === sessionId);
+  }
+
   registerTask(input: Omit<ExternalTaskRecord, "id" | "status" | "createdAt">): ExternalTaskRecord {
     const task: ExternalTaskRecord = {
       ...input,
@@ -653,6 +878,120 @@ export class SessionStore {
       "UPDATE external_tasks SET status=?,task_json=? WHERE session_id=? AND external_task_id=?",
     ).run(status, JSON.stringify(task), sessionId, externalTaskId);
     return task;
+  }
+
+  createEgressChallenge(input: Omit<
+    EgressChallenge,
+    "id" | "status" | "createdAt" | "draftDigest"
+  >): EgressChallenge {
+    const challenge: EgressChallenge = {
+      ...input,
+      id: randomUUID(),
+      draftDigest: digest(input.draft),
+      status: "pending",
+      createdAt: new Date().toISOString(),
+    };
+    this.gateway.db.prepare(`
+      INSERT INTO egress_challenges(
+        id,session_id,task_id,status,challenge_json,draft_digest,created_at
+      ) VALUES (?,?,?,?,?,?,?)
+    `).run(challenge.id, challenge.sessionId, challenge.taskId ?? null, challenge.status,
+      JSON.stringify(challenge), challenge.draftDigest, challenge.createdAt);
+    if (challenge.taskId) {
+      this.completeTask(challenge.sessionId, challenge.taskId, "awaiting_owner_confirmation");
+    }
+    return challenge;
+  }
+
+  listEgressChallenges(sessionId?: string): EgressChallenge[] {
+    const rows = sessionId
+      ? this.gateway.db.prepare(`
+          SELECT challenge_json FROM egress_challenges
+          WHERE session_id=? ORDER BY created_at DESC
+        `).all(sessionId)
+      : this.gateway.db.prepare(`
+          SELECT challenge_json FROM egress_challenges ORDER BY created_at DESC
+        `).all();
+    return (rows as { challenge_json: string }[])
+      .map((row) => JSON.parse(row.challenge_json) as EgressChallenge);
+  }
+
+  resolveEgressChallenge(input: {
+    id: string;
+    decision: "released" | "rejected";
+    ownerPrincipalId: string;
+    releasedAnswer?: EgressChallenge["releasedAnswer"];
+    expectedDraftDigest?: string;
+  }): EgressChallenge {
+    const row = this.gateway.db.prepare(
+      "SELECT challenge_json FROM egress_challenges WHERE id=?",
+    ).get(input.id) as { challenge_json: string } | undefined;
+    if (!row) throw new Error("egress challenge not found");
+    const current = JSON.parse(row.challenge_json) as EgressChallenge;
+    if (current.status !== "pending") throw new Error("egress challenge is already resolved");
+    const session = this.getSessionRaw(current.sessionId);
+    if (!session || session.ownerPrincipalId !== input.ownerPrincipalId) {
+      throw new Error("egress challenge Owner mismatch");
+    }
+    if (input.expectedDraftDigest && input.expectedDraftDigest !== current.draftDigest) {
+      throw new Error("egress challenge draft digest mismatch");
+    }
+    const resolvedAt = new Date().toISOString();
+    const next: EgressChallenge = {
+      ...current,
+      status: input.decision,
+      resolvedAt,
+      resolvedByPrincipalId: input.ownerPrincipalId,
+      releasedAnswer: input.decision === "released"
+        ? input.releasedAnswer ?? current.draft
+        : undefined,
+    };
+    this.gateway.db.prepare(`
+      UPDATE egress_challenges SET status=?,challenge_json=?,resolved_at=? WHERE id=?
+    `).run(next.status, JSON.stringify(next), resolvedAt, next.id);
+    if (next.status === "released" && next.releasedAnswer) {
+      this.appendEvent(
+        current.sessionId,
+        "agent-message",
+        input.ownerPrincipalId,
+        {
+          ...next.releasedAnswer,
+          ownerConfirmedEgress: true,
+          egressChallengeId: current.id,
+          draftDigest: current.draftDigest,
+        },
+        next.releasedAnswer.disclosedContextRefs,
+      );
+      if (current.taskId) {
+        this.appendEvent(
+          current.sessionId,
+          "artifact",
+          input.ownerPrincipalId,
+          {
+            taskId: current.taskId,
+            mediaType: "application/json",
+            result: next.releasedAnswer,
+            digest: digest(next.releasedAnswer),
+            egressChallengeId: current.id,
+          },
+          next.releasedAnswer.disclosedContextRefs,
+        );
+      }
+    }
+    if (current.taskId) {
+      this.completeTask(
+        current.sessionId,
+        current.taskId,
+        input.decision === "released" ? "completed" : "failed",
+      );
+    }
+    this.appendEvent(current.sessionId, "status", input.ownerPrincipalId, {
+      egressChallengeId: current.id,
+      decision: input.decision,
+      draftDigest: current.draftDigest,
+      releasedAnswerDigest: next.releasedAnswer ? digest(next.releasedAnswer) : undefined,
+    }, current.projectedContextRefs);
+    return next;
   }
 
   getCheckpoint(sessionId: string): SessionCheckpoint | undefined {
@@ -780,10 +1119,11 @@ export class SessionStore {
     if (decision === "accepted") {
       const session = this.getSession(current.sessionId)!;
       const collection = this.getCollection(current.targetCollectionId)!;
-      const sensitivity = current.evidenceRefs.reduce<Sensitivity>((result, ref) => {
-        const item = this.getItem(ref);
-        return item ? maxSensitivity(result, item.sensitivity) : result;
-      }, maxSensitivity(
+      const evidenceSensitivity = this.resolveEvidenceSensitivity(
+        current.sessionId,
+        current.evidenceRefs,
+      );
+      const sensitivity = maxSensitivity(evidenceSensitivity, maxSensitivity(
         collection.defaultSensitivity,
         review?.sensitivity ?? current.requestedSensitivity ?? "public",
       ));
@@ -807,6 +1147,35 @@ export class SessionStore {
       "UPDATE writeback_proposals SET status=?, proposal_json=?, reviewed_at=? WHERE id=?",
     ).run(next.status, JSON.stringify(next), reviewedAt, id);
     return next;
+  }
+
+  resolveEvidenceSensitivity(sessionId: string, initialRefs: string[]): Sensitivity {
+    let sensitivity: Sensitivity = "public";
+    const pending = [...initialRefs];
+    const visited = new Set<string>();
+    while (pending.length > 0) {
+      const ref = pending.pop()!;
+      if (visited.has(ref)) continue;
+      visited.add(ref);
+      const item = this.getItem(ref);
+      if (item) {
+        sensitivity = maxSensitivity(sensitivity, item.sensitivity);
+        continue;
+      }
+      const event = this.getSessionEvent(sessionId, ref);
+      if (event) {
+        pending.push(...event.contextRefs);
+        pending.push(...extractEvidenceRefs(event.content));
+        continue;
+      }
+      const proposal = this.listWritebacks().find((candidate) =>
+        candidate.id === ref && candidate.sessionId === sessionId);
+      if (proposal) {
+        pending.push(...proposal.evidenceRefs);
+        if (proposal.resolvedItemId) pending.push(proposal.resolvedItemId);
+      }
+    }
+    return sensitivity;
   }
 
   createInvite(invite: SessionInvite): void {
@@ -923,9 +1292,15 @@ export class SessionStore {
       })
       .map((row) => row.id);
     for (const sessionId of expiredIds) {
-      this.gateway.db.prepare(
-        "DELETE FROM external_session_events WHERE session_id=?",
-      ).run(sessionId);
+      for (const table of [
+        "external_session_events",
+        "external_tasks",
+        "session_checkpoints",
+        "egress_challenges",
+        "guest_session_bindings",
+      ]) {
+        this.gateway.db.prepare(`DELETE FROM ${table} WHERE session_id=?`).run(sessionId);
+      }
       const items = this.gateway.db.prepare(
         "SELECT id,item_json FROM context_items",
       ).all() as { id: string; item_json: string }[];
@@ -970,6 +1345,15 @@ export class SessionStore {
         id TEXT PRIMARY KEY,session_id TEXT NOT NULL UNIQUE,grant_json TEXT NOT NULL,
         expires_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS session_egress_grants(
+        id TEXT PRIMARY KEY,session_id TEXT NOT NULL UNIQUE,grant_json TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS session_authority_bundles(
+        id TEXT PRIMARY KEY,session_id TEXT NOT NULL,authority_version INTEGER NOT NULL,
+        authority_digest TEXT NOT NULL,bundle_json TEXT NOT NULL,issued_at TEXT NOT NULL,
+        UNIQUE(session_id,authority_version),UNIQUE(session_id,authority_digest)
+      );
       CREATE TABLE IF NOT EXISTS external_sessions(
         id TEXT PRIMARY KEY,owner_agent_id TEXT NOT NULL,caller_principal_id TEXT NOT NULL,
         caller_peer_id TEXT,status TEXT NOT NULL,expires_at TEXT NOT NULL,
@@ -993,6 +1377,11 @@ export class SessionStore {
         checkpoint_json TEXT NOT NULL,created_at TEXT NOT NULL,
         UNIQUE(session_id,up_to_sequence)
       );
+      CREATE TABLE IF NOT EXISTS egress_challenges(
+        id TEXT PRIMARY KEY,session_id TEXT NOT NULL,task_id TEXT,status TEXT NOT NULL,
+        challenge_json TEXT NOT NULL,draft_digest TEXT NOT NULL,created_at TEXT NOT NULL,
+        resolved_at TEXT
+      );
       CREATE TABLE IF NOT EXISTS writeback_proposals(
         id TEXT PRIMARY KEY,session_id TEXT NOT NULL,status TEXT NOT NULL,
         proposal_json TEXT NOT NULL,created_at TEXT NOT NULL,reviewed_at TEXT
@@ -1011,10 +1400,72 @@ export class SessionStore {
         ON external_session_events(session_id,sequence);
       CREATE INDEX IF NOT EXISTS idx_external_tasks_session
         ON external_tasks(session_id,created_at);
+      CREATE INDEX IF NOT EXISTS idx_egress_challenges_session
+        ON egress_challenges(session_id,status,created_at);
     `);
     this.ensureColumn("context_collections", "visibility", "TEXT NOT NULL DEFAULT 'private'");
     this.ensureColumn("context_collections", "public_alias", "TEXT");
     this.ensureColumn("context_collections", "access_policy_json", "TEXT");
+    this.migrateLegacyAuthority();
+  }
+
+  private migrateLegacyAuthority(): void {
+    const rows = this.gateway.db.prepare(
+      "SELECT id,session_json FROM external_sessions",
+    ).all() as { id: string; session_json: string }[];
+    for (const row of rows) {
+      const session = JSON.parse(row.session_json) as ExternalSession;
+      if (session.egressGrantId && session.authorityVersion && session.authorityDigest) continue;
+      const contextGrant = this.getGrant(session.contextGrantId);
+      const operationGrant = this.getOperationGrant(session.operationGrantId);
+      const actionGrant = this.getActionGrant(session.actionGrantId);
+      if (!contextGrant || !operationGrant || !actionGrant) continue;
+      const egressGrant: EgressGrant = {
+        id: randomUUID(),
+        sessionId: session.id,
+        allowedAuthority: [
+          "external-claim", "agent-inference", "project-record", "owner-confirmed",
+        ],
+        allowedSensitivity: contextGrant.sensitivityCeiling,
+        quoteMode: contextGrant.exactContentAllowed ? "bounded-excerpt" : "summary-only",
+        maxQuoteCharacters: 240,
+        requireEvidenceRefs: contextGrant.allowedCollections.length > 0,
+        requireOwnerConfirmationFor: ["restricted"],
+        issuedByOwnerPolicy: "legacy-safe-migration",
+        createdAt: contextGrant.createdAt,
+        expiresAt: contextGrant.expiresAt,
+      };
+      const bundle = createAuthorityBundle({
+        sessionId: session.id,
+        authorityVersion: 1,
+        contextGrant,
+        operationGrant,
+        actionGrant,
+        egressGrant,
+        groupPolicyVersion: session.groupPolicyVersion,
+        groupMembershipVersion: session.groupMembershipVersion,
+      }, this.signAuthority);
+      const migrated = {
+        ...session,
+        egressGrantId: egressGrant.id,
+        authorityVersion: 1,
+        authorityDigest: bundle.authorityDigest,
+      };
+      this.gateway.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.gateway.db.prepare(
+          "INSERT INTO session_egress_grants(id,session_id,grant_json,expires_at) VALUES (?,?,?,?)",
+        ).run(egressGrant.id, session.id, JSON.stringify(egressGrant), egressGrant.expiresAt);
+        this.insertAuthorityBundle(bundle);
+        this.gateway.db.prepare(
+          "UPDATE external_sessions SET session_json=? WHERE id=?",
+        ).run(JSON.stringify(migrated), session.id);
+        this.gateway.db.exec("COMMIT");
+      } catch (error) {
+        this.gateway.db.exec("ROLLBACK");
+        throw error;
+      }
+    }
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
@@ -1065,4 +1516,49 @@ function minSensitivity(left: Sensitivity, right: Sensitivity): Sensitivity {
 
 function maxSensitivity(left: Sensitivity, right: Sensitivity): Sensitivity {
   return SENSITIVITY[Math.max(SENSITIVITY.indexOf(left), SENSITIVITY.indexOf(right))];
+}
+
+function narrowerQuoteMode(
+  left: EgressGrant["quoteMode"],
+  right: EgressGrant["quoteMode"],
+): EgressGrant["quoteMode"] {
+  const modes: EgressGrant["quoteMode"][] = [
+    "none", "summary-only", "bounded-excerpt", "exact",
+  ];
+  return modes[Math.min(modes.indexOf(left), modes.indexOf(right))];
+}
+
+function createAuthorityBundle(input: Omit<
+  SessionAuthorityBundle,
+  "id" | "issuedAt" | "authorityDigest" | "proof"
+>, sign?: (statement: unknown) => import(
+  "../protocol/signed-request.js"
+).SignedStatement): SessionAuthorityBundle {
+  const issuedAt = new Date().toISOString();
+  const body = { ...input, issuedAt };
+  const unsigned = {
+    ...body,
+    id: randomUUID(),
+    authorityDigest: digest(body),
+  };
+  return { ...unsigned, proof: sign?.(unsigned) };
+}
+
+function extractEvidenceRefs(value: unknown, depth = 0): string[] {
+  if (depth > 10 || value === null || value === undefined) return [];
+  if (Array.isArray(value)) return value.flatMap((item) => extractEvidenceRefs(item, depth + 1));
+  if (typeof value !== "object") return [];
+  const refs: string[] = [];
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    if (
+      ["evidenceRefs", "contextRefs", "disclosedContextRefs", "possiblyDisclosedRefs"]
+        .includes(key)
+      && Array.isArray(child)
+    ) {
+      refs.push(...child.filter((item): item is string => typeof item === "string"));
+    } else {
+      refs.push(...extractEvidenceRefs(child, depth + 1));
+    }
+  }
+  return refs;
 }

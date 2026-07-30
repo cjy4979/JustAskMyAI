@@ -551,7 +551,7 @@ server.registerTool(
       body,
     }) as {
       session?: unknown; requestedGrant?: unknown; grant?: unknown;
-      operationGrant?: unknown; actionGrant?: unknown; proof?: unknown;
+      operationGrant?: unknown; actionGrant?: unknown; egressGrant?: unknown; proof?: unknown;
     };
     const verified = verifySignedStatement(
       result.proof,
@@ -561,6 +561,7 @@ server.registerTool(
         grant: result.grant,
         operationGrant: result.operationGrant,
         actionGrant: result.actionGrant,
+        egressGrant: result.egressGrant,
       },
       store,
     );
@@ -740,6 +741,67 @@ server.registerTool(
   "list_writeback_proposals",
   { description: "List local External Session writeback proposals and their review state." },
   async () => text(JSON.stringify(sessions.listWritebacks(), null, 2)),
+);
+
+server.registerTool(
+  "list_egress_challenges",
+  {
+    description:
+      "List local drafts withheld by the Egress Guard pending explicit Owner confirmation.",
+    inputSchema: { sessionId: z.string().min(1).optional() },
+  },
+  async ({ sessionId }) =>
+    text(JSON.stringify(sessions.listEgressChallenges(sessionId), null, 2)),
+);
+
+server.registerTool(
+  "resolve_egress_confirmation",
+  {
+    description:
+      "Release or reject an exact Egress draft after a bound localhost Human approval.",
+    inputSchema: {
+      challengeId: z.string().min(1),
+      decision: z.enum(["released", "rejected"]),
+      draftDigest: z.string().min(1),
+      releasedAnswer: z.unknown().optional(),
+      approvalId: z.string().min(1).optional(),
+    },
+  },
+  async ({ challengeId, decision, draftDigest, releasedAnswer, approvalId }) => {
+    const requestHash = digestJson({ challengeId, decision, draftDigest, releasedAnswer });
+    const binding = {
+      peerId: localPeerId,
+      taskId: `egress:${challengeId}`,
+      contextId: challengeId,
+      requestHash,
+    };
+    const approval = approvalId ? store.consumeApproval(approvalId, binding) : undefined;
+    if (!approval) {
+      const pending = store.createApproval({
+        ...binding,
+        requestedScopes: [`egress:${decision}`],
+      });
+      return text(JSON.stringify({
+        status: "LOCAL_HUMAN_APPROVAL_REQUIRED",
+        approvalId: pending.id,
+        challengeId,
+        decision,
+        draftDigest,
+      }, null, 2));
+    }
+    if (!approval.approvedScopes.includes(`egress:${decision}`)) {
+      throw new Error("Human approval does not authorize this Egress decision");
+    }
+    return text(JSON.stringify(sessions.resolveEgressChallenge({
+      id: challengeId,
+      decision,
+      ownerPrincipalId: principalId,
+      expectedDraftDigest: draftDigest,
+      releasedAnswer: releasedAnswer as Parameters<
+        SessionStore["resolveEgressChallenge"]
+      >[0]["releasedAnswer"],
+    }), null, 2));
+  },
 );
 
 server.registerTool(

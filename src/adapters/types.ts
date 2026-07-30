@@ -5,6 +5,10 @@ export interface PermissionDecision {
   allowed: boolean;
   matchedScope?: string;
   deniedByScope?: string;
+  requestedPaths?: string[];
+  requestedUrls?: string[];
+  matchedResources?: string[];
+  deniedResources?: string[];
   reason: string;
 }
 
@@ -15,6 +19,7 @@ export interface AgentRequest {
   signal: AbortSignal;
   approvedScopes: string[];
   deniedScopes: string[];
+  grantedResources?: string[];
   externalSessionId?: string;
   resumeSessionId?: string;
   onPermissionDecision?: (decision: PermissionDecision) => Promise<void>;
@@ -24,6 +29,7 @@ export interface AgentResult {
   text: string;
   sessionId?: string;
   degradedRehydration?: boolean;
+  memoryIsolationEvidence?: import("../session/types.js").MemoryIsolationEvidence;
 }
 
 export interface AgentAdapter {
@@ -31,6 +37,7 @@ export interface AgentAdapter {
   readonly displayName: string;
   readonly capabilities: AgentAdapterCapabilities;
   run(request: AgentRequest): Promise<AgentResult>;
+  closeSession?(externalSessionId: string): Promise<void> | void;
   close?(): Promise<void> | void;
 }
 import type { AgentAdapterCapabilities } from "../session/types.js";

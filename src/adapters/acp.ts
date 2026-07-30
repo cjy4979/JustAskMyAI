@@ -8,12 +8,27 @@ import type {
   PermissionDecision,
 } from "./types.js";
 import { decideToolPermission } from "../policy/tool-permission.js";
+import type {
+  AgentAdapterCapabilities, MemoryIsolationEvidence,
+} from "../session/types.js";
 
 export interface AcpAdapterOptions {
   command: string;
   args: string[];
   cwd: string;
   allowToolPermissions?: boolean;
+  capabilities?: AgentAdapterCapabilities;
+  runtimeFactory?: (externalSessionId: string) => AcpRuntimeLaunch;
+}
+
+export interface AcpRuntimeLaunch {
+  command: string;
+  args: string[];
+  cwd: string;
+  agentCwd: string;
+  env?: NodeJS.ProcessEnv;
+  memoryIsolationEvidence?: MemoryIsolationEvidence;
+  cleanup?: () => Promise<void> | void;
 }
 
 interface AcpRuntime {
@@ -25,8 +40,12 @@ interface AcpRuntime {
   queue: Promise<void>;
   approvedScopes: Set<string>;
   deniedScopes: Set<string>;
+  grantedResources: Set<string>;
   degradedRehydration: boolean;
   onPermissionDecision?: (decision: PermissionDecision) => Promise<void>;
+  memoryIsolationEvidence?: MemoryIsolationEvidence;
+  cleanup?: () => Promise<void> | void;
+  agentCwd: string;
 }
 
 /**
@@ -34,25 +53,25 @@ interface AcpRuntime {
  * A continuation therefore reaches the same existing agent memory.
  */
 export class AcpAdapter implements AgentAdapter {
-  readonly id = "acp";
-  readonly displayName = "ACP agent";
-  readonly capabilities = {
-    isolatedSessions: true,
-    sessionResume: true,
-    nativeMemoryWriteControl: (
-      process.env.JAMAI_ACP_MEMORY_ISOLATION === "confirmed" ? "controlled" : "unknown"
-    ) as "controlled" | "unknown",
-    separateMemoryNamespace: process.env.JAMAI_ACP_MEMORY_ISOLATION === "confirmed",
-    memoryIsolationAssurance: (
-      process.env.JAMAI_ACP_MEMORY_ISOLATION === "confirmed"
-        ? "operator-attested" : "unknown"
-    ) as "operator-attested" | "unknown",
-    toolPermissionHooks: true,
-    structuredContextualOutput: false,
-  };
+  readonly id: string = "acp";
+  readonly displayName: string = "ACP agent";
+  readonly capabilities: AgentAdapterCapabilities;
   private readonly sessions = new Map<string, Promise<AcpRuntime>>();
 
-  constructor(private readonly options: AcpAdapterOptions) {}
+  constructor(private readonly options: AcpAdapterOptions) {
+    this.capabilities = options.capabilities ?? {
+      isolatedSessions: true,
+      sessionResume: true,
+      nativeMemoryWriteControl:
+        process.env.JAMAI_ACP_MEMORY_ISOLATION === "confirmed" ? "controlled" : "unknown",
+      separateMemoryNamespace: process.env.JAMAI_ACP_MEMORY_ISOLATION === "confirmed",
+      memoryIsolationAssurance:
+        process.env.JAMAI_ACP_MEMORY_ISOLATION === "confirmed"
+          ? "operator-attested" : "unknown",
+      toolPermissionHooks: true,
+      structuredContextualOutput: false,
+    };
+  }
 
   async run(request: AgentRequest): Promise<AgentResult> {
     const runtimeKey = request.externalSessionId ?? request.contextId;
@@ -64,6 +83,7 @@ export class AcpAdapter implements AgentAdapter {
     runtime.chunks = [];
     runtime.approvedScopes = new Set(request.approvedScopes);
     runtime.deniedScopes = new Set(request.deniedScopes);
+    runtime.grantedResources = new Set(request.grantedResources ?? []);
     runtime.onPermissionDecision = request.onPermissionDecision;
     const abort = () => {
       void runtime.connection.cancel({ sessionId: runtime.sessionId });
@@ -81,6 +101,7 @@ export class AcpAdapter implements AgentAdapter {
         text: runtime.chunks.join("").trim(),
         sessionId: runtime.sessionId,
         degradedRehydration: runtime.degradedRehydration,
+        memoryIsolationEvidence: runtime.memoryIsolationEvidence,
       };
     } catch (error) {
       const stderr = runtime.stderr.trim();
@@ -92,13 +113,22 @@ export class AcpAdapter implements AgentAdapter {
   }
 
   async close(): Promise<void> {
-    const runtimes = await Promise.allSettled(this.sessions.values());
-    for (const result of runtimes) {
-      if (result.status !== "fulfilled") continue;
-      result.value.child.stdin.end();
-      result.value.child.kill("SIGTERM");
-    }
+    const keys = [...this.sessions.keys()];
+    await Promise.allSettled(keys.map((key) => this.closeSession(key)));
     this.sessions.clear();
+  }
+
+  async closeSession(externalSessionId: string): Promise<void> {
+    const pending = this.sessions.get(externalSessionId);
+    if (!pending) return;
+    this.sessions.delete(externalSessionId);
+    try {
+      const runtime = await pending;
+      runtime.child.stdin.end();
+      runtime.child.kill("SIGTERM");
+    } catch {
+      // Failed startup has no live process.
+    }
   }
 
   private getRuntime(contextId: string, resumeSessionId?: string): Promise<AcpRuntime> {
@@ -111,8 +141,15 @@ export class AcpAdapter implements AgentAdapter {
   }
 
   private async createRuntime(contextId: string, resumeSessionId?: string): Promise<AcpRuntime> {
-    const child = spawn(this.options.command, this.options.args, {
+    const launch = this.options.runtimeFactory?.(contextId) ?? {
+      command: this.options.command,
+      args: this.options.args,
       cwd: this.options.cwd,
+      agentCwd: this.options.cwd,
+    };
+    const child = spawn(launch.command, launch.args, {
+      cwd: launch.cwd,
+      env: launch.env,
       shell: false,
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
@@ -124,7 +161,11 @@ export class AcpAdapter implements AgentAdapter {
     runtime.queue = Promise.resolve();
     runtime.approvedScopes = new Set();
     runtime.deniedScopes = new Set();
+    runtime.grantedResources = new Set();
     runtime.degradedRehydration = false;
+    runtime.memoryIsolationEvidence = launch.memoryIsolationEvidence;
+    runtime.cleanup = launch.cleanup;
+    runtime.agentCwd = launch.agentCwd;
     child.stderr.setEncoding("utf8").on("data", (chunk) => {
       runtime.stderr += String(chunk);
     });
@@ -133,7 +174,9 @@ export class AcpAdapter implements AgentAdapter {
       if (current) void current.then((value) => {
         if (value === runtime) this.sessions.delete(contextId);
       }).catch(() => undefined);
+      void runtime.cleanup?.();
     });
+    child.once("error", () => { void runtime.cleanup?.(); });
     const stream = acp.ndJsonStream(
       Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
       Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
@@ -146,6 +189,7 @@ export class AcpAdapter implements AgentAdapter {
           options,
           approvedScopes: runtime.approvedScopes,
           deniedScopes: runtime.deniedScopes,
+          grantedResources: runtime.grantedResources,
           persistDecision: runtime.onPermissionDecision,
         });
         return option
@@ -163,19 +207,19 @@ export class AcpAdapter implements AgentAdapter {
       protocolVersion: acp.PROTOCOL_VERSION,
       clientCapabilities: {},
     });
-    const canResume = Boolean(
+    const canResume = this.capabilities.sessionResume && Boolean(
       (initialized.agentCapabilities as { sessionCapabilities?: { resume?: unknown } })
         ?.sessionCapabilities?.resume,
     );
     if (resumeSessionId && canResume) {
       await runtime.connection.resumeSession({
         sessionId: resumeSessionId,
-        cwd: this.options.cwd,
+        cwd: runtime.agentCwd,
         mcpServers: [],
       });
       runtime.sessionId = resumeSessionId;
     } else {
-      const session = await runtime.connection.newSession({ cwd: this.options.cwd, mcpServers: [] });
+      const session = await runtime.connection.newSession({ cwd: runtime.agentCwd, mcpServers: [] });
       runtime.sessionId = session.sessionId;
       runtime.degradedRehydration = Boolean(resumeSessionId);
     }

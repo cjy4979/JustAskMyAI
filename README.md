@@ -46,15 +46,20 @@ perform bounded work within that authority.
 - Local receipt evidence records with field-selective localhost disclosure
 - Signed, audience-bound capability discovery with policy-filtered public aliases
 - Persistent External Sessions for multi-turn Human-to-Agent and Agent-to-Agent access
+- Dependency-free Managed ACP Profiles with separate per-Session Agent memory/configuration
+- Optional Docker-backed strict isolation for sensitive deployments
 - Session leases, caller/purpose/issued-grant binding, pause, revoke, close, and 7-day hard limits
 - Requested-versus-issued Context Grants intersected with Owner collection policy
 - Separate operation and action grants, with exact task-bound Human approval
+- Runtime ACP resource enforcement over actual tool paths, URLs, locations, and typed resource IDs
 - Explicit Context Collections backed by SQLite FTS5, with visibility, caller, mode,
   collection, sensitivity, item, and token ceilings
 - Physically session-scoped External Thread events that never enter Context Collections automatically
 - Atomic event sequencing, durable task replay protection, and periodic session checkpoints
+- Versioned, gateway-signed Authority Bundles linked by previous digest
 - Structured contextual answers with validated evidence references and authority ceilings
-- Egress escalation for unauthorized references, restricted context, and secret patterns
+- Independent Egress Grants for authority, sensitivity, quote mode, excerpt size, and evidence
+- Durable Owner-confirmation challenges that withhold, release, or reject exact answer drafts
 - Owner-reviewed writeback proposals that create new provenance-bound records
 - Guest invitation links with hashed single-use tokens, scoped grants, HttpOnly cookies,
   expiration, rate limiting, and SSE events
@@ -87,9 +92,20 @@ To connect an existing ACP-compatible agent:
 $env:JAMAI_ADAPTER="acp"
 $env:JAMAI_ACP_COMMAND="hermes"
 $env:JAMAI_ACP_ARGS='["acp"]'
-$env:JAMAI_AGENT_CWD="D:\projects\my-project"
 npm run dev:node
 ```
+
+`acp` uses a JAMA Managed Profile by default. Every External Session gets independent
+HOME, XDG, AppData, temporary, history, Codex, Claude, Hermes, and other Agent profile
+directories. Its Workspace is empty and isolated unless the Owner explicitly sets:
+
+```powershell
+$env:JAMAI_AGENT_CWD="D:\projects\my-project"
+$env:JAMAI_ACP_MANAGED_WORKSPACE="owner-trusted"
+```
+
+`owner-trusted` gives the Agent process normal access to that Workspace. Use Context
+Collections instead when the remote caller only needs selected project knowledge.
 
 ACP tool permissions are denied unless the local owner explicitly sets
 `JAMAI_ACP_ALLOW_TOOLS=true`. Even then, each requested ACP tool kind must match an
@@ -97,19 +113,32 @@ approved scope such as `read-workspace`, `edit-workspace`, `run-tests`, `network
 `tool:<kind>`, or `tool:<name>`. A remote requester cannot select the local workspace
 or override the owner's policy.
 
-An ACP environment declaration is only an operator attestation, not an enforced sandbox:
+The default isolation policy is `managed`: JAMA accepts its own adapter-created profile
+namespace or a stronger OS sandbox. This prevents ordinary Agent memory and configuration
+cross-contamination without requiring Docker. It is not a boundary against a malicious
+local process that deliberately ignores the redirected directories. After restart, JAMA
+creates a clean Managed Profile and reconstructs the session from its event thread,
+checkpoint, and current Context Projection.
+
+For adversarial or sensitive deployments, require an enforced boundary:
 
 ```powershell
-$env:JAMAI_ACP_MEMORY_ISOLATION="confirmed"
+$env:JAMAI_ISOLATION_POLICY="strict"
+$env:JAMAI_ADAPTER="acp-sandbox"
+$env:JAMAI_ACP_SANDBOX_IMAGE="your-trusted-agent-image:tag"
+$env:JAMAI_ACP_COMMAND="agent-command-inside-image"
+$env:JAMAI_ACP_ARGS='["acp"]'
+$env:JAMAI_AGENT_CWD="D:\projects\simulation-x"
+npm run dev:node
 ```
 
-By default, context-rich External Sessions require an adapter whose isolation assurance is
-`enforced`; an ACP operator attestation alone fails closed. A deployment may explicitly
-accept that residual risk with
-`JAMAI_ALLOW_OPERATOR_ATTESTED_EXTERNAL_CONTEXT=true`. JAMA still creates a separate ACP
-session and never connects a non-owner caller to an Owner's native session. If ACP cannot
-resume after a restart, JAMA starts a new session, rebuilds it from the session-scoped event
-thread, checkpoint, and current Context Projection, and records degraded rehydration.
+The sandbox uses an independent HOME/XDG namespace and empty Workspace per External Session,
+a read-only root filesystem, a separate writable `/output`, no Linux capabilities, no
+network, and no Owner session mount. The gateway records isolation evidence and destroys the
+session namespace when its ACP process terminates. Grant sandbox paths as
+`path:/workspace/**` or `path:/output/**`. An explicit
+`JAMAI_ACP_SANDBOX_MOUNT_OWNER_WORKSPACE=read-only` opt-in mounts the configured Workspace;
+only use it when that entire root is approved for the Session.
 
 Denied scopes take precedence over allowed scopes, including wildcard grants. `run-tests`
 matches only a dedicated test tool name such as `pytest`, `jest`, or `run-tests`; it never
@@ -128,11 +157,12 @@ Invoke-RestMethod `
 
 ## Current limitations
 
-- ACP resume depends on the selected agent advertising `session/resume`. Without it, JAMA
-  uses audited degraded rehydration from its own External Thread and Context Projection.
-- ACP process isolation is operator-attested, not an OS-enforced memory boundary. Context-rich
-  access therefore fails closed unless the adapter reports enforced isolation or the local
-  operator explicitly accepts the weaker assurance.
+- Managed ACP Profiles isolate normal Agent configuration and memory paths but are not an
+  OS security boundary against a malicious local Agent process. Strict deployments should
+  use `JAMAI_ISOLATION_POLICY=strict` with `acp-sandbox`; its configured image remains part
+  of the local trusted computing base.
+- Managed Profiles intentionally use audited degraded rehydration after gateway restart.
+  JAMA reconstructs from its own External Thread, checkpoint, and current Context Projection.
 - The audit hash chain detects local modification but is not independently anchored. Group
   terminal receipts are signed by the receiving gateway, but external audit checkpoints
   are not implemented yet.
@@ -155,6 +185,8 @@ Invoke-RestMethod `
 - Context retrieval is lexical FTS5 retrieval over explicitly registered content. It does not
   scan native private agent sessions or use an external vector database.
 - The Egress Guard is defense in depth; it does not claim complete semantic leak detection.
+- Runtime Resource Grants depend on ACP exposing `rawInput` or file `locations`. A
+  resource-bound tool call with no verifiable resource fails closed.
 - Guest access is intended for LAN use or a TLS reverse proxy. Bare HTTP public deployment is
   not a supported security boundary.
 
@@ -186,6 +218,8 @@ identities, performs bilateral pairing, then runs A2A and MCP delegation tests.
 - `propose_memory_writeback`
 - `list_writeback_proposals`
 - `resolve_writeback_proposal`
+- `list_egress_challenges`
+- `resolve_egress_confirmation`
 
 The core protocol deliberately does not provide `collaborate_with_ais`. Parallel
 delegation, coordination, and plan merging belong to the caller's existing agent rather

@@ -103,6 +103,8 @@ try {
     "propose_memory_writeback",
     "list_writeback_proposals",
     "resolve_writeback_proposal",
+    "list_egress_challenges",
+    "resolve_egress_confirmation",
   ]) {
     if (!names.includes(expected)) throw new Error(`missing MCP tool: ${expected}`);
   }
@@ -343,6 +345,81 @@ try {
   });
   if (!JSON.stringify(resolved).includes("resolvedItemId")) {
     throw new Error(`owner-approved writeback did not create a new item: ${JSON.stringify(resolved)}`);
+  }
+  await postJson(`${bob.managementUrl}/api/external-sessions/${externalSession.id}/status`, {
+    status: "paused",
+  });
+  await postJson(`${bob.managementUrl}/api/external-sessions/${externalSession.id}/approve`, {
+    allowedCollections: [simulationCollection.id],
+    sensitivityCeiling: "internal",
+    exactContentAllowed: false,
+    maxItems: 8,
+    maxTokens: 6000,
+    allowedOperations: ["ask"],
+    actionScopes: [],
+    deniedScopes: [],
+    resources: [],
+    actionApprovalRule: "runtime-policy",
+    egressQuoteMode: "none",
+    egressRequireEvidenceRefs: true,
+  });
+  await mcp.callTool({
+    name: "get_external_session",
+    arguments: { peerUrl: bob.publicUrl, sessionId: externalSession.id },
+  });
+  const blockedEgress = await mcp.callTool({
+    name: "send_external_message",
+    arguments: {
+      peerUrl: bob.publicUrl,
+      sessionId: externalSession.id,
+      message: "Use the record, but this answer must wait for Bob's confirmation.",
+    },
+  });
+  const blockedEgressText = blockedEgress.content?.find((item) => item.type === "text")?.text;
+  const egressTicket = blockedEgressText ? JSON.parse(blockedEgressText) : {};
+  if (egressTicket.status !== "OWNER_CONFIRMATION_REQUIRED" || !egressTicket.challengeId) {
+    throw new Error(`Egress Grant did not withhold the answer: ${JSON.stringify(blockedEgress)}`);
+  }
+  const withheldState = await mcp.callTool({
+    name: "get_external_session",
+    arguments: { peerUrl: bob.publicUrl, sessionId: externalSession.id },
+  });
+  const withheldStateText = withheldState.content?.find((item) => item.type === "text")?.text ?? "";
+  if (withheldStateText.includes('"draft":')) {
+    throw new Error("pending Egress draft leaked to the remote Caller");
+  }
+  const egressResolutionPending = await bobMcp.callTool({
+    name: "resolve_egress_confirmation",
+    arguments: {
+      challengeId: egressTicket.challengeId,
+      decision: "released",
+      draftDigest: egressTicket.draftDigest,
+    },
+  });
+  const egressResolutionText = egressResolutionPending.content
+    ?.find((item) => item.type === "text")?.text;
+  const egressResolutionTicket = egressResolutionText ? JSON.parse(egressResolutionText) : {};
+  if (egressResolutionTicket.status !== "LOCAL_HUMAN_APPROVAL_REQUIRED") {
+    throw new Error("MCP Egress release bypassed local Human approval");
+  }
+  await postJson(
+    `${bob.managementUrl}/api/approvals/${egressResolutionTicket.approvalId}/approve`,
+    { approvedScopes: ["egress:released"], deniedScopes: [] },
+  );
+  const releasedEgress = await bobMcp.callTool({
+    name: "resolve_egress_confirmation",
+    arguments: {
+      challengeId: egressTicket.challengeId,
+      decision: "released",
+      draftDigest: egressTicket.draftDigest,
+      approvalId: egressResolutionTicket.approvalId,
+    },
+  });
+  const releasedEgressText = releasedEgress.content
+    ?.find((item) => item.type === "text")?.text;
+  const releasedEgressResult = releasedEgressText ? JSON.parse(releasedEgressText) : {};
+  if (releasedEgressResult.status !== "released") {
+    throw new Error(`Owner-confirmed Egress answer was not released: ${JSON.stringify(releasedEgress)}`);
   }
   await mcp.callTool({
     name: "close_external_session",

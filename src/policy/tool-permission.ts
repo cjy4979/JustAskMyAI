@@ -1,4 +1,5 @@
 import type { PermissionDecision } from "../adapters/types.js";
+import { evaluateToolResources } from "./resource-permission.js";
 import { evaluateToolScope } from "./tool-scope.js";
 
 interface PermissionOptionLike {
@@ -12,10 +13,13 @@ export async function decideToolPermission(input: {
     toolCallId: string;
     name?: string | null;
     kind?: string | null;
+    rawInput?: unknown;
+    locations?: Array<{ path: string }> | null;
   };
   options: PermissionOptionLike[];
   approvedScopes: Iterable<string>;
   deniedScopes: Iterable<string>;
+  grantedResources?: Iterable<string>;
   persistDecision?: (decision: PermissionDecision) => Promise<void>;
 }): Promise<{ decision: PermissionDecision; option?: PermissionOptionLike }> {
   const scopeDecision = evaluateToolScope(
@@ -24,7 +28,14 @@ export async function decideToolPermission(input: {
     input.approvedScopes,
     input.deniedScopes,
   );
-  const allowed = Boolean(input.localToolsEnabled && scopeDecision.allowed);
+  const resourceDecision = evaluateToolResources({
+    rawInput: input.toolCall.rawInput,
+    locations: input.toolCall.locations ?? undefined,
+    grantedResources: input.grantedResources ?? [],
+  });
+  const allowed = Boolean(
+    input.localToolsEnabled && scopeDecision.allowed && resourceDecision.allowed
+  );
   const desiredKind = allowed ? "allow_once" : "reject_once";
   let option = input.options.find((item) => item.kind === desiredKind);
   const decision: PermissionDecision = {
@@ -34,12 +45,18 @@ export async function decideToolPermission(input: {
     allowed: Boolean(allowed && option),
     matchedScope: scopeDecision.matchedScope,
     deniedByScope: scopeDecision.deniedByScope,
+    requestedPaths: resourceDecision.requestedPaths,
+    requestedUrls: resourceDecision.requestedUrls,
+    matchedResources: resourceDecision.matchedResources,
+    deniedResources: resourceDecision.deniedResources,
     reason: !input.localToolsEnabled
       ? "local ACP tool permissions are disabled"
       : scopeDecision.deniedByScope
         ? `explicitly denied by scope ${scopeDecision.deniedByScope}`
         : !scopeDecision.matchedScope
           ? "tool action is outside approved scopes"
+          : !resourceDecision.allowed
+            ? resourceDecision.reason ?? "tool resource is outside the Action Grant"
           : option
             ? `matched approved scope ${scopeDecision.matchedScope}`
             : "agent did not offer the required permission option",

@@ -11,6 +11,32 @@ export type MemoryIsolationAssurance =
 export type CollectionVisibility =
   | "private" | "paired-discoverable" | "group-discoverable" | "invite-only";
 
+export interface EnforcedMemoryIsolationEvidence {
+  assurance: "enforced";
+  namespaceId: string;
+  sandboxRootDigest: string;
+  nativeMemoryDisabled: boolean;
+  ownerSessionMounted: false;
+  workspaceMode: "isolated" | "read-only";
+  networkMode: "none";
+  createdAt: string;
+}
+
+export interface ManagedProfileIsolationEvidence {
+  assurance: "adapter-attested";
+  namespaceId: string;
+  profileRootDigest: string;
+  nativeMemorySeparated: true;
+  osSandboxed: false;
+  redirectedEnvironment: string[];
+  workspaceMode: "isolated" | "owner-trusted";
+  createdAt: string;
+}
+
+export type MemoryIsolationEvidence =
+  | EnforcedMemoryIsolationEvidence
+  | ManagedProfileIsolationEvidence;
+
 export interface AgentAdapterCapabilities {
   isolatedSessions: boolean;
   sessionResume: boolean;
@@ -114,7 +140,22 @@ export interface SessionActionGrant {
   allowedScopes: string[];
   deniedScopes: string[];
   resources: string[];
-  approvalRule: "per-session" | "per-task" | "per-tool";
+  approvalRule: "per-session" | "per-task" | "runtime-policy" | "per-tool";
+  issuedByOwnerPolicy: string;
+  issuedByPrincipalId?: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface EgressGrant {
+  id: string;
+  sessionId: string;
+  allowedAuthority: ContextAuthority[];
+  allowedSensitivity: Sensitivity;
+  quoteMode: "none" | "summary-only" | "bounded-excerpt" | "exact";
+  maxQuoteCharacters: number;
+  requireEvidenceRefs: boolean;
+  requireOwnerConfirmationFor: string[];
   issuedByOwnerPolicy: string;
   issuedByPrincipalId?: string;
   createdAt: string;
@@ -139,6 +180,9 @@ export interface ExternalSession {
   contextGrantId: string;
   operationGrantId: string;
   actionGrantId: string;
+  egressGrantId: string;
+  authorityVersion: number;
+  authorityDigest: string;
   allowedActions: string[];
   status: SessionStatus;
   createdAt: string;
@@ -190,6 +234,7 @@ export interface SignedSessionGrant {
   grant: ContextGrant;
   operationGrant: SessionOperationGrant;
   actionGrant: SessionActionGrant;
+  egressGrant: EgressGrant;
   proof: SignedStatement;
 }
 
@@ -217,8 +262,44 @@ export interface ExternalTaskRecord {
   requestedScopes: string[];
   deniedScopes: string[];
   resources: string[];
-  status: "registered" | "completed" | "failed" | "cancelled";
+  status:
+    | "registered" | "running" | "awaiting_owner_confirmation"
+    | "completed" | "failed" | "cancelled";
   createdAt: string;
+}
+
+export interface SessionAuthorityBundle {
+  id: string;
+  sessionId: string;
+  authorityVersion: number;
+  previousAuthorityDigest?: string;
+  contextGrant: IssuedContextGrant;
+  operationGrant: SessionOperationGrant;
+  actionGrant: SessionActionGrant;
+  egressGrant: EgressGrant;
+  groupPolicyVersion?: number;
+  groupMembershipVersion?: number;
+  issuedAt: string;
+  authorityDigest: string;
+  proof?: SignedStatement;
+}
+
+export interface EgressChallenge {
+  id: string;
+  sessionId: string;
+  taskId?: string;
+  draft: ContextualAnswer;
+  draftDigest: string;
+  projectedContextRefs: string[];
+  possiblyDisclosedRefs: string[];
+  egressGrantId: string;
+  authorityVersion: number;
+  reason: string;
+  status: "pending" | "released" | "rejected";
+  createdAt: string;
+  resolvedAt?: string;
+  resolvedByPrincipalId?: string;
+  releasedAnswer?: ContextualAnswer;
 }
 
 export interface SessionCheckpoint {

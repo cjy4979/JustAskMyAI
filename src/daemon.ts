@@ -50,8 +50,8 @@ import { SessionStore, digest as sessionDigest } from "./session/store.js";
 import { buildContextPrompt, indexExplicitFile } from "./session/context.js";
 import { normalizeContextualAnswer } from "./session/answer.js";
 import type {
-  AgentProfile, ContextCollection, ExternalSession, ExternalSessionEnvelope, Sensitivity,
-  SessionInvite, SessionStatus,
+  AgentProfile, ContextAuthority, ContextCollection, EgressGrant, ExternalSession,
+  ExternalSessionEnvelope, Sensitivity, SessionInvite, SessionStatus,
 } from "./session/types.js";
 
 const config = loadConfig();
@@ -69,7 +69,10 @@ const identity = {
 const adapter = createAdapter(config.adapter);
 const approvals = new ApprovalPolicy(config.policy, store);
 const groups = new GroupStore(store, gatewayIdentity);
-const sessions = new SessionStore(store);
+const sessions = new SessionStore(
+  store,
+  (statement) => gatewayIdentity.signStatement(statement),
+);
 const guestRateWindows = new Map<string, { startedAt: number; count: number }>();
 const peers = new PeerRegistry();
 const discovery = new LanDiscovery({ id: nodeId, name: config.name, port: config.port }, peers);
@@ -265,7 +268,7 @@ publicApp.post("/external/sessions", async (req, res) => {
         allowedScopes: [],
         deniedScopes: [],
         resources: [],
-        approvalRule: "per-tool",
+        approvalRule: "runtime-policy",
         issuedByOwnerPolicy: "deny-by-default",
       },
       leaseSeconds: typeof req.body?.leaseSeconds === "number" ? req.body.leaseSeconds : undefined,
@@ -280,6 +283,7 @@ publicApp.post("/external/sessions", async (req, res) => {
         grant: created.grant,
         operationGrant: created.operationGrant,
         actionGrant: created.actionGrant,
+        egressGrant: created.egressGrant,
       }),
     };
     store.appendAudit({
@@ -331,13 +335,11 @@ publicApp.post("/external/sessions/:id/messages", async (req, res) => {
     const contextGrant = sessions.getGrant(session.contextGrantId);
     if (
       contextGrant?.allowedCollections.length
-      && adapter.capabilities.memoryIsolationAssurance !== "enforced"
-      && process.env.JAMAI_ALLOW_OPERATOR_ATTESTED_EXTERNAL_CONTEXT !== "true"
+      && !contextIsolationAllowed()
     ) {
       throw new Error(
-        `context-rich External Session requires enforced memory isolation; adapter provides ${
-          adapter.capabilities.memoryIsolationAssurance
-        }`,
+        `context-rich External Session requires ${contextIsolationPolicy()} isolation; `
+        + `adapter provides ${adapter.capabilities.memoryIsolationAssurance}`,
       );
     }
     let task: Record<string, unknown> | undefined;
@@ -408,6 +410,7 @@ publicApp.post("/external/sessions/:id/messages", async (req, res) => {
         deniedScopes,
         resources: requestedResources,
       });
+      sessions.completeTask(session.id, taskId, "running");
     }
     return res.json(await executeExternalMessage(
       session.id, requiredString(req.body?.message, "message"),
@@ -444,12 +447,7 @@ publicApp.post("/external/sessions/:id/writebacks", (req, res) => {
       grantDigest: sessionDigest(sessions.getGrant(session.contextGrantId)),
     });
     const evidenceRefs = stringArray(req.body?.evidenceRefs);
-    const threadEvents = sessions.listEvents(session.id);
-    const knownRefs = new Set(threadEvents.flatMap((event) => [event.id, ...event.contextRefs]));
-    if (evidenceRefs.some((ref) => {
-      if (knownRefs.has(ref)) return false;
-      return sessions.getItem(ref)?.origin.sessionId !== session.id;
-    })) {
+    if (evidenceRefs.some((ref) => !sessions.evidenceRefBelongsToSession(session.id, ref))) {
       throw new Error("writeback evidence must reference this session or a known ContextItem");
     }
     const proposal = sessions.createWriteback({
@@ -504,6 +502,21 @@ publicApp.get("/external/sessions/:id", (req, res) => {
     grant: sessions.getGrant(session.contextGrantId),
     operationGrant: sessions.getOperationGrant(session.operationGrantId),
     actionGrant: sessions.getActionGrant(session.actionGrantId),
+    egressGrant: sessions.getEgressGrant(session.egressGrantId),
+    authorityBundle: sessions.getAuthorityBundle(session.id),
+    egressChallenges: sessions.listEgressChallenges(session.id).map((challenge) => ({
+      id: challenge.id,
+      sessionId: challenge.sessionId,
+      taskId: challenge.taskId,
+      draftDigest: challenge.draftDigest,
+      egressGrantId: challenge.egressGrantId,
+      authorityVersion: challenge.authorityVersion,
+      reason: challenge.reason,
+      status: challenge.status,
+      createdAt: challenge.createdAt,
+      resolvedAt: challenge.resolvedAt,
+      releasedAnswer: challenge.status === "released" ? challenge.releasedAnswer : undefined,
+    })),
     checkpoint: sessions.getCheckpoint(session.id),
     events: sessions.listEvents(session.id),
   };
@@ -535,7 +548,9 @@ publicApp.post("/external/sessions/:id/close", (req, res) => {
   } catch (error) {
     return res.status(400).json({ error: String(error) });
   }
-  return res.json(sessions.setSessionStatus(session.id, "closed"));
+  const closed = sessions.setSessionStatus(session.id, "closed");
+  void adapter.closeSession?.(session.id);
+  return res.json(closed);
 });
 if (process.env.JAMAI_ENABLE_GUEST_INVITES === "true") {
   publicApp.get("/guest", (_req, res) => res.type("html").send(guestPage()));
@@ -589,7 +604,7 @@ if (process.env.JAMAI_ENABLE_GUEST_INVITES === "true") {
           allowedScopes: [],
           deniedScopes: [],
           resources: [],
-          approvalRule: "per-tool",
+          approvalRule: "runtime-policy",
           issuedByOwnerPolicy: "deny-by-default",
         },
         leaseSeconds: invite.maxSessionSeconds,
@@ -699,6 +714,9 @@ managementApp.get("/api/capabilities", (_req, res) => res.json({
   canExecuteWork: adapter.id !== "mock",
   humanApproval: config.policy,
   acpToolPermissions: process.env.JAMAI_ACP_ALLOW_TOOLS === "true",
+  isolationPolicy: contextIsolationPolicy(),
+  isolationAssurance: adapter.capabilities.memoryIsolationAssurance,
+  dockerRequired: contextIsolationPolicy() === "strict" && adapter.id === "acp-sandbox",
   profile: sessions.getProfile(agentId) ?? defaultProfile,
 }));
 managementApp.get("/chat", (_req, res) => res.type("html").send(ownerPage()));
@@ -730,7 +748,7 @@ managementApp.post("/api/remote-external-sessions", async (req, res) => {
       body,
     }) as {
       session?: ExternalSession; requestedGrant?: unknown; grant?: unknown;
-      operationGrant?: unknown; actionGrant?: unknown; proof?: unknown;
+      operationGrant?: unknown; actionGrant?: unknown; egressGrant?: unknown; proof?: unknown;
     };
     const verified = verifySignedStatement(
       result.proof,
@@ -740,6 +758,7 @@ managementApp.post("/api/remote-external-sessions", async (req, res) => {
         grant: result.grant,
         operationGrant: result.operationGrant,
         actionGrant: result.actionGrant,
+        egressGrant: result.egressGrant,
       },
       store,
     );
@@ -925,6 +944,9 @@ managementApp.get("/api/external-sessions/:id", (req, res) => {
     grant: sessions.getGrant(session.contextGrantId),
     operationGrant: sessions.getOperationGrant(session.operationGrantId),
     actionGrant: sessions.getActionGrant(session.actionGrantId),
+    egressGrant: sessions.getEgressGrant(session.egressGrantId),
+    authorityBundle: sessions.getAuthorityBundle(session.id),
+    egressChallenges: sessions.listEgressChallenges(session.id),
     checkpoint: sessions.getCheckpoint(session.id),
     events: sessions.listEvents(session.id),
   });
@@ -940,16 +962,40 @@ managementApp.post("/api/external-sessions/:id/status", (req, res) => {
     const status = requiredString(req.body?.status, "status");
     if (!["requested", "awaiting_owner_consent", "active", "paused", "revoked",
       "expired", "closed"].includes(status)) throw new Error("invalid session status");
-    return res.json(sessions.setSessionStatus(req.params.id, status as SessionStatus));
+    const updated = sessions.setSessionStatus(req.params.id, status as SessionStatus);
+    if (["revoked", "expired", "closed"].includes(status)) {
+      void adapter.closeSession?.(updated.id);
+    }
+    return res.json(updated);
   } catch (error) { return res.status(400).json({ error: String(error) }); }
 });
-managementApp.post("/api/external-sessions/:id/approve", (req, res) => {
+managementApp.post("/api/external-sessions/:id/approve", async (req, res) => {
   try {
     const session = sessions.getSession(req.params.id);
     if (!session) throw new Error("external session not found");
     const requested = sessions.getRequestedGrant(session.requestedContextGrantId);
     const operation = sessions.getOperationGrant(session.operationGrantId);
     if (!requested || !operation) throw new Error("session request grants are missing");
+    let currentGroup = session.groupId ? groups.getWorkgroup(session.groupId) : undefined;
+    if (session.groupId) {
+      await groups.refreshFromAuthority(session.groupId);
+      currentGroup = groups.getWorkgroup(session.groupId);
+      const callerMember = session.callerPeerId
+        ? groups.findLocalMember(session.groupId, session.callerPeerId)
+        : undefined;
+      if (!currentGroup || !callerMember || callerMember.principalId !== session.callerPrincipalId) {
+        throw new Error("Group caller is no longer an active matching member");
+      }
+      const roleGrants = callerMember.roles.map((role) => currentGroup!.rolePolicy[role])
+        .filter((grant): grant is GroupRoleGrant => Boolean(grant));
+      if (!roleGrants.some((grant) =>
+        grant.operations.includes("context")
+        && (grant.allowedScopes.includes("*") || grant.allowedScopes.includes("context:read"))
+        && !grant.deniedScopes.some((scope) => scope === "context:read" || scope === "context:*")
+      )) {
+        throw new Error("current Group role no longer grants Context access");
+      }
+    }
     return res.json(sessions.approveSession({
       sessionId: session.id,
       ownerPrincipalId: principalId,
@@ -973,9 +1019,21 @@ managementApp.post("/api/external-sessions/:id/approve", (req, res) => {
       actionScopes: stringArray(req.body?.actionScopes),
       deniedScopes: stringArray(req.body?.deniedScopes),
       resources: stringArray(req.body?.resources),
-      actionApprovalRule: ["per-session", "per-task", "per-tool"]
+      actionApprovalRule: ["per-session", "per-task", "runtime-policy", "per-tool"]
         .includes(String(req.body?.actionApprovalRule))
-        ? req.body.actionApprovalRule : "per-tool",
+        ? req.body.actionApprovalRule : "runtime-policy",
+      egressAllowedAuthority: parseContextAuthorities(req.body?.egressAllowedAuthority),
+      egressAllowedSensitivity: req.body?.egressAllowedSensitivity
+        ? parseSensitivity(req.body.egressAllowedSensitivity) : undefined,
+      egressQuoteMode: parseQuoteMode(req.body?.egressQuoteMode),
+      egressMaxQuoteCharacters: req.body?.egressMaxQuoteCharacters === undefined
+        ? undefined : boundedNumber(req.body.egressMaxQuoteCharacters, 240, 0, 4000),
+      egressRequireEvidenceRefs: req.body?.egressRequireEvidenceRefs === undefined
+        ? undefined : req.body.egressRequireEvidenceRefs === true,
+      egressRequireOwnerConfirmationFor:
+        stringArray(req.body?.egressRequireOwnerConfirmationFor),
+      groupPolicyVersion: currentGroup?.policyVersion,
+      groupMembershipVersion: currentGroup?.membershipVersion,
     }));
   } catch (error) { return res.status(400).json({ error: String(error) }); }
 });
@@ -987,6 +1045,29 @@ managementApp.post("/api/external-sessions/:id/extend", (req, res) => {
   } catch (error) { return res.status(400).json({ error: String(error) }); }
 });
 managementApp.get("/api/writebacks", (_req, res) => res.json(sessions.listWritebacks()));
+managementApp.get("/api/egress-challenges", (req, res) => res.json(
+  sessions.listEgressChallenges(
+    typeof req.query.sessionId === "string" ? req.query.sessionId : undefined,
+  ),
+));
+managementApp.post("/api/egress-challenges/:id/resolve", (req, res) => {
+  try {
+    const decision = requiredString(req.body?.decision, "decision");
+    if (decision !== "released" && decision !== "rejected") {
+      throw new Error("egress decision must be released or rejected");
+    }
+    return res.json(sessions.resolveEgressChallenge({
+      id: req.params.id,
+      decision,
+      ownerPrincipalId: principalId,
+      expectedDraftDigest: typeof req.body?.draftDigest === "string"
+        ? req.body.draftDigest : undefined,
+      releasedAnswer: req.body?.releasedAnswer,
+    }));
+  } catch (error) {
+    return res.status(400).json({ error: String(error) });
+  }
+});
 managementApp.post("/api/writebacks/:id/resolve", (req, res) => {
   try {
     const decision = requiredString(req.body?.decision, "decision");
@@ -1459,7 +1540,12 @@ async function executeExternalMessage(
   taskAuthority?: { allowedScopes: string[]; deniedScopes: string[]; resources: string[] },
 ): Promise<unknown> {
   const session = sessions.getSession(sessionId);
-  if (!session || session.status !== "active") throw new Error("external session is not active");
+  if (!session || session.status !== "active") {
+    if (session && ["revoked", "expired", "closed"].includes(session.status)) {
+      void adapter.closeSession?.(session.id);
+    }
+    throw new Error("external session is not active");
+  }
   if (session.groupId) {
     await groups.refreshFromAuthority(session.groupId);
     const group = groups.getWorkgroup(session.groupId);
@@ -1470,7 +1556,14 @@ async function executeExternalMessage(
       || (session.groupMembershipVersion !== undefined
         && session.groupMembershipVersion !== group.membershipVersion)
     ) {
-      throw new Error("external session group authority is stale");
+      if (group) {
+        sessions.pauseForGroupEpoch(
+          session.id,
+          group.policyVersion,
+          group.membershipVersion,
+        );
+      }
+      throw new Error("external session paused for Owner reauthorization after Group epoch change");
     }
   }
   if (!adapter.capabilities.isolatedSessions) {
@@ -1482,13 +1575,11 @@ async function executeExternalMessage(
   const projected = sessions.project(session, `${session.purpose} ${message}`);
   if (
     projected.length > 0
-    && adapter.capabilities.memoryIsolationAssurance !== "enforced"
-    && process.env.JAMAI_ALLOW_OPERATOR_ATTESTED_EXTERNAL_CONTEXT !== "true"
+    && !contextIsolationAllowed()
   ) {
     throw new Error(
-      `context-rich External Session requires enforced memory isolation; adapter provides ${
-        adapter.capabilities.memoryIsolationAssurance
-      }`,
+      `context-rich External Session requires ${contextIsolationPolicy()} isolation; `
+      + `adapter provides ${adapter.capabilities.memoryIsolationAssurance}`,
     );
   }
   const thread = sessions.listEvents(session.id, 24);
@@ -1528,6 +1619,7 @@ async function executeExternalMessage(
       signal: controller.signal,
       approvedScopes: taskAuthority?.allowedScopes ?? [],
       deniedScopes: taskAuthority?.deniedScopes ?? [],
+      grantedResources: taskAuthority?.resources ?? [],
       onPermissionDecision: async (decision) => {
         store.appendAudit({
           eventType: "external-session.tool-decision", principalId, agentId,
@@ -1538,6 +1630,10 @@ async function executeExternalMessage(
           metadata: {
             matchedScope: decision.matchedScope,
             deniedByScope: decision.deniedByScope,
+            requestedPaths: decision.requestedPaths,
+            requestedUrls: decision.requestedUrls,
+            matchedResources: decision.matchedResources,
+            deniedResources: decision.deniedResources,
             taskResources: taskAuthority?.resources,
           },
         });
@@ -1569,11 +1665,52 @@ async function executeExternalMessage(
       adapterId: adapter.id, localSessionId: result.sessionId,
     });
   }
-  const normalized = normalizeContextualAnswer(result.text, projected);
+  if (result.memoryIsolationEvidence) {
+    store.appendAudit({
+      eventType: "external-session.memory-isolation-evidence",
+      principalId,
+      agentId,
+      peerId: session.callerPeerId,
+      contextId: session.a2aContextId,
+      action: "enforce-memory-isolation",
+      resource: session.id,
+      decision: "allowed",
+      decisionReason: `${result.memoryIsolationEvidence.assurance} isolation evidence recorded`,
+      outputDigest: sessionDigest(result.memoryIsolationEvidence),
+      metadata: { ...result.memoryIsolationEvidence },
+    });
+  }
+  const egressGrant = sessions.getEgressGrant(session.egressGrantId);
+  if (!egressGrant || Date.parse(egressGrant.expiresAt) <= Date.now()) {
+    throw new Error("session Egress Grant is missing or expired");
+  }
+  const normalized = normalizeContextualAnswer(result.text, projected, egressGrant);
   if (normalized.escalationReason) {
+    const challenge = sessions.createEgressChallenge({
+      sessionId: session.id,
+      taskId: typeof task?.id === "string" ? task.id : undefined,
+      draft: normalized.draft ?? {
+        answer: "[draft withheld by Egress Guard]",
+        claims: [],
+        disclosedContextRefs: [],
+        evidenceCoverage: 0,
+        ownerConfirmationRequired: true,
+      },
+      projectedContextRefs: projected.map((item) => item.id),
+      possiblyDisclosedRefs: normalized.possiblyDisclosedRefs
+        ?? projected.map((item) => item.id),
+      egressGrantId: egressGrant.id,
+      authorityVersion: session.authorityVersion,
+      reason: normalized.escalationReason,
+    });
     sessions.appendEvent(
       session.id, "escalation", principalId,
-      { reason: normalized.escalationReason, draftDigest: sessionDigest(result.text) },
+      {
+        reason: normalized.escalationReason,
+        challengeId: challenge.id,
+        draftDigest: challenge.draftDigest,
+        possiblyDisclosedRefs: challenge.possiblyDisclosedRefs,
+      },
       projected.map((item) => item.id),
     );
     store.appendAudit({
@@ -1585,6 +1722,8 @@ async function executeExternalMessage(
     return {
       status: "OWNER_CONFIRMATION_REQUIRED",
       taskId: task?.id,
+      challengeId: challenge.id,
+      draftDigest: challenge.draftDigest,
       reason: normalized.escalationReason,
     };
   }
@@ -1879,6 +2018,7 @@ function ownerPage(): string {
   <button id="remoteSend" onclick="sendRemote()" disabled>Send</button><pre id="remoteOutput"></pre></section>
   <button onclick="load()">Refresh</button><h2>Owned Sessions</h2><div id="sessions"></div>
   <h2>Context Collections</h2><pre id="collections"></pre>
+  <h2>Pending Egress Confirmations</h2><div id="egress"></div>
   <h2>Pending Writebacks</h2><div id="writebacks"></div><h2>Invitations</h2><pre id="invites"></pre>
   <script>
   async function api(path,method="GET",body){const r=await fetch(path,{method,headers:body?{"content-type":"application/json"}:{},
@@ -1889,10 +2029,12 @@ function ownerPage(): string {
   allowedCollections:request.requestedCollections,sensitivityCeiling:request.requestedSensitivity,
   exactContentAllowed:false,maxItems:request.requestedLimits.maxItems,
   maxTokens:request.requestedLimits.maxTokens,allowedOperations:detail.operationGrant.allowedOperations,
-  actionScopes:[],deniedScopes:[],resources:[],actionApprovalRule:"per-tool"})}
+  actionScopes:[],deniedScopes:[],resources:[],actionApprovalRule:"runtime-policy"})}
   else await api("/api/external-sessions/"+id+"/status","POST",{status:value});load()}
   async function extend(id){await api("/api/external-sessions/"+id+"/extend","POST",{additionalSeconds:3600});load()}
   async function resolve(id,decision){await api("/api/writebacks/"+id+"/resolve","POST",{decision});load()}
+  async function resolveEgress(id,decision,draftDigest){
+  await api("/api/egress-challenges/"+id+"/resolve","POST",{decision,draftDigest});load()}
   let remoteSession;
   async function openRemote(){const peerId=document.getElementById("remotePeer").value;
   const purpose=document.getElementById("remotePurpose").value;
@@ -1906,8 +2048,9 @@ function ownerPage(): string {
   const result=await api("/api/remote-external-sessions/"+remoteSession.id+"/messages","POST",
   {peerId,message,operation:"ask"});document.getElementById("remoteOutput").textContent=JSON.stringify(result,null,2)}
   function esc(value){return String(value).replace(/[&<>"]/g,(c)=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
-  async function load(){const [ss,cc,ww,ii]=await Promise.all([
-  api("/api/external-sessions"),api("/api/context-collections"),api("/api/writebacks"),api("/api/session-invites")]);
+  async function load(){const [ss,cc,ww,ii,ee]=await Promise.all([
+  api("/api/external-sessions"),api("/api/context-collections"),api("/api/writebacks"),
+  api("/api/session-invites"),api("/api/egress-challenges")]);
   const pp=await api("/api/peers");document.getElementById("remotePeer").innerHTML=pp.map((p)=>
   "<option value=\\""+esc(p.id)+"\\">"+esc(p.name+" · "+p.url)+"</option>").join("");
   document.getElementById("sessions").innerHTML=ss.map((s)=>"<section><b>"+esc(s.purpose)+"</b><br>"+
@@ -1915,6 +2058,11 @@ function ownerPage(): string {
   ["active","paused","revoked","closed"].map((v)=>"<button onclick=\\"status('"+s.id+"','"+v+"')\\">"+v+"</button>").join("")+
   "<button onclick=\\"extend('"+s.id+"')\\">+1 hour</button></section>").join("")||"<p>None</p>";
   document.getElementById("collections").textContent=JSON.stringify(cc,null,2);
+  document.getElementById("egress").innerHTML=ee.filter((e)=>e.status==="pending").map((e)=>
+  "<section><b>"+esc(e.reason)+"</b><br>"+esc(e.draftDigest)+"<pre>"+
+  esc(JSON.stringify(e.draft,null,2))+"</pre><button onclick=\\"resolveEgress('"+e.id+
+  "','released','"+e.draftDigest+"')\\">release</button><button onclick=\\"resolveEgress('"+
+  e.id+"','rejected','"+e.draftDigest+"')\\">reject</button></section>").join("")||"<p>None</p>";
   document.getElementById("writebacks").innerHTML=ww.map((w)=>"<section><b>"+esc(w.proposedSummary)+"</b><br>"+
   esc(w.status+" · "+w.targetCollectionId)+"<br>"+(w.status==="pending"?
   "<button onclick=\\"resolve('"+w.id+"','accepted')\\">accept</button><button onclick=\\"resolve('"+w.id+"','rejected')\\">reject</button>":"")+
@@ -1974,6 +2122,33 @@ function parseCallerTrust(
       item === "paired-gateway" || item === "guest-capability",
   );
   return parsed.length > 0 ? parsed : ["paired-gateway"];
+}
+
+function parseContextAuthorities(value: unknown): ContextAuthority[] | undefined {
+  if (value === undefined) return undefined;
+  return stringArray(value).filter((item): item is ContextAuthority =>
+    item === "external-claim"
+    || item === "agent-inference"
+    || item === "project-record"
+    || item === "owner-confirmed");
+}
+
+function parseQuoteMode(value: unknown): EgressGrant["quoteMode"] | undefined {
+  return ["none", "summary-only", "bounded-excerpt", "exact"].includes(String(value))
+    ? value as EgressGrant["quoteMode"]
+    : undefined;
+}
+
+function contextIsolationPolicy(): "managed" | "strict" {
+  return process.env.JAMAI_ISOLATION_POLICY === "strict" ? "strict" : "managed";
+}
+
+function contextIsolationAllowed(): boolean {
+  const assurance = adapter.capabilities.memoryIsolationAssurance;
+  if (contextIsolationPolicy() === "strict") return assurance === "enforced";
+  if (assurance === "enforced" || assurance === "adapter-attested") return true;
+  return assurance === "operator-attested"
+    && process.env.JAMAI_ALLOW_OPERATOR_ATTESTED_EXTERNAL_CONTEXT === "true";
 }
 
 function parseMemberStatus(value: unknown): "active" | "suspended" | "removed" {
