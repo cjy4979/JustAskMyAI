@@ -503,11 +503,11 @@ server.registerTool(
     description: "Read a remote AI's owner-published expertise, operations, isolation capabilities, and requestable context collections.",
     inputSchema: { peerUrl: z.string().url() },
   },
-  async ({ peerUrl }) => text(JSON.stringify(
-    await publicJson(new URL("/external/capabilities", peerUrl)),
-    null,
-    2,
-  )),
+  async ({ peerUrl }) => text(JSON.stringify(await signedExternalFetch(
+    peerUrl,
+    "/external/capabilities",
+    { action: "capabilities.get", method: "GET" },
+  ), null, 2)),
 );
 
 server.registerTool(
@@ -522,6 +522,9 @@ server.registerTool(
       sensitivityCeiling: z.enum(["public", "internal", "confidential", "restricted"]).default("internal"),
       exactContentAllowed: z.boolean().default(false),
       allowedActions: z.array(z.enum(["ask", "task"])).default(["ask"]),
+      tags: z.array(z.string().min(1)).default([]),
+      maxItems: z.number().int().min(1).max(50).default(8),
+      maxTokens: z.number().int().min(256).max(50000).default(6000),
       leaseSeconds: z.number().int().min(60).max(604800).default(28800),
       groupId: z.string().min(1).optional(),
     },
@@ -536,6 +539,9 @@ server.registerTool(
       sensitivityCeiling: input.sensitivityCeiling,
       exactContentAllowed: input.exactContentAllowed,
       allowedActions: input.allowedActions,
+      tags: input.tags,
+      maxItems: input.maxItems,
+      maxTokens: input.maxTokens,
       leaseSeconds: input.leaseSeconds,
       groupId: input.groupId,
     };
@@ -543,10 +549,19 @@ server.registerTool(
       action: "session.open",
       method: "POST",
       body,
-    }) as { session?: unknown; grant?: unknown; proof?: unknown };
+    }) as {
+      session?: unknown; requestedGrant?: unknown; grant?: unknown;
+      operationGrant?: unknown; actionGrant?: unknown; proof?: unknown;
+    };
     const verified = verifySignedStatement(
       result.proof,
-      { session: result.session, grant: result.grant },
+      {
+        session: result.session,
+        requestedGrant: result.requestedGrant,
+        grant: result.grant,
+        operationGrant: result.operationGrant,
+        actionGrant: result.actionGrant,
+      },
       store,
     );
     if (!verified.ok) throw new Error(`remote session grant is invalid: ${verified.reason}`);
@@ -600,20 +615,31 @@ server.registerTool(
       objective: z.string().min(1),
       acceptanceCriteria: z.array(z.string().min(1)).default([]),
       expectedArtifactType: z.string().min(1).optional(),
+      requestedScopes: z.array(z.string().min(1)).default([]),
+      deniedScopes: z.array(z.string().min(1)).default([]),
+      resources: z.array(z.string().min(1)).default([]),
+      taskId: z.string().min(1).optional(),
+      taskApprovalId: z.string().min(1).optional(),
     },
   },
-  async ({ peerUrl, sessionId, objective, acceptanceCriteria, expectedArtifactType }) => {
+  async ({
+    peerUrl, sessionId, objective, acceptanceCriteria, expectedArtifactType,
+    requestedScopes, deniedScopes, resources, taskId, taskApprovalId,
+  }) => {
     const task = {
-      id: randomUUID(),
+      id: taskId ?? randomUUID(),
       objective,
       acceptanceCriteria,
       expectedArtifactType: expectedArtifactType ?? "application/json",
-      createdAt: new Date().toISOString(),
+      requestedScopes,
+      deniedScopes,
+      resources,
     };
     const body = {
       callerPrincipalId: principalId,
       operation: "task",
       task,
+      taskApprovalId,
       message: JSON.stringify(task),
     };
     return text(JSON.stringify(await signedExternalFetch(
@@ -630,16 +656,31 @@ server.registerTool(
     description: "Read session state and its persistent External Thread events.",
     inputSchema: { peerUrl: z.string().url(), sessionId: z.string().min(1) },
   },
-  async ({ peerUrl, sessionId }) => text(JSON.stringify(
-    await signedExternalFetch(peerUrl, `/external/sessions/${encodeURIComponent(sessionId)}`, {
+  async ({ peerUrl, sessionId }) => {
+    const result = await signedExternalFetch(
+      peerUrl,
+      `/external/sessions/${encodeURIComponent(sessionId)}`,
+      {
       action: "session.get",
       method: "GET",
       payload: { sessionId },
       contextId: sessionId,
-    }),
-    null,
-    2,
-  )),
+      },
+    ) as Record<string, unknown>;
+    const proof = result.proof;
+    const state = { ...result };
+    delete state.proof;
+    const verified = verifySignedStatement(proof, state, store);
+    if (!verified.ok) throw new Error(`remote session state is invalid: ${verified.reason}`);
+    const session = result.session as { id?: unknown; purpose?: unknown } | undefined;
+    if (typeof session?.id === "string" && typeof session.purpose === "string") {
+      store.setMeta(remoteSessionBindingKey(verified.peerId, session.id), JSON.stringify({
+        purpose: session.purpose,
+        grantDigest: digestJson(result.grant),
+      }));
+    }
+    return text(JSON.stringify(result, null, 2));
+  },
 );
 
 server.registerTool(

@@ -24,6 +24,7 @@ export class ProcessAdapter implements AgentAdapter {
     sessionResume: false,
     nativeMemoryWriteControl: "unknown",
     separateMemoryNamespace: false,
+    memoryIsolationAssurance: "unknown",
     toolPermissionHooks: false,
     structuredContextualOutput: false,
   };

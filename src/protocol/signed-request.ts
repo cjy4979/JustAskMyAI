@@ -18,6 +18,7 @@ export type SignedAction =
   | "task.get"
   | "task.cancel"
   | "group.manifest.get"
+  | "capabilities.get"
   | "session.open"
   | "session.message"
   | "session.get"
@@ -262,7 +263,8 @@ function parseSignedRequest(value: unknown): SignedRequest | undefined {
       "task.continue",
       "task.get",
       "task.cancel",
-      "group.manifest.get",
+    "group.manifest.get",
+    "capabilities.get",
       "session.open",
       "session.message",
       "session.get",

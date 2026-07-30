@@ -44,11 +44,15 @@ perform bounded work within that authority.
 - Ed25519-signed receipts for completed, failed, and cancelled tasks, binding request,
   authority, disclosure, approval, tool decisions, and artifact digests
 - Local receipt evidence records with field-selective localhost disclosure
-- Owner-published capability profiles and requestable Context Collection metadata
+- Signed, audience-bound capability discovery with policy-filtered public aliases
 - Persistent External Sessions for multi-turn Human-to-Agent and Agent-to-Agent access
-- Session leases, caller/purpose/grant binding, pause, revoke, close, and 7-day hard limits
-- Explicit Context Collections backed by SQLite FTS5, with collection and sensitivity ceilings
-- Isolated External Thread Memory that never becomes Owner or Project Context automatically
+- Session leases, caller/purpose/issued-grant binding, pause, revoke, close, and 7-day hard limits
+- Requested-versus-issued Context Grants intersected with Owner collection policy
+- Separate operation and action grants, with exact task-bound Human approval
+- Explicit Context Collections backed by SQLite FTS5, with visibility, caller, mode,
+  collection, sensitivity, item, and token ceilings
+- Physically session-scoped External Thread events that never enter Context Collections automatically
+- Atomic event sequencing, durable task replay protection, and periodic session checkpoints
 - Structured contextual answers with validated evidence references and authority ceilings
 - Egress escalation for unauthorized references, restricted context, and secret patterns
 - Owner-reviewed writeback proposals that create new provenance-bound records
@@ -93,17 +97,19 @@ approved scope such as `read-workspace`, `edit-workspace`, `run-tests`, `network
 `tool:<kind>`, or `tool:<name>`. A remote requester cannot select the local workspace
 or override the owner's policy.
 
-Context-rich External Sessions also fail closed unless ACP memory isolation is explicitly
-declared:
+An ACP environment declaration is only an operator attestation, not an enforced sandbox:
 
 ```powershell
 $env:JAMAI_ACP_MEMORY_ISOLATION="confirmed"
 ```
 
-JAMA always creates a separate ACP session for an External Session. It never connects a
-non-owner caller to an Owner's native agent session. If ACP cannot resume after a restart,
-JAMA creates a new isolated session, rebuilds it from the stored External Thread and current
-Context Projection, and records a degraded-rehydration audit event.
+By default, context-rich External Sessions require an adapter whose isolation assurance is
+`enforced`; an ACP operator attestation alone fails closed. A deployment may explicitly
+accept that residual risk with
+`JAMAI_ALLOW_OPERATOR_ATTESTED_EXTERNAL_CONTEXT=true`. JAMA still creates a separate ACP
+session and never connects a non-owner caller to an Owner's native session. If ACP cannot
+resume after a restart, JAMA starts a new session, rebuilds it from the session-scoped event
+thread, checkpoint, and current Context Projection, and records degraded rehydration.
 
 Denied scopes take precedence over allowed scopes, including wildcard grants. `run-tests`
 matches only a dedicated test tool name such as `pytest`, `jest`, or `run-tests`; it never
@@ -124,6 +130,9 @@ Invoke-RestMethod `
 
 - ACP resume depends on the selected agent advertising `session/resume`. Without it, JAMA
   uses audited degraded rehydration from its own External Thread and Context Projection.
+- ACP process isolation is operator-attested, not an OS-enforced memory boundary. Context-rich
+  access therefore fails closed unless the adapter reports enforced isolation or the local
+  operator explicitly accepts the weaker assurance.
 - The audit hash chain detects local modification but is not independently anchored. Group
   terminal receipts are signed by the receiving gateway, but external audit checkpoints
   are not implemented yet.

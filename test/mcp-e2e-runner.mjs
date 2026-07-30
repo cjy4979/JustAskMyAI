@@ -120,6 +120,17 @@ try {
     sourceType: "project-record",
     defaultSensitivity: "internal",
     tags: ["simulation"],
+    visibility: "paired-discoverable",
+    publicAlias: "Simulation records",
+    accessPolicy: {
+      allowedCallerTypes: ["human", "agent"],
+      allowedTrust: ["paired-gateway", "guest-capability"],
+      sensitivityCeiling: "internal",
+      exactContentAllowed: true,
+      maxItems: 8,
+      maxTokens: 6000,
+      autoApprove: true,
+    },
   });
   await postJson(
     `${bob.managementUrl}/api/context-collections/${simulationCollection.id}/items`,
@@ -130,6 +141,23 @@ try {
       sensitivity: "internal",
     },
   );
+  await postJson(`${bob.managementUrl}/api/context-collections`, {
+    name: "Project Falcon Restricted Failures",
+    description: "This metadata must remain private",
+    sourceType: "project-record",
+    defaultSensitivity: "restricted",
+    visibility: "private",
+    accessPolicy: {
+      allowedCallerTypes: ["human", "agent"],
+      allowedTrust: ["paired-gateway"],
+      sensitivityCeiling: "restricted",
+      exactContentAllowed: false,
+      maxItems: 2,
+      maxTokens: 500,
+      autoApprove: false,
+    },
+    tags: ["secret-project"],
+  });
   const webSessionResult = await postJson(`${alice.managementUrl}/api/remote-external-sessions`, {
     peerId: bobIdentity.peerId,
     purpose: "Human paired-gateway simulation question",
@@ -154,8 +182,11 @@ try {
     name: "discover_agent_capabilities",
     arguments: { peerUrl: bob.publicUrl },
   });
-  if (!JSON.stringify(capabilities).includes("Bob simulation records")) {
+  if (!JSON.stringify(capabilities).includes("Simulation records")) {
     throw new Error("remote Capability Directory did not expose requestable collection metadata");
+  }
+  if (JSON.stringify(capabilities).includes("Falcon")) {
+    throw new Error("private collection metadata leaked through Capability Directory");
   }
   const opened = await mcp.callTool({
     name: "open_external_session",
@@ -198,6 +229,19 @@ try {
   if (!externalTaskResult.artifact?.id || !externalTaskResult.taskId) {
     throw new Error(`External Session task failed: ${JSON.stringify(externalTask)}`);
   }
+  const overScopedTask = await mcp.callTool({
+    name: "request_external_task",
+    arguments: {
+      peerUrl: bob.publicUrl,
+      sessionId: externalSession.id,
+      objective: "Attempt a scope not issued by the Owner",
+      requestedScopes: ["run-tests"],
+      resources: ["simulation"],
+    },
+  });
+  if (!overScopedTask.isError) {
+    throw new Error("External Task bypassed the Session Action Grant");
+  }
   const externalState = await mcp.callTool({
     name: "get_external_session",
     arguments: { peerUrl: bob.publicUrl, sessionId: externalSession.id },
@@ -210,6 +254,54 @@ try {
     || externalThread.events[4]?.type !== "artifact"
   ) {
     throw new Error(`External Thread was not persistent across interactions: ${JSON.stringify(externalState)}`);
+  }
+  await postJson(`${bob.managementUrl}/api/external-sessions/${externalSession.id}/status`, {
+    status: "paused",
+  });
+  await postJson(`${bob.managementUrl}/api/external-sessions/${externalSession.id}/approve`, {
+    allowedCollections: [simulationCollection.id],
+    sensitivityCeiling: "internal",
+    exactContentAllowed: true,
+    maxItems: 8,
+    maxTokens: 6000,
+    allowedOperations: ["ask", "task"],
+    actionScopes: ["run-tests"],
+    deniedScopes: ["network"],
+    resources: ["simulation"],
+    actionApprovalRule: "per-task",
+  });
+  await mcp.callTool({
+    name: "get_external_session",
+    arguments: { peerUrl: bob.publicUrl, sessionId: externalSession.id },
+  });
+  const governedTaskArgs = {
+    peerUrl: bob.publicUrl,
+    sessionId: externalSession.id,
+    objective: "Run the Owner-authorized simulation test",
+    requestedScopes: ["run-tests"],
+    deniedScopes: ["network"],
+    resources: ["simulation"],
+    taskId: "external-governed-task",
+  };
+  const governedPending = await mcp.callTool({
+    name: "request_external_task",
+    arguments: governedTaskArgs,
+  });
+  const governedPendingText = governedPending.content?.find((item) => item.type === "text")?.text;
+  const governedTicket = governedPendingText ? JSON.parse(governedPendingText) : {};
+  if (governedTicket.status !== "OWNER_TASK_APPROVAL_REQUIRED") {
+    throw new Error("per-task Session Action Grant did not require Owner approval");
+  }
+  await postJson(
+    `${bob.managementUrl}/api/approvals/${governedTicket.approvalId}/approve`,
+    { approvedScopes: ["run-tests"], deniedScopes: ["network"] },
+  );
+  const governedCompleted = await mcp.callTool({
+    name: "request_external_task",
+    arguments: { ...governedTaskArgs, taskApprovalId: governedTicket.approvalId },
+  });
+  if (!JSON.stringify(governedCompleted).includes("artifact")) {
+    throw new Error(`Owner-approved External Task did not complete: ${JSON.stringify(governedCompleted)}`);
   }
   const proposed = await mcp.callTool({
     name: "propose_memory_writeback",
@@ -356,8 +448,17 @@ try {
   if (deniedBeforeConsent.status !== 401) {
     throw new Error("request-only guest could send before Owner consent");
   }
-  await postJson(`${bob.managementUrl}/api/external-sessions/${gatedSession.id}/status`, {
-    status: "active",
+  await postJson(`${bob.managementUrl}/api/external-sessions/${gatedSession.id}/approve`, {
+    allowedCollections: [simulationCollection.id],
+    sensitivityCeiling: "internal",
+    exactContentAllowed: false,
+    maxItems: 8,
+    maxTokens: 6000,
+    allowedOperations: ["ask"],
+    actionScopes: [],
+    deniedScopes: [],
+    resources: [],
+    actionApprovalRule: "per-tool",
   });
   const allowedAfterConsent = await fetch(
     `${bob.publicUrl}/guest/sessions/${gatedSession.id}/messages`,

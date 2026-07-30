@@ -2,7 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import type { GatewayStore } from "../storage/sqlite.js";
 import type {
   AgentProfile, ContextCollection, ContextGrant, ContextItem, ExternalSession,
-  ExternalSessionEvent, Sensitivity, SessionInvite, SessionStatus, WritebackProposal,
+  ExternalSessionEvent, ExternalTaskRecord, IssuedContextGrant, RequestedContextGrant,
+  Sensitivity, SessionActionGrant, SessionCheckpoint, SessionInvite, SessionOperationGrant,
+  SessionStatus, WritebackProposal,
 } from "./types.js";
 
 const SENSITIVITY: Sensitivity[] = ["public", "internal", "confidential", "restricted"];
@@ -28,15 +30,35 @@ export class SessionStore {
     return profile;
   }
 
-  createCollection(input: Omit<ContextCollection, "id" | "createdAt" | "updatedAt">): ContextCollection {
+  createCollection(input: Omit<
+    ContextCollection,
+    "id" | "createdAt" | "updatedAt" | "visibility" | "accessPolicy"
+  > & Pick<Partial<ContextCollection>, "visibility" | "accessPolicy">): ContextCollection {
     const now = new Date().toISOString();
-    const value = { ...input, id: randomUUID(), createdAt: now, updatedAt: now };
+    const value: ContextCollection = {
+      ...input,
+      visibility: input.visibility ?? "private",
+      accessPolicy: {
+        allowedCallerTypes: input.accessPolicy?.allowedCallerTypes ?? ["human", "agent"],
+        allowedTrust: input.accessPolicy?.allowedTrust ?? ["paired-gateway"],
+        sensitivityCeiling: input.accessPolicy?.sensitivityCeiling ?? input.defaultSensitivity,
+        exactContentAllowed: input.accessPolicy?.exactContentAllowed ?? false,
+        maxItems: input.accessPolicy?.maxItems ?? 8,
+        maxTokens: input.accessPolicy?.maxTokens ?? 6000,
+        autoApprove: input.accessPolicy?.autoApprove ?? false,
+      },
+      id: randomUUID(),
+      createdAt: now,
+      updatedAt: now,
+    };
     this.gateway.db.prepare(`
       INSERT INTO context_collections(
-        id,name,description,source_type,root_path,default_sensitivity,tags_json,created_at,updated_at
-      ) VALUES (?,?,?,?,?,?,?,?,?)
+        id,name,description,source_type,root_path,default_sensitivity,tags_json,
+        visibility,public_alias,access_policy_json,created_at,updated_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(value.id, value.name, value.description, value.sourceType, value.rootPath ?? null,
-      value.defaultSensitivity, JSON.stringify(value.tags), now, now);
+      value.defaultSensitivity, JSON.stringify(value.tags), value.visibility,
+      value.publicAlias ?? null, JSON.stringify(value.accessPolicy), now, now);
     return value;
   }
 
@@ -52,6 +74,21 @@ export class SessionStore {
       "SELECT * FROM context_collections WHERE id=?",
     ).get(id) as Record<string, unknown> | undefined;
     return row ? mapCollection(row) : undefined;
+  }
+
+  updateCollectionPolicy(
+    id: string,
+    input: Pick<ContextCollection, "visibility" | "publicAlias" | "accessPolicy">,
+  ): ContextCollection {
+    const current = this.getCollection(id);
+    if (!current) throw new Error("context collection not found");
+    const updatedAt = new Date().toISOString();
+    this.gateway.db.prepare(`
+      UPDATE context_collections SET visibility=?,public_alias=?,access_policy_json=?,updated_at=?
+      WHERE id=?
+    `).run(input.visibility, input.publicAlias ?? null, JSON.stringify(input.accessPolicy),
+      updatedAt, id);
+    return { ...current, ...input, updatedAt };
   }
 
   addItem(input: Omit<ContextItem, "id" | "sourceDigest" | "createdAt">): ContextItem {
@@ -89,26 +126,125 @@ export class SessionStore {
     ownerPrincipalId: string; ownerAgentId: string; callerType: "human" | "agent";
     callerPrincipalId: string; callerAgentId?: string; callerPeerId?: string;
     callerTrust: "paired-gateway" | "guest-capability"; purpose: string; groupId?: string;
-    groupPolicyVersion?: number; groupMembershipVersion?: number; collectionIds: string[];
+    groupPolicyVersion?: number; groupMembershipVersion?: number; collectionIds?: string[];
     tags?: string[]; sensitivityCeiling?: Sensitivity; exactContentAllowed?: boolean;
     maxItems?: number; maxTokens?: number; allowedActions?: string[]; status: SessionStatus;
     leaseSeconds?: number; a2aContextId?: string;
-  }): { session: ExternalSession; grant: ContextGrant } {
-    for (const id of input.collectionIds) {
+    requestedContext?: {
+      collections: string[]; sensitivity: Sensitivity; mode: "summary" | "exact";
+      maxItems: number; maxTokens: number; tags?: string[];
+    };
+    issuedContext?: {
+      collections: string[]; sensitivityCeiling: Sensitivity; exactContentAllowed: boolean;
+      maxItems: number; maxTokens: number; tags?: string[]; issuedByOwnerPolicy: string;
+      issuedByPrincipalId?: string;
+    };
+    operationGrant?: {
+      allowedOperations: Array<"ask" | "task" | "review">;
+      issuedByOwnerPolicy: string;
+    };
+    actionGrant?: {
+      allowedScopes: string[]; deniedScopes: string[]; resources: string[];
+      approvalRule: "per-session" | "per-task" | "per-tool";
+      issuedByOwnerPolicy: string; issuedByPrincipalId?: string;
+    };
+  }): {
+    session: ExternalSession;
+    requestedGrant: RequestedContextGrant;
+    grant: ContextGrant;
+    operationGrant: SessionOperationGrant;
+    actionGrant: SessionActionGrant;
+  } {
+    if (!input.issuedContext) {
+      throw new Error("Issued Context Grant must be created by Owner policy");
+    }
+    const requestedCollections = [...new Set(
+      input.requestedContext?.collections ?? input.collectionIds ?? [],
+    )];
+    for (const id of requestedCollections) {
       if (!this.getCollection(id)) throw new Error(`context collection not found: ${id}`);
+    }
+    const issuedCollections = [...new Set(
+      input.issuedContext.collections,
+    )];
+    if (issuedCollections.some((id) => !requestedCollections.includes(id))) {
+      throw new Error("issued context grant cannot exceed the caller request");
     }
     const now = new Date();
     const leaseSeconds = Math.min(Math.max(input.leaseSeconds ?? 28_800, 60), 604_800);
     const sessionId = randomUUID();
     const expiresAt = new Date(now.getTime() + leaseSeconds * 1000).toISOString();
-    const grant: ContextGrant = {
-      id: randomUUID(), sessionId, collectionIds: [...new Set(input.collectionIds)],
-      tags: [...new Set(input.tags ?? [])],
-      sensitivityCeiling: input.sensitivityCeiling ?? "internal",
-      exactContentAllowed: Boolean(input.exactContentAllowed),
-      maxItems: Math.min(Math.max(input.maxItems ?? 8, 1), 50),
-      maxTokens: Math.min(Math.max(input.maxTokens ?? 6000, 256), 50_000),
-      purpose: input.purpose, createdAt: now.toISOString(), expiresAt,
+    const requestedGrant: RequestedContextGrant = {
+      id: randomUUID(),
+      sessionId,
+      requestedCollections,
+      requestedSensitivity: input.requestedContext?.sensitivity
+        ?? input.sensitivityCeiling ?? "internal",
+      requestedMode: input.requestedContext?.mode
+        ?? (input.exactContentAllowed ? "exact" : "summary"),
+      requestedLimits: {
+        maxItems: Math.min(Math.max(input.requestedContext?.maxItems ?? input.maxItems ?? 8, 1), 50),
+        maxTokens: Math.min(
+          Math.max(input.requestedContext?.maxTokens ?? input.maxTokens ?? 6000, 256),
+          50_000,
+        ),
+      },
+      requestedTags: [...new Set(input.requestedContext?.tags ?? input.tags ?? [])],
+      createdAt: now.toISOString(),
+    };
+    const grant: IssuedContextGrant = {
+      id: randomUUID(),
+      sessionId,
+      allowedCollections: issuedCollections,
+      tags: [...new Set(input.issuedContext.tags ?? requestedGrant.requestedTags)],
+      sensitivityCeiling: input.issuedContext.sensitivityCeiling,
+      exactContentAllowed: input.issuedContext.exactContentAllowed,
+      maxItems: Math.min(
+        requestedGrant.requestedLimits.maxItems,
+        input.issuedContext.maxItems,
+      ),
+      maxTokens: Math.min(
+        requestedGrant.requestedLimits.maxTokens,
+        input.issuedContext.maxTokens,
+      ),
+      purpose: input.purpose,
+      issuedByOwnerPolicy: input.issuedContext.issuedByOwnerPolicy,
+      issuedByPrincipalId: input.issuedContext.issuedByPrincipalId,
+      createdAt: now.toISOString(),
+      expiresAt,
+    };
+    if (SENSITIVITY.indexOf(grant.sensitivityCeiling)
+      > SENSITIVITY.indexOf(requestedGrant.requestedSensitivity)) {
+      throw new Error("issued sensitivity cannot exceed the caller request");
+    }
+    if (grant.exactContentAllowed && requestedGrant.requestedMode !== "exact") {
+      throw new Error("issued exact-content mode cannot exceed the caller request");
+    }
+    const operationGrant: SessionOperationGrant = {
+      id: randomUUID(),
+      sessionId,
+      allowedOperations: [...new Set(
+        input.operationGrant?.allowedOperations
+        ?? (input.allowedActions ?? ["ask"]).filter(
+          (value): value is "ask" | "task" | "review" =>
+            value === "ask" || value === "task" || value === "review",
+        ),
+      )],
+      issuedByOwnerPolicy: input.operationGrant?.issuedByOwnerPolicy ?? "legacy-direct",
+      createdAt: now.toISOString(),
+      expiresAt,
+    };
+    const actionGrant: SessionActionGrant = {
+      id: randomUUID(),
+      sessionId,
+      allowedScopes: [...new Set(input.actionGrant?.allowedScopes ?? [])],
+      deniedScopes: [...new Set(input.actionGrant?.deniedScopes ?? [])],
+      resources: [...new Set(input.actionGrant?.resources ?? [])],
+      approvalRule: input.actionGrant?.approvalRule ?? "per-tool",
+      issuedByOwnerPolicy: input.actionGrant?.issuedByOwnerPolicy ?? "deny-by-default",
+      issuedByPrincipalId: input.actionGrant?.issuedByPrincipalId,
+      createdAt: now.toISOString(),
+      expiresAt,
     };
     const session: ExternalSession = {
       id: sessionId, ownerPrincipalId: input.ownerPrincipalId, ownerAgentId: input.ownerAgentId,
@@ -117,15 +253,28 @@ export class SessionStore {
       callerTrust: input.callerTrust, purpose: input.purpose, groupId: input.groupId,
       groupPolicyVersion: input.groupPolicyVersion,
       groupMembershipVersion: input.groupMembershipVersion,
-      a2aContextId: input.a2aContextId, contextGrantId: grant.id,
-      allowedActions: [...new Set(input.allowedActions ?? ["ask"])],
+      a2aContextId: input.a2aContextId,
+      requestedContextGrantId: requestedGrant.id,
+      contextGrantId: grant.id,
+      operationGrantId: operationGrant.id,
+      actionGrantId: actionGrant.id,
+      allowedActions: operationGrant.allowedOperations,
       status: input.status, createdAt: now.toISOString(), expiresAt,
     };
     this.gateway.db.exec("BEGIN IMMEDIATE");
     try {
       this.gateway.db.prepare(
+        "INSERT INTO requested_context_grants(id,session_id,grant_json) VALUES (?,?,?)",
+      ).run(requestedGrant.id, session.id, JSON.stringify(requestedGrant));
+      this.gateway.db.prepare(
         "INSERT INTO context_grants(id,session_id,grant_json,expires_at) VALUES (?,?,?,?)",
       ).run(grant.id, session.id, JSON.stringify(grant), expiresAt);
+      this.gateway.db.prepare(
+        "INSERT INTO session_operation_grants(id,session_id,grant_json,expires_at) VALUES (?,?,?,?)",
+      ).run(operationGrant.id, session.id, JSON.stringify(operationGrant), expiresAt);
+      this.gateway.db.prepare(
+        "INSERT INTO session_action_grants(id,session_id,grant_json,expires_at) VALUES (?,?,?,?)",
+      ).run(actionGrant.id, session.id, JSON.stringify(actionGrant), expiresAt);
       this.gateway.db.prepare(`
         INSERT INTO external_sessions(
           id,owner_agent_id,caller_principal_id,caller_peer_id,status,expires_at,session_json,created_at
@@ -137,7 +286,7 @@ export class SessionStore {
     } catch (error) {
       this.gateway.db.exec("ROLLBACK"); throw error;
     }
-    return { session, grant };
+    return { session, requestedGrant, grant, operationGrant, actionGrant };
   }
 
   getSession(id: string): ExternalSession | undefined {
@@ -162,7 +311,184 @@ export class SessionStore {
     const row = this.gateway.db.prepare(
       "SELECT grant_json FROM context_grants WHERE id=?",
     ).get(id) as { grant_json: string } | undefined;
-    return row ? JSON.parse(row.grant_json) as ContextGrant : undefined;
+    if (!row) return undefined;
+    const value = JSON.parse(row.grant_json) as ContextGrant & { collectionIds?: string[] };
+    return {
+      ...value,
+      allowedCollections: value.allowedCollections ?? value.collectionIds ?? [],
+      issuedByOwnerPolicy: value.issuedByOwnerPolicy ?? "legacy-unverified",
+    };
+  }
+
+  getRequestedGrant(id: string): RequestedContextGrant | undefined {
+    const row = this.gateway.db.prepare(
+      "SELECT grant_json FROM requested_context_grants WHERE id=?",
+    ).get(id) as { grant_json: string } | undefined;
+    return row ? JSON.parse(row.grant_json) as RequestedContextGrant : undefined;
+  }
+
+  getOperationGrant(id: string): SessionOperationGrant | undefined {
+    const row = this.gateway.db.prepare(
+      "SELECT grant_json FROM session_operation_grants WHERE id=?",
+    ).get(id) as { grant_json: string } | undefined;
+    return row ? JSON.parse(row.grant_json) as SessionOperationGrant : undefined;
+  }
+
+  getActionGrant(id: string): SessionActionGrant | undefined {
+    const row = this.gateway.db.prepare(
+      "SELECT grant_json FROM session_action_grants WHERE id=?",
+    ).get(id) as { grant_json: string } | undefined;
+    return row ? JSON.parse(row.grant_json) as SessionActionGrant : undefined;
+  }
+
+  evaluateContextRequest(input: {
+    collections: string[];
+    requestedSensitivity: Sensitivity;
+    requestedMode: "summary" | "exact";
+    requestedMaxItems: number;
+    requestedMaxTokens: number;
+    callerType: "human" | "agent";
+    callerTrust: "paired-gateway" | "guest-capability";
+    requireAutoApprove: boolean;
+    groupAuthorized?: boolean;
+  }): {
+    collections: string[];
+    sensitivityCeiling: Sensitivity;
+    exactContentAllowed: boolean;
+    maxItems: number;
+    maxTokens: number;
+  } {
+    const allowed = [...new Set(input.collections)].map((id) => this.getCollection(id))
+      .filter((collection): collection is ContextCollection => Boolean(collection))
+      .filter((collection) =>
+        collection.name !== "External Thread Memory"
+        && collection.accessPolicy.allowedCallerTypes.includes(input.callerType)
+        && collection.accessPolicy.allowedTrust.includes(input.callerTrust)
+        && (!input.requireAutoApprove || (
+          collection.accessPolicy.autoApprove
+          && (
+            collection.visibility === "paired-discoverable"
+            || (collection.visibility === "group-discoverable" && input.groupAuthorized)
+          )
+        )));
+    const sensitivity = allowed.reduce(
+      (result, collection) => minSensitivity(result, collection.accessPolicy.sensitivityCeiling),
+      input.requestedSensitivity,
+    );
+    return {
+      collections: allowed.map((collection) => collection.id),
+      sensitivityCeiling: sensitivity,
+      exactContentAllowed: input.requestedMode === "exact"
+        && allowed.length > 0
+        && allowed.every((collection) => collection.accessPolicy.exactContentAllowed),
+      maxItems: Math.min(
+        input.requestedMaxItems,
+        ...allowed.map((collection) => collection.accessPolicy.maxItems),
+      ),
+      maxTokens: Math.min(
+        input.requestedMaxTokens,
+        ...allowed.map((collection) => collection.accessPolicy.maxTokens),
+      ),
+    };
+  }
+
+  approveSession(input: {
+    sessionId: string;
+    ownerPrincipalId: string;
+    allowedCollections: string[];
+    sensitivityCeiling: Sensitivity;
+    exactContentAllowed: boolean;
+    maxItems: number;
+    maxTokens: number;
+    allowedOperations: Array<"ask" | "task" | "review">;
+    actionScopes: string[];
+    deniedScopes: string[];
+    resources: string[];
+    actionApprovalRule: "per-session" | "per-task" | "per-tool";
+  }): {
+    session: ExternalSession;
+    grant: ContextGrant;
+    operationGrant: SessionOperationGrant;
+    actionGrant: SessionActionGrant;
+  } {
+    const session = this.getSessionRaw(input.sessionId);
+    if (!session || !["awaiting_owner_consent", "paused"].includes(session.status)) {
+      throw new Error("external session is not awaiting Owner consent or paused reauthorization");
+    }
+    if (session.ownerPrincipalId !== input.ownerPrincipalId) throw new Error("Owner mismatch");
+    const requested = this.getRequestedGrant(session.requestedContextGrantId);
+    const currentGrant = this.getGrant(session.contextGrantId);
+    const currentOperation = this.getOperationGrant(session.operationGrantId);
+    const currentAction = this.getActionGrant(session.actionGrantId);
+    if (!requested || !currentGrant || !currentOperation || !currentAction) {
+      throw new Error("session grants are incomplete");
+    }
+    const requestedOperations = new Set(currentOperation.allowedOperations);
+    if (input.allowedOperations.some((operation) => !requestedOperations.has(operation))) {
+      throw new Error("Owner decision cannot add an unrequested operation");
+    }
+    const evaluated = this.evaluateContextRequest({
+      collections: input.allowedCollections.filter((id) =>
+        requested.requestedCollections.includes(id)),
+      requestedSensitivity: minSensitivity(
+        requested.requestedSensitivity,
+        input.sensitivityCeiling,
+      ),
+      requestedMode: requested.requestedMode === "exact" && input.exactContentAllowed
+        ? "exact" : "summary",
+      requestedMaxItems: Math.min(requested.requestedLimits.maxItems, input.maxItems),
+      requestedMaxTokens: Math.min(requested.requestedLimits.maxTokens, input.maxTokens),
+      callerType: session.callerType,
+      callerTrust: session.callerTrust,
+      requireAutoApprove: false,
+    });
+    const grant: ContextGrant = {
+      ...currentGrant,
+      allowedCollections: evaluated.collections,
+      sensitivityCeiling: evaluated.sensitivityCeiling,
+      exactContentAllowed: evaluated.exactContentAllowed,
+      maxItems: evaluated.maxItems,
+      maxTokens: evaluated.maxTokens,
+      issuedByOwnerPolicy: "human-owner-decision",
+      issuedByPrincipalId: input.ownerPrincipalId,
+    };
+    const operationGrant: SessionOperationGrant = {
+      ...currentOperation,
+      allowedOperations: [...new Set(input.allowedOperations)],
+      issuedByOwnerPolicy: "human-owner-decision",
+    };
+    const actionGrant: SessionActionGrant = {
+      ...currentAction,
+      allowedScopes: [...new Set(input.actionScopes)],
+      deniedScopes: [...new Set(input.deniedScopes)],
+      resources: [...new Set(input.resources)],
+      approvalRule: input.actionApprovalRule,
+      issuedByOwnerPolicy: "human-owner-decision",
+      issuedByPrincipalId: input.ownerPrincipalId,
+    };
+    const active = { ...session, status: "active" as const };
+    this.gateway.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.gateway.db.prepare("UPDATE context_grants SET grant_json=? WHERE id=?")
+        .run(JSON.stringify(grant), grant.id);
+      this.gateway.db.prepare("UPDATE session_operation_grants SET grant_json=? WHERE id=?")
+        .run(JSON.stringify(operationGrant), operationGrant.id);
+      this.gateway.db.prepare("UPDATE session_action_grants SET grant_json=? WHERE id=?")
+        .run(JSON.stringify(actionGrant), actionGrant.id);
+      this.gateway.db.prepare(
+        "UPDATE external_sessions SET status='active',session_json=? WHERE id=?",
+      ).run(JSON.stringify(active), active.id);
+      this.gateway.db.exec("COMMIT");
+    } catch (error) {
+      this.gateway.db.exec("ROLLBACK");
+      throw error;
+    }
+    this.appendEvent(active.id, "status", input.ownerPrincipalId, {
+      status: "active",
+      issuedContextGrantDigest: digest(grant),
+      actionGrantDigest: digest(actionGrant),
+    }, []);
+    return { session: active, grant, operationGrant, actionGrant };
   }
 
   setSessionStatus(id: string, status: SessionStatus): ExternalSession {
@@ -173,6 +499,9 @@ export class SessionStore {
       && status !== current.status
     ) {
       throw new Error("terminal external session state cannot be changed");
+    }
+    if (current.status === "awaiting_owner_consent" && status === "active") {
+      throw new Error("Owner must issue narrowed grants before activating the session");
     }
     const terminal = ["revoked", "expired", "closed"].includes(status);
     const closedAt = terminal ? current.closedAt ?? new Date().toISOString() : current.closedAt;
@@ -188,6 +517,9 @@ export class SessionStore {
     this.gateway.db.prepare(
       "UPDATE external_sessions SET status=?, session_json=? WHERE id=?",
     ).run(status, JSON.stringify(next), id);
+    if (terminal) {
+      this.gateway.db.prepare("DELETE FROM guest_session_bindings WHERE session_id=?").run(id);
+    }
     this.appendEvent(id, "status", current.ownerPrincipalId, { status }, []);
     return next;
   }
@@ -215,6 +547,16 @@ export class SessionStore {
       this.gateway.db.prepare(
         "UPDATE context_grants SET expires_at=?, grant_json=? WHERE id=?",
       ).run(expiresAt, JSON.stringify(nextGrant), grant.id);
+      for (const [table, id, value] of [
+        ["session_operation_grants", current.operationGrantId,
+          { ...this.getOperationGrant(current.operationGrantId)!, expiresAt }],
+        ["session_action_grants", current.actionGrantId,
+          { ...this.getActionGrant(current.actionGrantId)!, expiresAt }],
+      ] as const) {
+        this.gateway.db.prepare(
+          `UPDATE ${table} SET expires_at=?, grant_json=? WHERE id=?`,
+        ).run(expiresAt, JSON.stringify(value), id);
+      }
       this.gateway.db.exec("COMMIT");
     } catch (error) {
       this.gateway.db.exec("ROLLBACK");
@@ -238,20 +580,32 @@ export class SessionStore {
     sessionId: string, type: ExternalSessionEvent["type"], actorPrincipalId: string | undefined,
     content: unknown, contextRefs: string[],
   ): ExternalSessionEvent {
-    const sequence = Number((this.gateway.db.prepare(
-      "SELECT COALESCE(MAX(sequence),0)+1 AS n FROM external_session_events WHERE session_id=?",
-    ).get(sessionId) as { n: number }).n);
-    const event: ExternalSessionEvent = {
-      id: randomUUID(), sessionId, sequence, type, actorPrincipalId,
-      content, contentDigest: digest(content), contextRefs, createdAt: new Date().toISOString(),
-    };
-    this.gateway.db.prepare(`
-      INSERT INTO external_session_events(
-        id,session_id,sequence,type,event_json,content_digest,created_at
-      ) VALUES (?,?,?,?,?,?,?)
-    `).run(event.id, sessionId, sequence, type, JSON.stringify(event),
-      event.contentDigest, event.createdAt);
-    return event;
+    this.gateway.db.exec("BEGIN IMMEDIATE");
+    try {
+      const initial = Number((this.gateway.db.prepare(
+        "SELECT COALESCE(MAX(sequence),0)+1 AS sequence FROM external_session_events WHERE session_id=?",
+      ).get(sessionId) as { sequence: number }).sequence);
+      const counter = this.gateway.db.prepare(`
+        INSERT INTO external_session_counters(session_id,next_sequence) VALUES (?,?)
+        ON CONFLICT(session_id) DO UPDATE SET next_sequence=next_sequence+1
+        RETURNING next_sequence
+      `).get(sessionId, initial) as { next_sequence: number };
+      const event: ExternalSessionEvent = {
+        id: randomUUID(), sessionId, sequence: Number(counter.next_sequence), type, actorPrincipalId,
+        content, contentDigest: digest(content), contextRefs, createdAt: new Date().toISOString(),
+      };
+      this.gateway.db.prepare(`
+        INSERT INTO external_session_events(
+          id,session_id,sequence,type,event_json,content_digest,created_at
+        ) VALUES (?,?,?,?,?,?,?)
+      `).run(event.id, sessionId, event.sequence, type, JSON.stringify(event),
+        event.contentDigest, event.createdAt);
+      this.gateway.db.exec("COMMIT");
+      return event;
+    } catch (error) {
+      this.gateway.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   listEvents(sessionId: string, limit = 100): ExternalSessionEvent[] {
@@ -262,10 +616,103 @@ export class SessionStore {
       .map((row) => JSON.parse(row.event_json) as ExternalSessionEvent).reverse();
   }
 
+  registerTask(input: Omit<ExternalTaskRecord, "id" | "status" | "createdAt">): ExternalTaskRecord {
+    const task: ExternalTaskRecord = {
+      ...input,
+      id: randomUUID(),
+      status: "registered",
+      createdAt: new Date().toISOString(),
+    };
+    try {
+      this.gateway.db.prepare(`
+        INSERT INTO external_tasks(
+          id,session_id,external_task_id,status,task_json,request_digest,created_at
+        ) VALUES (?,?,?,?,?,?,?)
+      `).run(task.id, task.sessionId, task.externalTaskId, task.status,
+        JSON.stringify(task), task.requestDigest, task.createdAt);
+    } catch (error) {
+      if (String(error).includes("UNIQUE constraint failed")) {
+        throw new Error("External Session task ID is immutable and already exists");
+      }
+      throw error;
+    }
+    return task;
+  }
+
+  completeTask(
+    sessionId: string,
+    externalTaskId: string,
+    status: ExternalTaskRecord["status"],
+  ): ExternalTaskRecord {
+    const row = this.gateway.db.prepare(
+      "SELECT task_json FROM external_tasks WHERE session_id=? AND external_task_id=?",
+    ).get(sessionId, externalTaskId) as { task_json: string } | undefined;
+    if (!row) throw new Error("External Session task not found");
+    const task = { ...JSON.parse(row.task_json) as ExternalTaskRecord, status };
+    this.gateway.db.prepare(
+      "UPDATE external_tasks SET status=?,task_json=? WHERE session_id=? AND external_task_id=?",
+    ).run(status, JSON.stringify(task), sessionId, externalTaskId);
+    return task;
+  }
+
+  getCheckpoint(sessionId: string): SessionCheckpoint | undefined {
+    const row = this.gateway.db.prepare(`
+      SELECT checkpoint_json FROM session_checkpoints
+      WHERE session_id=? ORDER BY up_to_sequence DESC LIMIT 1
+    `).get(sessionId) as { checkpoint_json: string } | undefined;
+    return row ? JSON.parse(row.checkpoint_json) as SessionCheckpoint : undefined;
+  }
+
+  maybeCheckpoint(sessionId: string, interval = 20): SessionCheckpoint | undefined {
+    const events = this.listEvents(sessionId, 500);
+    const latest = this.getCheckpoint(sessionId);
+    const lastSequence = events.at(-1)?.sequence ?? 0;
+    if (lastSequence === 0 || lastSequence - (latest?.upToSequence ?? 0) < interval) return latest;
+    const confirmedConstraints = [...new Set([...(latest?.confirmedConstraints ?? []), ...events.flatMap((event) => {
+      if (event.type !== "agent-message" || !event.content || typeof event.content !== "object") {
+        return [];
+      }
+      const claims = (event.content as { claims?: unknown }).claims;
+      if (!Array.isArray(claims)) return [];
+      return claims.flatMap((claim) => {
+        if (!claim || typeof claim !== "object") return [];
+        const value = claim as Record<string, unknown>;
+        return ["owner-confirmed", "project-record"].includes(String(value.status))
+          && typeof value.text === "string" ? [value.text] : [];
+      });
+    })])].slice(-50);
+    const checkpointBody = {
+      sessionId,
+      upToSequence: lastSequence,
+      confirmedConstraints,
+      unresolvedQuestions: [...new Set([...(latest?.unresolvedQuestions ?? []), ...events.filter((event) =>
+        event.type === "caller-message"
+        && typeof event.content === "string"
+        && event.content.trim().endsWith("?")).map((event) => event.id)])].slice(-50),
+      acceptedArtifacts: [...new Set([...(latest?.acceptedArtifacts ?? []), ...events
+        .filter((event) => event.type === "artifact").map((event) => event.id)])].slice(-50),
+      rejectedAssumptions: latest?.rejectedAssumptions ?? [],
+      ownerEscalations: [...new Set([...(latest?.ownerEscalations ?? []), ...events
+        .filter((event) => event.type === "escalation").map((event) => event.id)])].slice(-50),
+    };
+    const checkpoint: SessionCheckpoint = {
+      ...checkpointBody,
+      id: randomUUID(),
+      summaryDigest: digest(checkpointBody),
+      createdAt: new Date().toISOString(),
+    };
+    this.gateway.db.prepare(`
+      INSERT INTO session_checkpoints(id,session_id,up_to_sequence,checkpoint_json,created_at)
+      VALUES (?,?,?,?,?)
+    `).run(checkpoint.id, sessionId, checkpoint.upToSequence, JSON.stringify(checkpoint),
+      checkpoint.createdAt);
+    return checkpoint;
+  }
+
   project(session: ExternalSession, query: string): ContextItem[] {
     const grant = this.getGrant(session.contextGrantId);
     if (!grant || Date.parse(grant.expiresAt) <= Date.now()) throw new Error("context grant expired");
-    if (grant.collectionIds.length === 0) return [];
+    if (grant.allowedCollections.length === 0) return [];
     const terms = query.match(/[A-Za-z0-9_\-\u4e00-\u9fff]{2,}/g)?.slice(0, 12) ?? [];
     const rows = terms.length > 0
       ? this.gateway.db.prepare(`
@@ -275,13 +722,14 @@ export class SessionStore {
           ORDER BY bm25(context_items_fts) LIMIT 100
         `).all(terms.map((term) => `"${term.replaceAll('"', '""')}"`).join(" OR "))
       : this.gateway.db.prepare("SELECT item_json FROM context_items ORDER BY created_at DESC LIMIT 100").all();
-    const allowed = new Set(grant.collectionIds);
+    const allowed = new Set(grant.allowedCollections);
     const ceiling = SENSITIVITY.indexOf(grant.sensitivityCeiling);
     const result: ContextItem[] = [];
     let tokens = 0;
     for (const row of rows as { item_json: string }[]) {
       const item = JSON.parse(row.item_json) as ContextItem;
       if (!allowed.has(item.collectionId) || SENSITIVITY.indexOf(item.sensitivity) > ceiling) continue;
+      if (item.authority === "external-claim" && item.origin.sessionId !== session.id) continue;
       const collection = this.getCollection(item.collectionId);
       if (
         grant.tags.length > 0
@@ -318,7 +766,11 @@ export class SessionStore {
       JSON.parse(row.proposal_json) as WritebackProposal);
   }
 
-  resolveWriteback(id: string, decision: "accepted" | "rejected" | "superseded"): WritebackProposal {
+  resolveWriteback(
+    id: string,
+    decision: "accepted" | "rejected" | "superseded",
+    review?: { confirmedByPrincipalId?: string; sensitivity?: Sensitivity },
+  ): WritebackProposal {
     const row = this.gateway.db.prepare("SELECT proposal_json FROM writeback_proposals WHERE id=?")
       .get(id) as { proposal_json: string } | undefined;
     if (!row) throw new Error("writeback proposal not found");
@@ -327,11 +779,25 @@ export class SessionStore {
     let resolvedItemId: string | undefined;
     if (decision === "accepted") {
       const session = this.getSession(current.sessionId)!;
+      const collection = this.getCollection(current.targetCollectionId)!;
+      const sensitivity = current.evidenceRefs.reduce<Sensitivity>((result, ref) => {
+        const item = this.getItem(ref);
+        return item ? maxSensitivity(result, item.sensitivity) : result;
+      }, maxSensitivity(
+        collection.defaultSensitivity,
+        review?.sensitivity ?? current.requestedSensitivity ?? "public",
+      ));
       resolvedItemId = this.addItem({
         collectionId: current.targetCollectionId, content: current.proposedContent,
         summary: current.proposedSummary,
-        origin: { principalId: session.ownerPrincipalId, sessionId: session.id },
-        authority: "owner-confirmed", sensitivity: "internal",
+        origin: {
+          principalId: review?.confirmedByPrincipalId ?? session.ownerPrincipalId,
+          sessionId: session.id,
+          proposedBy: current.requestedByPrincipalId,
+          confirmedBy: review?.confirmedByPrincipalId ?? session.ownerPrincipalId,
+          evidenceRefs: current.evidenceRefs.join(","),
+        },
+        authority: "owner-confirmed", sensitivity,
         supersedes: current.evidenceRefs,
       }).id;
     }
@@ -346,6 +812,10 @@ export class SessionStore {
   createInvite(invite: SessionInvite): void {
     if (invite.collectionIds.some((id) => !this.getCollection(id))) {
       throw new Error("invitation references an unknown context collection");
+    }
+    if (invite.collectionIds.some((id) =>
+      !this.getCollection(id)!.accessPolicy.allowedTrust.includes("guest-capability"))) {
+      throw new Error("invitation collection policy does not allow guest capabilities");
     }
     if (invite.maxSessionSeconds < 60 || invite.maxSessionSeconds > 604_800) {
       throw new Error("invitation session lease must be between 60 seconds and 7 days");
@@ -397,6 +867,46 @@ export class SessionStore {
     return invite;
   }
 
+  createGuestBinding(input: {
+    cookieHash: string;
+    sessionId: string;
+    principalId: string;
+    expiresAt: string;
+  }): void {
+    this.gateway.db.prepare(`
+      INSERT INTO guest_session_bindings(cookie_hash,session_id,principal_id,expires_at)
+      VALUES (?,?,?,?)
+    `).run(input.cookieHash, input.sessionId, input.principalId, input.expiresAt);
+  }
+
+  getGuestBinding(cookieHash: string): {
+    sessionId: string;
+    principalId: string;
+    expiresAt: string;
+  } | undefined {
+    const row = this.gateway.db.prepare(`
+      SELECT session_id,principal_id,expires_at FROM guest_session_bindings
+      WHERE cookie_hash=?
+    `).get(cookieHash) as {
+      session_id: string;
+      principal_id: string;
+      expires_at: string;
+    } | undefined;
+    if (!row) return undefined;
+    if (Date.parse(row.expires_at) <= Date.now()) {
+      this.gateway.db.prepare("DELETE FROM guest_session_bindings WHERE cookie_hash=?")
+        .run(cookieHash);
+      return undefined;
+    }
+    const session = this.getSession(row.session_id);
+    if (!session || session.status !== "active") return undefined;
+    return {
+      sessionId: row.session_id,
+      principalId: row.principal_id,
+      expiresAt: row.expires_at,
+    };
+  }
+
   private getSessionRaw(id: string): ExternalSession | undefined {
     const row = this.gateway.db.prepare("SELECT session_json FROM external_sessions WHERE id=?")
       .get(id) as { session_json: string } | undefined;
@@ -436,6 +946,7 @@ export class SessionStore {
       CREATE TABLE IF NOT EXISTS context_collections(
         id TEXT PRIMARY KEY,name TEXT NOT NULL,description TEXT NOT NULL,source_type TEXT NOT NULL,
         root_path TEXT,default_sensitivity TEXT NOT NULL,tags_json TEXT NOT NULL,
+        visibility TEXT NOT NULL DEFAULT 'private',public_alias TEXT,access_policy_json TEXT,
         created_at TEXT NOT NULL,updated_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS context_items(
@@ -448,6 +959,17 @@ export class SessionStore {
       CREATE TABLE IF NOT EXISTS context_grants(
         id TEXT PRIMARY KEY,session_id TEXT NOT NULL,grant_json TEXT NOT NULL,expires_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS requested_context_grants(
+        id TEXT PRIMARY KEY,session_id TEXT NOT NULL UNIQUE,grant_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS session_operation_grants(
+        id TEXT PRIMARY KEY,session_id TEXT NOT NULL UNIQUE,grant_json TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS session_action_grants(
+        id TEXT PRIMARY KEY,session_id TEXT NOT NULL UNIQUE,grant_json TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS external_sessions(
         id TEXT PRIMARY KEY,owner_agent_id TEXT NOT NULL,caller_principal_id TEXT NOT NULL,
         caller_peer_id TEXT,status TEXT NOT NULL,expires_at TEXT NOT NULL,
@@ -458,6 +980,19 @@ export class SessionStore {
         event_json TEXT NOT NULL,content_digest TEXT NOT NULL,created_at TEXT NOT NULL,
         UNIQUE(session_id,sequence)
       );
+      CREATE TABLE IF NOT EXISTS external_session_counters(
+        session_id TEXT PRIMARY KEY,next_sequence INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS external_tasks(
+        id TEXT PRIMARY KEY,session_id TEXT NOT NULL,external_task_id TEXT NOT NULL,
+        status TEXT NOT NULL,task_json TEXT NOT NULL,request_digest TEXT NOT NULL,
+        created_at TEXT NOT NULL,UNIQUE(session_id,external_task_id)
+      );
+      CREATE TABLE IF NOT EXISTS session_checkpoints(
+        id TEXT PRIMARY KEY,session_id TEXT NOT NULL,up_to_sequence INTEGER NOT NULL,
+        checkpoint_json TEXT NOT NULL,created_at TEXT NOT NULL,
+        UNIQUE(session_id,up_to_sequence)
+      );
       CREATE TABLE IF NOT EXISTS writeback_proposals(
         id TEXT PRIMARY KEY,session_id TEXT NOT NULL,status TEXT NOT NULL,
         proposal_json TEXT NOT NULL,created_at TEXT NOT NULL,reviewed_at TEXT
@@ -466,11 +1001,29 @@ export class SessionStore {
         id TEXT PRIMARY KEY,token_hash TEXT NOT NULL UNIQUE,invite_json TEXT NOT NULL,
         expires_at TEXT NOT NULL,redeemed_at TEXT,revoked_at TEXT
       );
+      CREATE TABLE IF NOT EXISTS guest_session_bindings(
+        cookie_hash TEXT PRIMARY KEY,session_id TEXT NOT NULL,principal_id TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS idx_external_sessions_caller
         ON external_sessions(caller_principal_id,status);
       CREATE INDEX IF NOT EXISTS idx_session_events
         ON external_session_events(session_id,sequence);
+      CREATE INDEX IF NOT EXISTS idx_external_tasks_session
+        ON external_tasks(session_id,created_at);
     `);
+    this.ensureColumn("context_collections", "visibility", "TEXT NOT NULL DEFAULT 'private'");
+    this.ensureColumn("context_collections", "public_alias", "TEXT");
+    this.ensureColumn("context_collections", "access_policy_json", "TEXT");
+  }
+
+  private ensureColumn(table: string, column: string, definition: string): void {
+    const columns = this.gateway.db.prepare(
+      `PRAGMA table_info(${table})`,
+    ).all() as { name: string }[];
+    if (!columns.some((candidate) => candidate.name === column)) {
+      this.gateway.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
   }
 }
 
@@ -479,12 +1032,37 @@ export function digest(value: unknown): string {
 }
 
 function mapCollection(row: Record<string, unknown>): ContextCollection {
+  const defaultSensitivity = String(row.default_sensitivity) as Sensitivity;
+  const accessPolicy = row.access_policy_json
+    ? JSON.parse(String(row.access_policy_json)) as ContextCollection["accessPolicy"]
+    : {
+        allowedCallerTypes: ["human", "agent"] as Array<"human" | "agent">,
+        allowedTrust: ["paired-gateway"] as Array<"paired-gateway">,
+        sensitivityCeiling: defaultSensitivity,
+        exactContentAllowed: false,
+        maxItems: 8,
+        maxTokens: 6000,
+        autoApprove: false,
+      };
   return {
     id: String(row.id), name: String(row.name), description: String(row.description),
     sourceType: String(row.source_type) as ContextCollection["sourceType"],
     rootPath: row.root_path ? String(row.root_path) : undefined,
-    defaultSensitivity: String(row.default_sensitivity) as Sensitivity,
+    defaultSensitivity,
     tags: JSON.parse(String(row.tags_json)) as string[],
+    visibility: (row.visibility
+      ? String(row.visibility)
+      : "private") as ContextCollection["visibility"],
+    publicAlias: row.public_alias ? String(row.public_alias) : undefined,
+    accessPolicy,
     createdAt: String(row.created_at), updatedAt: String(row.updated_at),
   };
+}
+
+function minSensitivity(left: Sensitivity, right: Sensitivity): Sensitivity {
+  return SENSITIVITY[Math.min(SENSITIVITY.indexOf(left), SENSITIVITY.indexOf(right))];
+}
+
+function maxSensitivity(left: Sensitivity, right: Sensitivity): Sensitivity {
+  return SENSITIVITY[Math.max(SENSITIVITY.indexOf(left), SENSITIVITY.indexOf(right))];
 }

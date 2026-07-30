@@ -43,6 +43,10 @@ export class AcpAdapter implements AgentAdapter {
       process.env.JAMAI_ACP_MEMORY_ISOLATION === "confirmed" ? "controlled" : "unknown"
     ) as "controlled" | "unknown",
     separateMemoryNamespace: process.env.JAMAI_ACP_MEMORY_ISOLATION === "confirmed",
+    memoryIsolationAssurance: (
+      process.env.JAMAI_ACP_MEMORY_ISOLATION === "confirmed"
+        ? "operator-attested" : "unknown"
+    ) as "operator-attested" | "unknown",
     toolPermissionHooks: true,
     structuredContextualOutput: false,
   };

@@ -50,8 +50,8 @@ import { SessionStore, digest as sessionDigest } from "./session/store.js";
 import { buildContextPrompt, indexExplicitFile } from "./session/context.js";
 import { normalizeContextualAnswer } from "./session/answer.js";
 import type {
-  AgentProfile, ExternalSession, ExternalSessionEnvelope, Sensitivity, SessionInvite,
-  SessionStatus,
+  AgentProfile, ContextCollection, ExternalSession, ExternalSessionEnvelope, Sensitivity,
+  SessionInvite, SessionStatus,
 } from "./session/types.js";
 
 const config = loadConfig();
@@ -73,16 +73,18 @@ const sessions = new SessionStore(store);
 const guestRateWindows = new Map<string, { startedAt: number; count: number }>();
 const peers = new PeerRegistry();
 const discovery = new LanDiscovery({ id: nodeId, name: config.name, port: config.port }, peers);
-const defaultProfile: AgentProfile = sessions.getProfile(agentId) ?? sessions.saveProfile({
+const storedProfile = sessions.getProfile(agentId);
+const defaultProfile: AgentProfile = sessions.saveProfile({
   agentId,
-  displayName: config.name,
-  description: "A human-owned, context-bearing AI reachable through JAMA.",
-  expertise: [],
-  operations: ["ask", "review", "delegate", "execute"],
-  artifactTypes: ["text", "report", "patch", "artifact"],
-  allowHuman: true,
-  allowAgent: true,
-  allowGuest: false,
+  displayName: storedProfile?.displayName ?? config.name,
+  description: storedProfile?.description
+    ?? "A human-owned, context-bearing AI reachable through JAMA.",
+  expertise: storedProfile?.expertise ?? [],
+  operations: storedProfile?.operations ?? ["ask", "review", "delegate", "execute"],
+  artifactTypes: storedProfile?.artifactTypes ?? ["text", "report", "patch", "artifact"],
+  allowHuman: storedProfile?.allowHuman ?? true,
+  allowAgent: storedProfile?.allowAgent ?? true,
+  allowGuest: storedProfile?.allowGuest ?? false,
   adapter: adapter.capabilities,
   updatedAt: new Date().toISOString(),
 });
@@ -145,8 +147,24 @@ const handler = secureTaskControls(baseHandler, store, identity, groups);
 // Public surface: Agent Card and signed A2A only.
 const publicApp = express();
 publicApp.use(express.json({ limit: "1mb" }));
-publicApp.get("/external/capabilities", (_req, res) =>
-  res.json(publicProfile(sessions.getProfile(agentId) ?? defaultProfile, sessions)));
+publicApp.get("/external/capabilities", (req, res) => {
+  const verified = verifySignedRequest(
+    decodeSignedRequest(req.header(JAMAI_AUTH_HEADER)),
+    { audiencePeerId: nodeId, action: "capabilities.get" },
+    store,
+  );
+  if (!verified.ok) return res.status(401).json({ error: verified.reason });
+  const sharedGroup = groups.listWorkgroups().some((workgroup) =>
+    groups.findLocalMember(workgroup.id, verified.peerId));
+  const visible = sessions.listCollections().filter((collection) =>
+    collection.name !== "External Thread Memory"
+    && collection.accessPolicy.allowedTrust.includes("paired-gateway")
+    && (
+      collection.visibility === "paired-discoverable"
+      || (collection.visibility === "group-discoverable" && sharedGroup)
+    ));
+  return res.json(publicProfile(sessions.getProfile(agentId) ?? defaultProfile, sessions, visible));
+});
 publicApp.post("/external/sessions", async (req, res) => {
   try {
     const verified = verifySignedRequest(
@@ -187,10 +205,36 @@ publicApp.post("/external/sessions", async (req, res) => {
         throw new Error("Group role does not grant context access");
       }
     }
+    const callerType = req.body?.callerType === "agent" ? "agent" : "human";
+    const requestedContext = {
+      collections: stringArray(req.body?.collectionIds),
+      sensitivity: parseSensitivity(req.body?.sensitivityCeiling),
+      mode: req.body?.exactContentAllowed === true ? "exact" as const : "summary" as const,
+      maxItems: boundedNumber(req.body?.maxItems, 8, 1, 50),
+      maxTokens: boundedNumber(req.body?.maxTokens, 6000, 256, 50_000),
+      tags: stringArray(req.body?.tags),
+    };
+    const policyGrant = sessions.evaluateContextRequest({
+      collections: requestedContext.collections,
+      requestedSensitivity: requestedContext.sensitivity,
+      requestedMode: requestedContext.mode,
+      requestedMaxItems: requestedContext.maxItems,
+      requestedMaxTokens: requestedContext.maxTokens,
+      callerType,
+      callerTrust: "paired-gateway",
+      requireAutoApprove: config.policy === "auto",
+      groupAuthorized: Boolean(requestedGroup),
+    });
+    const requestedOperations = parseSessionActions(req.body?.allowedActions) as
+      Array<"ask" | "task" | "review">;
+    const autoOperations = requestedOperations.filter((operation) =>
+      operation === "ask" ? profile.operations.includes("ask")
+        : operation === "review" ? profile.operations.includes("review")
+          : profile.operations.includes("delegate") || profile.operations.includes("execute"));
     const created = sessions.createSession({
       ownerPrincipalId: principalId,
       ownerAgentId: agentId,
-      callerType: req.body?.callerType === "agent" ? "agent" : "human",
+      callerType,
       callerPrincipalId: requiredString(req.body?.callerPrincipalId, "callerPrincipalId"),
       callerAgentId: typeof req.body?.callerAgentId === "string" ? req.body.callerAgentId : undefined,
       callerPeerId: verified.peerId,
@@ -201,17 +245,42 @@ publicApp.post("/external/sessions", async (req, res) => {
         ? groups.getWorkgroup(requestedGroup.id)?.policyVersion : undefined,
       groupMembershipVersion: requestedGroup
         ? groups.getWorkgroup(requestedGroup.id)?.membershipVersion : undefined,
-      collectionIds: stringArray(req.body?.collectionIds),
-      sensitivityCeiling: parseSensitivity(req.body?.sensitivityCeiling),
-      exactContentAllowed: req.body?.exactContentAllowed === true,
-      allowedActions: parseSessionActions(req.body?.allowedActions),
+      requestedContext,
+      issuedContext: {
+        collections: config.policy === "auto" ? policyGrant.collections : [],
+        sensitivityCeiling: config.policy === "auto"
+          ? policyGrant.sensitivityCeiling : "public",
+        exactContentAllowed: config.policy === "auto" && policyGrant.exactContentAllowed,
+        maxItems: config.policy === "auto" ? policyGrant.maxItems : 1,
+        maxTokens: config.policy === "auto" ? policyGrant.maxTokens : 256,
+        issuedByOwnerPolicy: config.policy === "auto"
+          ? "collection-auto-policy" : "pending-owner-consent",
+      },
+      operationGrant: {
+        allowedOperations: config.policy === "auto" ? autoOperations : requestedOperations,
+        issuedByOwnerPolicy: config.policy === "auto"
+          ? "owner-auto-policy" : "pending-owner-consent",
+      },
+      actionGrant: {
+        allowedScopes: [],
+        deniedScopes: [],
+        resources: [],
+        approvalRule: "per-tool",
+        issuedByOwnerPolicy: "deny-by-default",
+      },
       leaseSeconds: typeof req.body?.leaseSeconds === "number" ? req.body.leaseSeconds : undefined,
       status: config.policy === "auto" ? "active" : "awaiting_owner_consent",
       a2aContextId: randomUUID(),
     });
     const signed = {
       ...created,
-      proof: gatewayIdentity.signStatement({ session: created.session, grant: created.grant }),
+      proof: gatewayIdentity.signStatement({
+        session: created.session,
+        requestedGrant: created.requestedGrant,
+        grant: created.grant,
+        operationGrant: created.operationGrant,
+        actionGrant: created.actionGrant,
+      }),
     };
     store.appendAudit({
       eventType: "external-session.opened", principalId, agentId, peerId: verified.peerId,
@@ -251,29 +320,100 @@ publicApp.post("/external/sessions/:id/messages", async (req, res) => {
       session,
       grantDigest: sessionDigest(sessions.getGrant(session.contextGrantId)),
     });
-    if (!session.allowedActions.includes(operation)) {
+    const operationGrant = sessions.getOperationGrant(session.operationGrantId);
+    if (
+      !operationGrant
+      || Date.parse(operationGrant.expiresAt) <= Date.now()
+      || !operationGrant.allowedOperations.includes(operation)
+    ) {
       return res.status(403).json({ error: `session does not allow ${operation}` });
     }
+    const contextGrant = sessions.getGrant(session.contextGrantId);
+    if (
+      contextGrant?.allowedCollections.length
+      && adapter.capabilities.memoryIsolationAssurance !== "enforced"
+      && process.env.JAMAI_ALLOW_OPERATOR_ATTESTED_EXTERNAL_CONTEXT !== "true"
+    ) {
+      throw new Error(
+        `context-rich External Session requires enforced memory isolation; adapter provides ${
+          adapter.capabilities.memoryIsolationAssurance
+        }`,
+      );
+    }
     let task: Record<string, unknown> | undefined;
+    let taskAuthority: {
+      allowedScopes: string[];
+      deniedScopes: string[];
+      resources: string[];
+    } | undefined;
     if (operation === "task") {
       if (!req.body?.task || typeof req.body.task !== "object" || Array.isArray(req.body.task)) {
         throw new Error("session task payload is required");
       }
       task = req.body.task as Record<string, unknown>;
       const taskId = requiredString(task.id, "task.id");
-      requiredString(task.objective, "task.objective");
-      if (sessions.listEvents(session.id).some((event) =>
-        event.type === "task"
-        && event.content
-        && typeof event.content === "object"
-        && (event.content as Record<string, unknown>).id === taskId)) {
-        throw new Error("External Session task ID is immutable and already exists");
+      const objective = requiredString(task.objective, "task.objective");
+      const actionGrant = sessions.getActionGrant(session.actionGrantId);
+      if (!actionGrant || Date.parse(actionGrant.expiresAt) <= Date.now()) {
+        throw new Error("session action grant is missing or expired");
       }
+      const requestedScopes = stringArray(task.requestedScopes);
+      const taskDeniedScopes = stringArray(task.deniedScopes);
+      const requestedResources = stringArray(task.resources);
+      const allowedScopes = requestedScopes.filter((scope) =>
+        actionGrant.allowedScopes.includes("*") || actionGrant.allowedScopes.includes(scope));
+      if (allowedScopes.length !== requestedScopes.length) {
+        throw new Error("task requests scopes outside the Session Action Grant");
+      }
+      if (requestedResources.some((resource) =>
+        !actionGrant.resources.includes("*") && !actionGrant.resources.includes(resource))) {
+        throw new Error("task requests resources outside the Session Action Grant");
+      }
+      const deniedScopes = [...new Set([...actionGrant.deniedScopes, ...taskDeniedScopes])];
+      taskAuthority = { allowedScopes, deniedScopes, resources: requestedResources };
+      if (actionGrant.approvalRule === "per-task" && allowedScopes.length > 0) {
+        const requestHash = sessionDigest({ sessionId: session.id, task });
+        const binding = {
+          peerId: verified.peerId,
+          taskId,
+          contextId: session.id,
+          requestHash,
+        };
+        const approval = typeof req.body?.taskApprovalId === "string"
+          ? store.consumeApproval(req.body.taskApprovalId, binding)
+          : undefined;
+        if (!approval) {
+          const pending = store.createApproval({ ...binding, requestedScopes: allowedScopes });
+          return res.status(202).json({
+            status: "OWNER_TASK_APPROVAL_REQUIRED",
+            approvalId: pending.id,
+            taskId,
+            requestHash,
+            task,
+          });
+        }
+        taskAuthority.allowedScopes = allowedScopes.filter((scope) =>
+          approval.approvedScopes.includes(scope));
+        taskAuthority.deniedScopes = [...new Set([
+          ...taskAuthority.deniedScopes,
+          ...approval.deniedScopes,
+        ])];
+      }
+      sessions.registerTask({
+        sessionId: session.id,
+        externalTaskId: taskId,
+        objective,
+        requestDigest: sessionDigest(task),
+        requestedScopes,
+        deniedScopes,
+        resources: requestedResources,
+      });
     }
     return res.json(await executeExternalMessage(
       session.id, requiredString(req.body?.message, "message"),
       operation === "task" ? "task" : "caller-message",
       task,
+      taskAuthority,
     ));
   } catch (error) {
     return res.status(400).json({ error: String(error) });
@@ -319,6 +459,8 @@ publicApp.post("/external/sessions/:id/writebacks", (req, res) => {
       proposedSummary: requiredString(req.body?.proposedSummary, "proposedSummary"),
       evidenceRefs,
       requestedByPrincipalId: session.callerPrincipalId,
+      requestedSensitivity: req.body?.requestedSensitivity
+        ? parseSensitivity(req.body.requestedSensitivity) : undefined,
     });
     sessions.appendEvent(session.id, "status", session.callerPrincipalId, {
       writebackProposalId: proposal.id,
@@ -356,7 +498,16 @@ publicApp.get("/external/sessions/:id", (req, res) => {
   if (!session || session.callerPeerId !== verified.peerId) {
     return res.status(404).json({ error: "external session not found" });
   }
-  return res.json({ session, events: sessions.listEvents(session.id) });
+  const state = {
+    session,
+    requestedGrant: sessions.getRequestedGrant(session.requestedContextGrantId),
+    grant: sessions.getGrant(session.contextGrantId),
+    operationGrant: sessions.getOperationGrant(session.operationGrantId),
+    actionGrant: sessions.getActionGrant(session.actionGrantId),
+    checkpoint: sessions.getCheckpoint(session.id),
+    events: sessions.listEvents(session.id),
+  };
+  return res.json({ ...state, proof: gatewayIdentity.signStatement(state) });
 });
 publicApp.post("/external/sessions/:id/close", (req, res) => {
   const verified = verifySignedRequest(
@@ -398,18 +549,60 @@ if (process.env.JAMAI_ENABLE_GUEST_INVITES === "true") {
       const token = requiredString(req.body?.token, "token");
       const invite = sessions.redeemInvite(createHash("sha256").update(token).digest("hex"));
       const guestPrincipalId = `guest:${randomUUID()}`;
+      const evaluated = sessions.evaluateContextRequest({
+        collections: invite.collectionIds,
+        requestedSensitivity: invite.sensitivityCeiling,
+        requestedMode: "summary",
+        requestedMaxItems: 8,
+        requestedMaxTokens: 6000,
+        callerType: "human",
+        callerTrust: "guest-capability",
+        requireAutoApprove: false,
+      });
       const created = sessions.createSession({
         ownerPrincipalId: principalId, ownerAgentId: invite.ownerAgentId, callerType: "human",
         callerPrincipalId: guestPrincipalId, callerTrust: "guest-capability",
-        purpose: invite.purpose, collectionIds: invite.collectionIds,
-        sensitivityCeiling: invite.sensitivityCeiling, allowedActions: invite.allowedActions,
+        purpose: invite.purpose,
+        requestedContext: {
+          collections: invite.collectionIds,
+          sensitivity: invite.sensitivityCeiling,
+          mode: "summary",
+          maxItems: 8,
+          maxTokens: 6000,
+        },
+        issuedContext: {
+          collections: invite.mode === "pre-authorized" ? evaluated.collections : [],
+          sensitivityCeiling: invite.mode === "pre-authorized"
+            ? evaluated.sensitivityCeiling : "public",
+          exactContentAllowed: false,
+          maxItems: invite.mode === "pre-authorized" ? evaluated.maxItems : 1,
+          maxTokens: invite.mode === "pre-authorized" ? evaluated.maxTokens : 256,
+          issuedByOwnerPolicy: invite.mode === "pre-authorized"
+            ? "owner-invitation" : "pending-owner-consent",
+          issuedByPrincipalId: principalId,
+        },
+        operationGrant: {
+          allowedOperations: invite.allowedActions as Array<"ask" | "task" | "review">,
+          issuedByOwnerPolicy: "owner-invitation",
+        },
+        actionGrant: {
+          allowedScopes: [],
+          deniedScopes: [],
+          resources: [],
+          approvalRule: "per-tool",
+          issuedByOwnerPolicy: "deny-by-default",
+        },
         leaseSeconds: invite.maxSessionSeconds,
         status: invite.mode === "pre-authorized" ? "active" : "awaiting_owner_consent",
         a2aContextId: randomUUID(),
       });
       const cookie = randomBytes(32).toString("base64url");
-      store.setMeta(`guest.cookie.${createHash("sha256").update(cookie).digest("hex")}`,
-        JSON.stringify({ sessionId: created.session.id, principalId: guestPrincipalId }));
+      sessions.createGuestBinding({
+        cookieHash: createHash("sha256").update(cookie).digest("hex"),
+        sessionId: created.session.id,
+        principalId: guestPrincipalId,
+        expiresAt: created.session.expiresAt,
+      });
       const secure = config.publicUrl.startsWith("https:") ? "; Secure" : "";
       res.setHeader("set-cookie",
         `jamai_guest=${cookie}; HttpOnly; SameSite=Strict; Path=/guest; Max-Age=${invite.maxSessionSeconds}${secure}`);
@@ -423,7 +616,7 @@ if (process.env.JAMAI_ENABLE_GUEST_INVITES === "true") {
       if (!consumeGuestRate(`message:${req.params.id}:${req.ip}`, 30, 60_000)) {
         return res.status(429).json({ error: "guest message rate limit exceeded" });
       }
-      const guest = guestCookie(req.header("cookie"), store);
+      const guest = guestCookie(req.header("cookie"), sessions);
       if (!guest || guest.sessionId !== req.params.id) throw new Error("invalid guest session");
       sessions.requireActive(req.params.id, guest.principalId);
       return res.json(await executeExternalMessage(
@@ -434,7 +627,7 @@ if (process.env.JAMAI_ENABLE_GUEST_INVITES === "true") {
     }
   });
   publicApp.get("/guest/sessions/:id/events", (req, res) => {
-    const guest = guestCookie(req.header("cookie"), store);
+    const guest = guestCookie(req.header("cookie"), sessions);
     if (!guest || guest.sessionId !== req.params.id) {
       return res.status(401).json({ error: "invalid guest session" });
     }
@@ -511,10 +704,11 @@ managementApp.get("/api/capabilities", (_req, res) => res.json({
 managementApp.get("/chat", (_req, res) => res.type("html").send(ownerPage()));
 managementApp.get("/api/remote-capabilities/:peerId", async (req, res) => {
   try {
-    const peer = requiredPairedPeer(req.params.peerId);
-    const response = await fetch(new URL("/external/capabilities", peer.url));
-    if (!response.ok) throw new Error(`remote gateway returned ${response.status}`);
-    return res.json(await response.json());
+    return res.json(await callRemoteSession(
+      req.params.peerId,
+      "/external/capabilities",
+      { action: "capabilities.get", method: "GET" },
+    ));
   } catch (error) { return res.status(400).json({ error: String(error) }); }
 });
 managementApp.post("/api/remote-external-sessions", async (req, res) => {
@@ -534,10 +728,19 @@ managementApp.post("/api/remote-external-sessions", async (req, res) => {
     const result = await callRemoteSession(peerId, "/external/sessions", {
       action: "session.open",
       body,
-    }) as { session?: ExternalSession; grant?: unknown; proof?: unknown };
+    }) as {
+      session?: ExternalSession; requestedGrant?: unknown; grant?: unknown;
+      operationGrant?: unknown; actionGrant?: unknown; proof?: unknown;
+    };
     const verified = verifySignedStatement(
       result.proof,
-      { session: result.session, grant: result.grant },
+      {
+        session: result.session,
+        requestedGrant: result.requestedGrant,
+        grant: result.grant,
+        operationGrant: result.operationGrant,
+        actionGrant: result.actionGrant,
+      },
       store,
     );
     if (!verified.ok || verified.peerId !== peerId || !result.session) {
@@ -572,7 +775,7 @@ managementApp.post("/api/remote-external-sessions/:id/messages", async (req, res
 managementApp.get("/api/remote-external-sessions/:id", async (req, res) => {
   try {
     const peerId = requiredString(req.query.peerId, "peerId");
-    return res.json(await callRemoteSession(
+    const result = await callRemoteSession(
       peerId,
       `/external/sessions/${encodeURIComponent(req.params.id)}`,
       {
@@ -581,7 +784,22 @@ managementApp.get("/api/remote-external-sessions/:id", async (req, res) => {
         payload: { sessionId: req.params.id },
         method: "GET",
       },
-    ));
+    ) as Record<string, unknown>;
+    const proof = result.proof;
+    const state = { ...result };
+    delete state.proof;
+    const verified = verifySignedStatement(proof, state, store);
+    if (!verified.ok || verified.peerId !== peerId) {
+      throw new Error("remote session state proof is invalid");
+    }
+    const session = result.session as ExternalSession | undefined;
+    if (session) {
+      store.setMeta(remoteSessionBindingKey(peerId, session.id), JSON.stringify({
+        purpose: session.purpose,
+        grantDigest: sessionDigest(result.grant),
+      }));
+    }
+    return res.json(result);
   } catch (error) { return res.status(400).json({ error: String(error) }); }
 });
 managementApp.post("/api/remote-external-sessions/:id/close", async (req, res) => {
@@ -628,6 +846,54 @@ managementApp.post("/api/context-collections", (req, res) => {
       rootPath: typeof req.body?.rootPath === "string" ? req.body.rootPath : undefined,
       defaultSensitivity: parseSensitivity(req.body?.defaultSensitivity),
       tags: stringArray(req.body?.tags),
+      visibility: parseCollectionVisibility(req.body?.visibility),
+      publicAlias: typeof req.body?.publicAlias === "string"
+        ? req.body.publicAlias.trim() || undefined : undefined,
+      accessPolicy: {
+        allowedCallerTypes: parseCallerTypes(req.body?.accessPolicy?.allowedCallerTypes),
+        allowedTrust: parseCallerTrust(req.body?.accessPolicy?.allowedTrust),
+        sensitivityCeiling: parseSensitivity(
+          req.body?.accessPolicy?.sensitivityCeiling ?? req.body?.defaultSensitivity,
+        ),
+        exactContentAllowed: req.body?.accessPolicy?.exactContentAllowed === true,
+        maxItems: boundedNumber(req.body?.accessPolicy?.maxItems, 8, 1, 50),
+        maxTokens: boundedNumber(req.body?.accessPolicy?.maxTokens, 6000, 256, 50_000),
+        autoApprove: req.body?.accessPolicy?.autoApprove === true,
+      },
+    }));
+  } catch (error) { return res.status(400).json({ error: String(error) }); }
+});
+managementApp.put("/api/context-collections/:id/policy", (req, res) => {
+  try {
+    const collection = sessions.getCollection(req.params.id);
+    if (!collection) throw new Error("context collection not found");
+    return res.json(sessions.updateCollectionPolicy(collection.id, {
+      visibility: parseCollectionVisibility(req.body?.visibility ?? collection.visibility),
+      publicAlias: typeof req.body?.publicAlias === "string"
+        ? req.body.publicAlias.trim() || undefined : collection.publicAlias,
+      accessPolicy: {
+        allowedCallerTypes: req.body?.accessPolicy?.allowedCallerTypes
+          ? parseCallerTypes(req.body.accessPolicy.allowedCallerTypes)
+          : collection.accessPolicy.allowedCallerTypes,
+        allowedTrust: req.body?.accessPolicy?.allowedTrust
+          ? parseCallerTrust(req.body.accessPolicy.allowedTrust)
+          : collection.accessPolicy.allowedTrust,
+        sensitivityCeiling: parseSensitivity(
+          req.body?.accessPolicy?.sensitivityCeiling
+          ?? collection.accessPolicy.sensitivityCeiling,
+        ),
+        exactContentAllowed: typeof req.body?.accessPolicy?.exactContentAllowed === "boolean"
+          ? req.body.accessPolicy.exactContentAllowed
+          : collection.accessPolicy.exactContentAllowed,
+        maxItems: boundedNumber(
+          req.body?.accessPolicy?.maxItems, collection.accessPolicy.maxItems, 1, 50,
+        ),
+        maxTokens: boundedNumber(
+          req.body?.accessPolicy?.maxTokens, collection.accessPolicy.maxTokens, 256, 50_000,
+        ),
+        autoApprove: typeof req.body?.accessPolicy?.autoApprove === "boolean"
+          ? req.body.accessPolicy.autoApprove : collection.accessPolicy.autoApprove,
+      },
     }));
   } catch (error) { return res.status(400).json({ error: String(error) }); }
 });
@@ -655,7 +921,11 @@ managementApp.get("/api/external-sessions/:id", (req, res) => {
   if (!session) return res.status(404).json({ error: "external session not found" });
   return res.json({
     session,
+    requestedGrant: sessions.getRequestedGrant(session.requestedContextGrantId),
     grant: sessions.getGrant(session.contextGrantId),
+    operationGrant: sessions.getOperationGrant(session.operationGrantId),
+    actionGrant: sessions.getActionGrant(session.actionGrantId),
+    checkpoint: sessions.getCheckpoint(session.id),
     events: sessions.listEvents(session.id),
   });
 });
@@ -671,6 +941,42 @@ managementApp.post("/api/external-sessions/:id/status", (req, res) => {
     if (!["requested", "awaiting_owner_consent", "active", "paused", "revoked",
       "expired", "closed"].includes(status)) throw new Error("invalid session status");
     return res.json(sessions.setSessionStatus(req.params.id, status as SessionStatus));
+  } catch (error) { return res.status(400).json({ error: String(error) }); }
+});
+managementApp.post("/api/external-sessions/:id/approve", (req, res) => {
+  try {
+    const session = sessions.getSession(req.params.id);
+    if (!session) throw new Error("external session not found");
+    const requested = sessions.getRequestedGrant(session.requestedContextGrantId);
+    const operation = sessions.getOperationGrant(session.operationGrantId);
+    if (!requested || !operation) throw new Error("session request grants are missing");
+    return res.json(sessions.approveSession({
+      sessionId: session.id,
+      ownerPrincipalId: principalId,
+      allowedCollections: Array.isArray(req.body?.allowedCollections)
+        ? stringArray(req.body.allowedCollections) : requested.requestedCollections,
+      sensitivityCeiling: parseSensitivity(
+        req.body?.sensitivityCeiling ?? requested.requestedSensitivity,
+      ),
+      exactContentAllowed: req.body?.exactContentAllowed === true,
+      maxItems: boundedNumber(
+        req.body?.maxItems, requested.requestedLimits.maxItems, 1,
+        requested.requestedLimits.maxItems,
+      ),
+      maxTokens: boundedNumber(
+        req.body?.maxTokens, requested.requestedLimits.maxTokens, 256,
+        requested.requestedLimits.maxTokens,
+      ),
+      allowedOperations: Array.isArray(req.body?.allowedOperations)
+        ? parseSessionActions(req.body.allowedOperations) as Array<"ask" | "task" | "review">
+        : operation.allowedOperations,
+      actionScopes: stringArray(req.body?.actionScopes),
+      deniedScopes: stringArray(req.body?.deniedScopes),
+      resources: stringArray(req.body?.resources),
+      actionApprovalRule: ["per-session", "per-task", "per-tool"]
+        .includes(String(req.body?.actionApprovalRule))
+        ? req.body.actionApprovalRule : "per-tool",
+    }));
   } catch (error) { return res.status(400).json({ error: String(error) }); }
 });
 managementApp.post("/api/external-sessions/:id/extend", (req, res) => {
@@ -690,6 +996,11 @@ managementApp.post("/api/writebacks/:id/resolve", (req, res) => {
     return res.json(sessions.resolveWriteback(
       req.params.id,
       decision as "accepted" | "rejected" | "superseded",
+      {
+        confirmedByPrincipalId: principalId,
+        sensitivity: req.body?.sensitivity
+          ? parseSensitivity(req.body.sensitivity) : undefined,
+      },
     ));
   } catch (error) { return res.status(400).json({ error: String(error) }); }
 });
@@ -1145,6 +1456,7 @@ async function executeExternalMessage(
   message: string,
   eventType: "caller-message" | "task" = "caller-message",
   task?: Record<string, unknown>,
+  taskAuthority?: { allowedScopes: string[]; deniedScopes: string[]; resources: string[] },
 ): Promise<unknown> {
   const session = sessions.getSession(sessionId);
   if (!session || session.status !== "active") throw new Error("external session is not active");
@@ -1161,54 +1473,82 @@ async function executeExternalMessage(
       throw new Error("external session group authority is stale");
     }
   }
-  if (
-    adapter.capabilities.nativeMemoryWriteControl !== "controlled"
-    || !adapter.capabilities.isolatedSessions
-  ) {
-    throw new Error("adapter cannot prove isolated external-session memory behavior");
+  if (!adapter.capabilities.isolatedSessions) {
+    throw new Error("adapter does not provide isolated External Sessions");
   }
   const callerEvent = sessions.appendEvent(
     session.id, eventType, session.callerPrincipalId, task ?? message, [],
   );
-  sessions.addItem({
-    collectionId: ensureThreadCollection(),
-    content: message,
-    summary: message.slice(0, 1000),
-    origin: {
-      principalId: session.callerPrincipalId,
-      agentId: session.callerAgentId,
-      sessionId: session.id,
-      messageId: callerEvent.id,
-    },
-    authority: "external-claim",
-    sensitivity: "internal",
-    supersedes: [],
-  });
   const projected = sessions.project(session, `${session.purpose} ${message}`);
+  if (
+    projected.length > 0
+    && adapter.capabilities.memoryIsolationAssurance !== "enforced"
+    && process.env.JAMAI_ALLOW_OPERATOR_ATTESTED_EXTERNAL_CONTEXT !== "true"
+  ) {
+    throw new Error(
+      `context-rich External Session requires enforced memory isolation; adapter provides ${
+        adapter.capabilities.memoryIsolationAssurance
+      }`,
+    );
+  }
   const thread = sessions.listEvents(session.id, 24);
-  const prompt = buildContextPrompt(session, projected, thread, message);
+  const checkpoint = sessions.getCheckpoint(session.id);
+  const prompt = buildContextPrompt(session, projected, thread, message, checkpoint);
+  store.appendAudit({
+    eventType: "external-session.context-projected",
+    principalId,
+    agentId,
+    peerId: session.callerPeerId,
+    contextId: session.a2aContextId,
+    action: "inject-context-projection",
+    resource: session.id,
+    inputDigest: callerEvent.contentDigest,
+    outputDigest: sessionDigest(projected.map((item) => ({
+      id: item.id,
+      sourceDigest: item.sourceDigest,
+      authority: item.authority,
+      sensitivity: item.sensitivity,
+    }))),
+    metadata: {
+      selectedContextRefs: projected.map((item) => item.id),
+      checkpointId: checkpoint?.id,
+      checkpointDigest: checkpoint?.summaryDigest,
+    },
+  });
   const controller = new AbortController();
   const previous = store.getAgentSession(session.id);
-  const result = await adapter.run({
-    prompt,
-    contextId: session.a2aContextId ?? session.id,
-    externalSessionId: session.id,
-    resumeSessionId: previous?.localSessionId,
-    taskId: randomUUID(),
-    signal: controller.signal,
-    approvedScopes: session.allowedActions,
-    deniedScopes: [],
-    onPermissionDecision: async (decision) => {
-      store.appendAudit({
-        eventType: "external-session.tool-decision", principalId, agentId,
-        peerId: session.callerPeerId, contextId: session.a2aContextId,
-        action: decision.toolName ?? decision.toolKind ?? "tool",
-        resource: session.id, decision: decision.allowed ? "allowed" : "denied",
-        decisionReason: decision.reason,
-        metadata: { matchedScope: decision.matchedScope, deniedByScope: decision.deniedByScope },
-      });
-    },
-  });
+  let result;
+  try {
+    result = await adapter.run({
+      prompt,
+      contextId: session.a2aContextId ?? session.id,
+      externalSessionId: session.id,
+      resumeSessionId: previous?.localSessionId,
+      taskId: typeof task?.id === "string" ? task.id : randomUUID(),
+      signal: controller.signal,
+      approvedScopes: taskAuthority?.allowedScopes ?? [],
+      deniedScopes: taskAuthority?.deniedScopes ?? [],
+      onPermissionDecision: async (decision) => {
+        store.appendAudit({
+          eventType: "external-session.tool-decision", principalId, agentId,
+          peerId: session.callerPeerId, contextId: session.a2aContextId,
+          action: decision.toolName ?? decision.toolKind ?? "tool",
+          resource: session.id, decision: decision.allowed ? "allowed" : "denied",
+          decisionReason: decision.reason,
+          metadata: {
+            matchedScope: decision.matchedScope,
+            deniedByScope: decision.deniedByScope,
+            taskResources: taskAuthority?.resources,
+          },
+        });
+      },
+    });
+  } catch (error) {
+    if (task && typeof task.id === "string") {
+      sessions.completeTask(session.id, task.id, "failed");
+    }
+    throw error;
+  }
   if (result.degradedRehydration) {
     store.appendAudit({
       eventType: "external-session.degraded-rehydration",
@@ -1265,6 +1605,10 @@ async function executeExternalMessage(
     },
     answer.disclosedContextRefs,
   ) : undefined;
+  if (task && typeof task.id === "string") {
+    sessions.completeTask(session.id, task.id, "completed");
+  }
+  sessions.maybeCheckpoint(session.id);
   store.appendAudit({
     eventType: "external-session.message-completed", principalId, agentId,
     peerId: session.callerPeerId, contextId: session.a2aContextId,
@@ -1289,27 +1633,21 @@ async function executeExternalMessage(
   };
 }
 
-function ensureThreadCollection(): string {
-  const existing = sessions.listCollections().find((item) =>
-    item.sourceType === "owner-summary" && item.name === "External Thread Memory");
-  return existing?.id ?? sessions.createCollection({
-    name: "External Thread Memory",
-    description: "Isolated untrusted claims from external sessions.",
-    sourceType: "owner-summary",
-    defaultSensitivity: "internal",
-    tags: ["external-thread"],
-  }).id;
-}
-
-function publicProfile(profile: AgentProfile, sessionStore: SessionStore): unknown {
+function publicProfile(
+  profile: AgentProfile,
+  sessionStore: SessionStore,
+  visibleCollections: ContextCollection[] = [],
+): unknown {
   return {
     ...profile,
-    contextCollections: sessionStore.listCollections().map((collection) => ({
+    contextCollections: visibleCollections.map((collection) => ({
       id: collection.id,
-      name: collection.name,
-      description: collection.description,
+      name: collection.publicAlias ?? collection.name,
+      description: collection.visibility === "paired-discoverable"
+        ? collection.description : "",
       tags: collection.tags,
       defaultSensitivity: collection.defaultSensitivity,
+      visibility: collection.visibility,
     })),
   };
 }
@@ -1394,15 +1732,12 @@ function parseSensitivity(value: unknown): Sensitivity {
 
 function guestCookie(
   header: string | undefined,
-  gateway: GatewayStore,
-): { sessionId: string; principalId: string } | undefined {
+  sessionStore: SessionStore,
+): { sessionId: string; principalId: string; expiresAt: string } | undefined {
   const value = header?.split(";").map((part) => part.trim())
     .find((part) => part.startsWith("jamai_guest="))?.slice("jamai_guest=".length);
   if (!value) return undefined;
-  const stored = gateway.getMeta(
-    `guest.cookie.${createHash("sha256").update(value).digest("hex")}`,
-  );
-  return stored ? JSON.parse(stored) as { sessionId: string; principalId: string } : undefined;
+  return sessionStore.getGuestBinding(createHash("sha256").update(value).digest("hex"));
 }
 
 function requiredPairedPeer(peerId: string): { peerId: string; publicKey: string; url: string } {
@@ -1548,7 +1883,14 @@ function ownerPage(): string {
   <script>
   async function api(path,method="GET",body){const r=await fetch(path,{method,headers:body?{"content-type":"application/json"}:{},
   body:body?JSON.stringify(body):undefined});const v=await r.json();if(!r.ok)alert(v.error||r.status);return v}
-  async function status(id,value){await api("/api/external-sessions/"+id+"/status","POST",{status:value});load()}
+  async function status(id,value){if(value==="active"){
+  const detail=await api("/api/external-sessions/"+id);const request=detail.requestedGrant;
+  await api("/api/external-sessions/"+id+"/approve","POST",{
+  allowedCollections:request.requestedCollections,sensitivityCeiling:request.requestedSensitivity,
+  exactContentAllowed:false,maxItems:request.requestedLimits.maxItems,
+  maxTokens:request.requestedLimits.maxTokens,allowedOperations:detail.operationGrant.allowedOperations,
+  actionScopes:[],deniedScopes:[],resources:[],actionApprovalRule:"per-tool"})}
+  else await api("/api/external-sessions/"+id+"/status","POST",{status:value});load()}
   async function extend(id){await api("/api/external-sessions/"+id+"/extend","POST",{additionalSeconds:3600});load()}
   async function resolve(id,decision){await api("/api/writebacks/"+id+"/resolve","POST",{decision});load()}
   let remoteSession;
@@ -1594,8 +1936,44 @@ function stringArray(value: unknown): string[] {
 }
 
 function parseSessionActions(value: unknown): string[] {
-  const actions = stringArray(value).filter((action) => action === "ask" || action === "task");
+  const actions = stringArray(value).filter((action) =>
+    action === "ask" || action === "task" || action === "review");
   return actions.length > 0 ? actions : ["ask"];
+}
+
+function boundedNumber(
+  value: unknown,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+): number {
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) throw new Error("numeric policy value is invalid");
+  return Math.min(Math.max(Math.floor(parsed), minimum), maximum);
+}
+
+function parseCollectionVisibility(value: unknown): ContextCollection["visibility"] {
+  return ["private", "paired-discoverable", "group-discoverable", "invite-only"]
+    .includes(String(value))
+    ? value as ContextCollection["visibility"]
+    : "private";
+}
+
+function parseCallerTypes(value: unknown): Array<"human" | "agent"> {
+  const parsed = stringArray(value).filter((item): item is "human" | "agent" =>
+    item === "human" || item === "agent");
+  return parsed.length > 0 ? parsed : ["human", "agent"];
+}
+
+function parseCallerTrust(
+  value: unknown,
+): Array<"paired-gateway" | "guest-capability"> {
+  const parsed = stringArray(value).filter(
+    (item): item is "paired-gateway" | "guest-capability" =>
+      item === "paired-gateway" || item === "guest-capability",
+  );
+  return parsed.length > 0 ? parsed : ["paired-gateway"];
 }
 
 function parseMemberStatus(value: unknown): "active" | "suspended" | "removed" {

@@ -8,6 +8,7 @@ export class MockAdapter implements AgentAdapter {
     sessionResume: true,
     nativeMemoryWriteControl: "controlled" as const,
     separateMemoryNamespace: true,
+    memoryIsolationAssurance: "enforced" as const,
     toolPermissionHooks: true,
     structuredContextualOutput: false,
   };
