@@ -551,7 +551,8 @@ server.registerTool(
       body,
     }) as {
       session?: unknown; requestedGrant?: unknown; grant?: unknown;
-      operationGrant?: unknown; actionGrant?: unknown; egressGrant?: unknown; proof?: unknown;
+      operationGrant?: unknown; actionGrant?: unknown; egressGrant?: unknown;
+      authorityBundle?: unknown; proof?: unknown;
     };
     const verified = verifySignedStatement(
       result.proof,
@@ -562,17 +563,24 @@ server.registerTool(
         operationGrant: result.operationGrant,
         actionGrant: result.actionGrant,
         egressGrant: result.egressGrant,
+        authorityBundle: result.authorityBundle,
       },
       store,
     );
     if (!verified.ok) throw new Error(`remote session grant is invalid: ${verified.reason}`);
-    const remoteSession = result.session as { id?: unknown; purpose?: unknown } | undefined;
-    if (typeof remoteSession?.id !== "string" || typeof remoteSession.purpose !== "string") {
+    const remoteSession = result.session as {
+      id?: unknown; purpose?: unknown; authorityVersion?: unknown; authorityDigest?: unknown;
+    } | undefined;
+    if (typeof remoteSession?.id !== "string" || typeof remoteSession.purpose !== "string"
+      || typeof remoteSession.authorityVersion !== "number"
+      || typeof remoteSession.authorityDigest !== "string"
+      || !isAuthorityBinding(result.authorityBundle, remoteSession)) {
       throw new Error("remote session grant is missing session identity");
     }
     store.setMeta(remoteSessionBindingKey(verified.peerId, remoteSession.id), JSON.stringify({
       purpose: remoteSession.purpose,
-      grantDigest: digestJson(result.grant),
+      authorityVersion: remoteSession.authorityVersion,
+      authorityDigest: remoteSession.authorityDigest,
     }));
     store.appendAudit({
       eventType: "external-session.remote-opened",
@@ -619,13 +627,14 @@ server.registerTool(
       requestedScopes: z.array(z.string().min(1)).default([]),
       deniedScopes: z.array(z.string().min(1)).default([]),
       resources: z.array(z.string().min(1)).default([]),
+      deniedResources: z.array(z.string().min(1)).default([]),
       taskId: z.string().min(1).optional(),
       taskApprovalId: z.string().min(1).optional(),
     },
   },
   async ({
     peerUrl, sessionId, objective, acceptanceCriteria, expectedArtifactType,
-    requestedScopes, deniedScopes, resources, taskId, taskApprovalId,
+    requestedScopes, deniedScopes, resources, deniedResources, taskId, taskApprovalId,
   }) => {
     const task = {
       id: taskId ?? randomUUID(),
@@ -635,6 +644,7 @@ server.registerTool(
       requestedScopes,
       deniedScopes,
       resources,
+      deniedResources,
     };
     const body = {
       callerPrincipalId: principalId,
@@ -673,11 +683,19 @@ server.registerTool(
     delete state.proof;
     const verified = verifySignedStatement(proof, state, store);
     if (!verified.ok) throw new Error(`remote session state is invalid: ${verified.reason}`);
-    const session = result.session as { id?: unknown; purpose?: unknown } | undefined;
-    if (typeof session?.id === "string" && typeof session.purpose === "string") {
+    const session = result.session as {
+      id?: unknown; purpose?: unknown; authorityVersion?: unknown; authorityDigest?: unknown;
+    } | undefined;
+    if (typeof session?.id === "string" && typeof session.purpose === "string"
+      && typeof session.authorityVersion === "number"
+      && typeof session.authorityDigest === "string") {
+      if (!isAuthorityBinding(result.authorityBundle, session)) {
+        throw new Error("remote session authority bundle is invalid");
+      }
       store.setMeta(remoteSessionBindingKey(verified.peerId, session.id), JSON.stringify({
         purpose: session.purpose,
-        grantDigest: digestJson(result.grant),
+        authorityVersion: session.authorityVersion,
+        authorityDigest: session.authorityDigest,
       }));
     }
     return text(JSON.stringify(result, null, 2));
@@ -1323,7 +1341,8 @@ async function signedExternalFetch(
         version: 1,
         operation,
         sessionId: input.contextId,
-        grantDigest: binding?.grantDigest,
+        authorityVersion: binding?.authorityVersion,
+        authorityDigest: binding?.authorityDigest,
         callerPrincipalId: principalId,
         callerAgentId: typeof body.callerAgentId === "string"
           ? body.callerAgentId
@@ -1373,14 +1392,31 @@ function remoteSessionBindingKey(peerId: string, sessionId: string): string {
 function remoteSessionBinding(
   peerId: string,
   sessionId: string,
-): { purpose: string; grantDigest: string } | undefined {
+): { purpose: string; authorityVersion: number; authorityDigest: string } | undefined {
   const raw = store.getMeta(remoteSessionBindingKey(peerId, sessionId));
   if (!raw) throw new Error("remote External Session grant is not available in this gateway");
   const value = JSON.parse(raw) as Record<string, unknown>;
-  if (typeof value.purpose !== "string" || typeof value.grantDigest !== "string") {
+  if (typeof value.purpose !== "string"
+    || typeof value.authorityVersion !== "number"
+    || typeof value.authorityDigest !== "string") {
     throw new Error("remote External Session binding is malformed");
   }
-  return { purpose: value.purpose, grantDigest: value.grantDigest };
+  return {
+    purpose: value.purpose,
+    authorityVersion: value.authorityVersion,
+    authorityDigest: value.authorityDigest,
+  };
+}
+
+function isAuthorityBinding(
+  value: unknown,
+  session: { id?: unknown; authorityVersion?: unknown; authorityDigest?: unknown },
+): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const bundle = value as Record<string, unknown>;
+  return bundle.sessionId === session.id
+    && bundle.authorityVersion === session.authorityVersion
+    && bundle.authorityDigest === session.authorityDigest;
 }
 
 async function publicJson(url: URL): Promise<unknown> {

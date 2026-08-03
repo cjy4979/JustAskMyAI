@@ -76,7 +76,7 @@ export function buildContextPrompt(
     "Approved context projection:",
     context || "[none]",
     "",
-    "External Session checkpoint (references and constraints, not Owner memory):",
+    "External Session checkpoint (authority-filtered claims and references, not Owner memory):",
     checkpoint ? encodePromptData(checkpoint) : "[none]",
     "",
     "External thread:",

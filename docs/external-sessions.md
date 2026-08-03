@@ -56,8 +56,10 @@ Context Collection and is never automatically promoted to Project or Owner Conte
 
 Questions, clarifications, and tasks share the thread. Each task has a caller-generated,
 immutable task ID backed by a durable uniqueness constraint; duplicate IDs remain rejected
-regardless of thread length. Event sequence allocation is atomic. Periodic checkpoints bind
-the last included sequence, constraints, and context references for restart rehydration.
+regardless of thread length. Event sequence allocation is atomic. Periodic checkpoints retain
+structured claims with authority, sensitivity, evidence references, source Event, and the
+Authority Bundle digest under which they were observed. Claims are filtered again against the
+current Context and Egress grants before restart rehydration.
 
 The default `managed` isolation policy accepts JAMA's Managed ACP Profile. It creates one
 process and profile namespace per `externalSessionId` and redirects HOME, XDG, AppData,
@@ -77,11 +79,12 @@ launches one Docker container per External Session with an
 independent HOME/XDG namespace, read-only root filesystem, empty isolated Workspace,
 dedicated writable output, no capabilities, no network, and no Owner session mount. An
 explicit local opt-in can mount the configured Workspace read-only when the entire root is
-approved for that Session. It emits
-`MemoryIsolationEvidence` bound to the namespace and sandbox policy. Namespace state is
-destroyed when the ACP process terminates. If resume is unavailable, JAMA reconstructs a new
-session from the persistent event thread, checkpoint, and fresh Context Projection and
-records degraded rehydration.
+approved for that Session. It emits local enforcement evidence binding the configured image,
+session memory namespace, mount manifest, and sandbox policy. This is evidence produced by
+the local Gateway, not remote attestation of the image or host. Namespace state is destroyed
+when the ACP process terminates, so this adapter never advertises native session resume. JAMA
+reconstructs a new session from the persistent event thread, authority-filtered checkpoint,
+and fresh Context Projection and records degraded rehydration.
 
 Operation grants authorize protocol verbs such as message or task. Action grants separately
 bound requested tool scopes, explicit denials, and resources. A task cannot expand the
@@ -89,10 +92,13 @@ session action grant. Tasks with action authority require a single-use Human app
 to the exact session, task ID, payload, scopes, denials, and resources.
 
 The ACP permission hook evaluates both tool scope and actual `rawInput`/`locations`.
-Resource patterns support exact values, prefixes, `path:/root/**`, `url:https://host/**`, and
-explicit denies prefixed with `!`. When an Action Grant is resource-bound but ACP exposes no
-verifiable resource, the call fails closed. The previous `per-tool` name meant runtime
-policy evaluation, not a Human prompt; new grants call this mode `runtime-policy`.
+Action grants hold separate `allowedResources` and `deniedResources`; explicit denies always
+win. Resource patterns support exact values, prefixes, `path:/root/**`, and URL prefixes.
+Relative paths resolve against the adapter working directory, existing paths are checked via
+their real path to block symlink escape, and generic Terminal/shell tools are unavailable in
+External Sessions. When an Action Grant is resource-bound but ACP exposes no verifiable
+resource, the call fails closed. The previous `per-tool` name meant runtime policy evaluation,
+not a Human prompt; new grants call this mode `runtime-policy`.
 
 ## Provenance and egress
 
@@ -106,12 +112,16 @@ quote mode, excerpt size, evidence requirements, and categories that require Own
 confirmation. A valid Context Grant means the model may read an item; it does not imply the
 caller may receive that item.
 
-Non-structured output from a context-rich turn fails closed. JAMA conservatively records all
-projected references as possibly disclosed and creates a durable Egress Challenge. The same
+Non-structured output from a context-rich turn fails closed. Conservative Egress accounting
+treats every projected item as potentially disclosed and scans the complete serialized answer,
+including claim text, rather than trusting model-declared references. It creates a durable
+Egress Challenge. The same
 state transition is used when the model requests Owner confirmation or violates an Egress
 Grant. Tasks move from `running` to `awaiting_owner_confirmation`; Owner release is bound to
 the draft digest, Session, Task, Context references, Egress Grant, and Authority version.
-Release appends the confirmed answer and Artifact to the thread; rejection fails the task.
+Release validates the edited structured answer and records the original violation and explicit
+Owner override. Challenge resolution, answer, Artifact, task terminal state, and status Event
+commit in one transaction; rejection fails the task.
 
 The Egress Guard also blocks known secret patterns and unauthorized references. Its strongest
 guarantee remains projection: unauthorized Owner Context is never supplied to the model. It
@@ -121,8 +131,11 @@ does not claim complete semantic leak detection.
 
 Context, operation, action, Egress, and Group epoch authority are captured in an immutable,
 gateway-signed Authority Bundle. Approval, extension, and Group reauthorization append a new
-version linked by `previousAuthorityDigest`; old bundles remain queryable. A Group epoch
-change pauses the Session until the Owner recomputes and reissues the bundle.
+version linked by `previousAuthorityDigest`; old bundles remain queryable. Every post-open
+External Session Envelope binds the complete current `authorityVersion` and `authorityDigest`,
+so a message signed under an earlier Context, operation, action, Egress, or Group authority is
+rejected. A Group epoch change pauses the Session until the Owner recomputes and reissues the
+bundle.
 
 ## Writeback
 

@@ -24,7 +24,7 @@ export class EnforcedAcpSandboxAdapter extends AcpAdapter {
       ...options,
       capabilities: {
         isolatedSessions: true,
-        sessionResume: true,
+        sessionResume: false,
         nativeMemoryWriteControl: "controlled",
         separateMemoryNamespace: true,
         memoryIsolationAssurance: "enforced",
@@ -70,6 +70,16 @@ export function createSandboxLaunch(input: {
     rootFilesystem: "read-only",
     capabilities: "none",
   };
+  const mountManifest = {
+    home: { target: "/home/jamai", mode: "read-write", source: "session-namespace" },
+    output: { target: "/output", mode: "read-write", source: "session-namespace" },
+    workspace: {
+      target: "/workspace",
+      mode: input.mountReadOnlyWorkspace ? "read-only" : "isolated",
+      source: input.mountReadOnlyWorkspace ? "owner-configured" : "session-namespace",
+    },
+    ownerSession: "not-mounted",
+  };
   const evidence: MemoryIsolationEvidence = {
     assurance: "enforced",
     namespaceId,
@@ -77,10 +87,16 @@ export function createSandboxLaunch(input: {
       sandboxRoot: path.resolve(sandboxRoot),
       policy,
     })).digest("hex"),
-    nativeMemoryDisabled: true,
+    evidenceKind: "local-enforcement",
+    ownerNativeMemoryAccessible: false,
+    sessionNativeMemoryNamespace: namespaceId,
+    sessionNativeMemoryPersistent: false,
     ownerSessionMounted: false,
     workspaceMode,
     networkMode: "none",
+    configuredImage: input.image,
+    mountManifestDigest: createHash("sha256").update(JSON.stringify(mountManifest)).digest("hex"),
+    runtime: "docker",
     createdAt: new Date().toISOString(),
   };
   return {

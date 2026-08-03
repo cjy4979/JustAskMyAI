@@ -49,6 +49,8 @@ import type {
 import { SessionStore, digest as sessionDigest } from "./session/store.js";
 import { buildContextPrompt, indexExplicitFile } from "./session/context.js";
 import { normalizeContextualAnswer } from "./session/answer.js";
+import { isAuthorityBinding, validateExternalEnvelope } from "./session/envelope.js";
+import { resourcePatternMatches } from "./policy/resource-permission.js";
 import type {
   AgentProfile, ContextAuthority, ContextCollection, EgressGrant, ExternalSession,
   ExternalSessionEnvelope, Sensitivity, SessionInvite, SessionStatus,
@@ -267,7 +269,8 @@ publicApp.post("/external/sessions", async (req, res) => {
       actionGrant: {
         allowedScopes: [],
         deniedScopes: [],
-        resources: [],
+        allowedResources: [],
+        deniedResources: [],
         approvalRule: "runtime-policy",
         issuedByOwnerPolicy: "deny-by-default",
       },
@@ -275,8 +278,11 @@ publicApp.post("/external/sessions", async (req, res) => {
       status: config.policy === "auto" ? "active" : "awaiting_owner_consent",
       a2aContextId: randomUUID(),
     });
+    const authorityBundle = sessions.getAuthorityBundle(created.session.id);
+    if (!authorityBundle) throw new Error("session authority bundle was not created");
     const signed = {
       ...created,
+      authorityBundle,
       proof: gatewayIdentity.signStatement({
         session: created.session,
         requestedGrant: created.requestedGrant,
@@ -284,6 +290,7 @@ publicApp.post("/external/sessions", async (req, res) => {
         operationGrant: created.operationGrant,
         actionGrant: created.actionGrant,
         egressGrant: created.egressGrant,
+        authorityBundle,
       }),
     };
     store.appendAudit({
@@ -322,7 +329,8 @@ publicApp.post("/external/sessions/:id/messages", async (req, res) => {
       operation: operation === "task" ? "session.task" : "session.message",
       body: req.body,
       session,
-      grantDigest: sessionDigest(sessions.getGrant(session.contextGrantId)),
+      authorityVersion: session.authorityVersion,
+      authorityDigest: session.authorityDigest,
     });
     const operationGrant = sessions.getOperationGrant(session.operationGrantId);
     if (
@@ -346,7 +354,8 @@ publicApp.post("/external/sessions/:id/messages", async (req, res) => {
     let taskAuthority: {
       allowedScopes: string[];
       deniedScopes: string[];
-      resources: string[];
+      allowedResources: string[];
+      deniedResources: string[];
     } | undefined;
     if (operation === "task") {
       if (!req.body?.task || typeof req.body.task !== "object" || Array.isArray(req.body.task)) {
@@ -362,17 +371,31 @@ publicApp.post("/external/sessions/:id/messages", async (req, res) => {
       const requestedScopes = stringArray(task.requestedScopes);
       const taskDeniedScopes = stringArray(task.deniedScopes);
       const requestedResources = stringArray(task.resources);
+      const taskDeniedResources = stringArray(task.deniedResources);
       const allowedScopes = requestedScopes.filter((scope) =>
         actionGrant.allowedScopes.includes("*") || actionGrant.allowedScopes.includes(scope));
       if (allowedScopes.length !== requestedScopes.length) {
         throw new Error("task requests scopes outside the Session Action Grant");
       }
       if (requestedResources.some((resource) =>
-        !actionGrant.resources.includes("*") && !actionGrant.resources.includes(resource))) {
+        !actionGrant.allowedResources.some((pattern) => resourcePatternMatches(pattern, resource)))) {
         throw new Error("task requests resources outside the Session Action Grant");
       }
+      const deniedResources = [...new Set([
+        ...actionGrant.deniedResources,
+        ...taskDeniedResources,
+      ])];
+      if (requestedResources.some((resource) =>
+        deniedResources.some((pattern) => resourcePatternMatches(pattern, resource)))) {
+        throw new Error("task requests an explicitly denied resource");
+      }
       const deniedScopes = [...new Set([...actionGrant.deniedScopes, ...taskDeniedScopes])];
-      taskAuthority = { allowedScopes, deniedScopes, resources: requestedResources };
+      taskAuthority = {
+        allowedScopes,
+        deniedScopes,
+        allowedResources: requestedResources,
+        deniedResources,
+      };
       if (actionGrant.approvalRule === "per-task" && allowedScopes.length > 0) {
         const requestHash = sessionDigest({ sessionId: session.id, task });
         const binding = {
@@ -408,7 +431,8 @@ publicApp.post("/external/sessions/:id/messages", async (req, res) => {
         requestDigest: sessionDigest(task),
         requestedScopes,
         deniedScopes,
-        resources: requestedResources,
+        requestedResources,
+        deniedResources,
       });
       sessions.completeTask(session.id, taskId, "running");
     }
@@ -444,7 +468,8 @@ publicApp.post("/external/sessions/:id/writebacks", (req, res) => {
       operation: "writeback.propose",
       body: req.body,
       session,
-      grantDigest: sessionDigest(sessions.getGrant(session.contextGrantId)),
+      authorityVersion: session.authorityVersion,
+      authorityDigest: session.authorityDigest,
     });
     const evidenceRefs = stringArray(req.body?.evidenceRefs);
     if (evidenceRefs.some((ref) => !sessions.evidenceRefBelongsToSession(session.id, ref))) {
@@ -543,7 +568,8 @@ publicApp.post("/external/sessions/:id/close", (req, res) => {
       operation: "session.close",
       body: req.body,
       session,
-      grantDigest: sessionDigest(sessions.getGrant(session.contextGrantId)),
+      authorityVersion: session.authorityVersion,
+      authorityDigest: session.authorityDigest,
     });
   } catch (error) {
     return res.status(400).json({ error: String(error) });
@@ -603,7 +629,8 @@ if (process.env.JAMAI_ENABLE_GUEST_INVITES === "true") {
         actionGrant: {
           allowedScopes: [],
           deniedScopes: [],
-          resources: [],
+          allowedResources: [],
+          deniedResources: [],
           approvalRule: "runtime-policy",
           issuedByOwnerPolicy: "deny-by-default",
         },
@@ -748,7 +775,8 @@ managementApp.post("/api/remote-external-sessions", async (req, res) => {
       body,
     }) as {
       session?: ExternalSession; requestedGrant?: unknown; grant?: unknown;
-      operationGrant?: unknown; actionGrant?: unknown; egressGrant?: unknown; proof?: unknown;
+      operationGrant?: unknown; actionGrant?: unknown; egressGrant?: unknown;
+      authorityBundle?: unknown; proof?: unknown;
     };
     const verified = verifySignedStatement(
       result.proof,
@@ -759,15 +787,18 @@ managementApp.post("/api/remote-external-sessions", async (req, res) => {
         operationGrant: result.operationGrant,
         actionGrant: result.actionGrant,
         egressGrant: result.egressGrant,
+        authorityBundle: result.authorityBundle,
       },
       store,
     );
-    if (!verified.ok || verified.peerId !== peerId || !result.session) {
+    if (!verified.ok || verified.peerId !== peerId || !result.session
+      || !isAuthorityBinding(result.authorityBundle, result.session)) {
       throw new Error(`remote session grant is invalid${verified.ok ? "" : `: ${verified.reason}`}`);
     }
     store.setMeta(remoteSessionBindingKey(peerId, result.session.id), JSON.stringify({
       purpose: result.session.purpose,
-      grantDigest: sessionDigest(result.grant),
+      authorityVersion: result.session.authorityVersion,
+      authorityDigest: result.session.authorityDigest,
     }));
     return res.status(201).json(result);
   } catch (error) { return res.status(400).json({ error: String(error) }); }
@@ -813,9 +844,13 @@ managementApp.get("/api/remote-external-sessions/:id", async (req, res) => {
     }
     const session = result.session as ExternalSession | undefined;
     if (session) {
+      if (!isAuthorityBinding(result.authorityBundle, session)) {
+        throw new Error("remote session authority bundle is invalid");
+      }
       store.setMeta(remoteSessionBindingKey(peerId, session.id), JSON.stringify({
         purpose: session.purpose,
-        grantDigest: sessionDigest(result.grant),
+        authorityVersion: session.authorityVersion,
+        authorityDigest: session.authorityDigest,
       }));
     }
     return res.json(result);
@@ -1018,7 +1053,8 @@ managementApp.post("/api/external-sessions/:id/approve", async (req, res) => {
         : operation.allowedOperations,
       actionScopes: stringArray(req.body?.actionScopes),
       deniedScopes: stringArray(req.body?.deniedScopes),
-      resources: stringArray(req.body?.resources),
+      allowedResources: stringArray(req.body?.allowedResources ?? req.body?.resources),
+      deniedResources: stringArray(req.body?.deniedResources),
       actionApprovalRule: ["per-session", "per-task", "runtime-policy", "per-tool"]
         .includes(String(req.body?.actionApprovalRule))
         ? req.body.actionApprovalRule : "runtime-policy",
@@ -1537,7 +1573,12 @@ async function executeExternalMessage(
   message: string,
   eventType: "caller-message" | "task" = "caller-message",
   task?: Record<string, unknown>,
-  taskAuthority?: { allowedScopes: string[]; deniedScopes: string[]; resources: string[] },
+  taskAuthority?: {
+    allowedScopes: string[];
+    deniedScopes: string[];
+    allowedResources: string[];
+    deniedResources: string[];
+  },
 ): Promise<unknown> {
   const session = sessions.getSession(sessionId);
   if (!session || session.status !== "active") {
@@ -1583,7 +1624,7 @@ async function executeExternalMessage(
     );
   }
   const thread = sessions.listEvents(session.id, 24);
-  const checkpoint = sessions.getCheckpoint(session.id);
+  const checkpoint = sessions.getCheckpointForAuthority(session);
   const prompt = buildContextPrompt(session, projected, thread, message, checkpoint);
   store.appendAudit({
     eventType: "external-session.context-projected",
@@ -1619,7 +1660,8 @@ async function executeExternalMessage(
       signal: controller.signal,
       approvedScopes: taskAuthority?.allowedScopes ?? [],
       deniedScopes: taskAuthority?.deniedScopes ?? [],
-      grantedResources: taskAuthority?.resources ?? [],
+      allowedResources: taskAuthority?.allowedResources ?? [],
+      deniedResources: taskAuthority?.deniedResources ?? [],
       onPermissionDecision: async (decision) => {
         store.appendAudit({
           eventType: "external-session.tool-decision", principalId, agentId,
@@ -1634,7 +1676,8 @@ async function executeExternalMessage(
             requestedUrls: decision.requestedUrls,
             matchedResources: decision.matchedResources,
             deniedResources: decision.deniedResources,
-            taskResources: taskAuthority?.resources,
+            taskAllowedResources: taskAuthority?.allowedResources,
+            taskDeniedResources: taskAuthority?.deniedResources,
           },
         });
       },
@@ -1817,52 +1860,6 @@ function streamSessionEvents(
   });
 }
 
-function validateExternalEnvelope(
-  value: unknown,
-  expected: {
-    operation: ExternalSessionEnvelope["operation"];
-    body: unknown;
-    session?: ExternalSession;
-    callerPrincipalId?: string;
-    purpose?: string;
-    grantDigest?: string;
-  },
-): void {
-  if (!value || typeof value !== "object") throw new Error("missing External Session Envelope");
-  const envelope = value as ExternalSessionEnvelope;
-  if (
-    envelope.version !== 1
-    || envelope.operation !== expected.operation
-    || typeof envelope.callerPrincipalId !== "string"
-    || typeof envelope.purpose !== "string"
-  ) {
-    throw new Error("malformed or mismatched External Session Envelope");
-  }
-  const body = expected.body && typeof expected.body === "object" && !Array.isArray(expected.body)
-    ? { ...expected.body as Record<string, unknown> }
-    : {};
-  delete body.envelope;
-  if (sessionDigest(envelope.payload) !== sessionDigest(body)) {
-    throw new Error("External Session Envelope payload mismatch");
-  }
-  if (expected.session) {
-    if (
-      envelope.sessionId !== expected.session.id
-      || envelope.callerPrincipalId !== expected.session.callerPrincipalId
-      || envelope.purpose !== expected.session.purpose
-      || envelope.grantDigest !== expected.grantDigest
-    ) {
-      throw new Error("External Session Envelope authority binding mismatch");
-    }
-  } else if (
-    envelope.sessionId !== undefined
-    || envelope.callerPrincipalId !== expected.callerPrincipalId
-    || envelope.purpose !== expected.purpose
-  ) {
-    throw new Error("External Session open Envelope binding mismatch");
-  }
-}
-
 function parseSensitivity(value: unknown): Sensitivity {
   return ["public", "internal", "confidential", "restricted"].includes(String(value))
     ? String(value) as Sensitivity
@@ -1891,15 +1888,22 @@ function remoteSessionBindingKey(peerId: string, sessionId: string): string {
 
 function remoteSessionBinding(peerId: string, sessionId: string): {
   purpose: string;
-  grantDigest: string;
+  authorityVersion: number;
+  authorityDigest: string;
 } {
   const raw = store.getMeta(remoteSessionBindingKey(peerId, sessionId));
   if (!raw) throw new Error("remote External Session grant is unavailable");
   const value = JSON.parse(raw) as Record<string, unknown>;
-  if (typeof value.purpose !== "string" || typeof value.grantDigest !== "string") {
+  if (typeof value.purpose !== "string"
+    || typeof value.authorityVersion !== "number"
+    || typeof value.authorityDigest !== "string") {
     throw new Error("remote External Session grant binding is malformed");
   }
-  return { purpose: value.purpose, grantDigest: value.grantDigest };
+  return {
+    purpose: value.purpose,
+    authorityVersion: value.authorityVersion,
+    authorityDigest: value.authorityDigest,
+  };
 }
 
 async function callRemoteSession(
@@ -1931,7 +1935,8 @@ async function callRemoteSession(
         version: 1,
         operation,
         sessionId: input.contextId,
-        grantDigest: binding?.grantDigest,
+        authorityVersion: binding?.authorityVersion,
+        authorityDigest: binding?.authorityDigest,
         callerPrincipalId: principalId,
         purpose: binding?.purpose ?? String(object.purpose ?? ""),
         payload: { ...object },
@@ -2029,7 +2034,7 @@ function ownerPage(): string {
   allowedCollections:request.requestedCollections,sensitivityCeiling:request.requestedSensitivity,
   exactContentAllowed:false,maxItems:request.requestedLimits.maxItems,
   maxTokens:request.requestedLimits.maxTokens,allowedOperations:detail.operationGrant.allowedOperations,
-  actionScopes:[],deniedScopes:[],resources:[],actionApprovalRule:"runtime-policy"})}
+  actionScopes:[],deniedScopes:[],allowedResources:[],deniedResources:[],actionApprovalRule:"runtime-policy"})}
   else await api("/api/external-sessions/"+id+"/status","POST",{status:value});load()}
   async function extend(id){await api("/api/external-sessions/"+id+"/extend","POST",{additionalSeconds:3600});load()}
   async function resolve(id,decision){await api("/api/writebacks/"+id+"/resolve","POST",{decision});load()}

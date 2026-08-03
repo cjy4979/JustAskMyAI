@@ -1,13 +1,20 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { GatewayStore } from "../storage/sqlite.js";
 import type {
-  AgentProfile, ContextCollection, ContextGrant, ContextItem, EgressChallenge, EgressGrant,
+  AgentProfile, CheckpointClaim, ContextAuthority, ContextCollection, ContextGrant, ContextItem,
+  EgressChallenge, EgressGrant,
   ExternalSession, ExternalSessionEvent, ExternalTaskRecord, IssuedContextGrant,
   RequestedContextGrant, Sensitivity, SessionActionGrant, SessionAuthorityBundle,
   SessionCheckpoint, SessionInvite, SessionOperationGrant, SessionStatus, WritebackProposal,
 } from "./types.js";
 
 const SENSITIVITY: Sensitivity[] = ["public", "internal", "confidential", "restricted"];
+const AUTHORITY_RANK: Record<ContextAuthority, number> = {
+  "external-claim": 0,
+  "agent-inference": 1,
+  "project-record": 2,
+  "owner-confirmed": 3,
+};
 
 export class SessionStore {
   constructor(
@@ -149,7 +156,8 @@ export class SessionStore {
       issuedByOwnerPolicy: string;
     };
     actionGrant?: {
-      allowedScopes: string[]; deniedScopes: string[]; resources: string[];
+      allowedScopes: string[]; deniedScopes: string[];
+      allowedResources?: string[]; deniedResources?: string[]; resources?: string[];
       approvalRule: "per-session" | "per-task" | "runtime-policy" | "per-tool";
       issuedByOwnerPolicy: string; issuedByPrincipalId?: string;
     };
@@ -160,6 +168,7 @@ export class SessionStore {
       maxQuoteCharacters?: number;
       requireEvidenceRefs?: boolean;
       requireOwnerConfirmationFor?: string[];
+      accountingMode?: EgressGrant["accountingMode"];
       issuedByOwnerPolicy: string;
       issuedByPrincipalId?: string;
     };
@@ -255,7 +264,10 @@ export class SessionStore {
       sessionId,
       allowedScopes: [...new Set(input.actionGrant?.allowedScopes ?? [])],
       deniedScopes: [...new Set(input.actionGrant?.deniedScopes ?? [])],
-      resources: [...new Set(input.actionGrant?.resources ?? [])],
+      allowedResources: [...new Set(
+        input.actionGrant?.allowedResources ?? input.actionGrant?.resources ?? [],
+      )],
+      deniedResources: [...new Set(input.actionGrant?.deniedResources ?? [])],
       approvalRule: input.actionGrant?.approvalRule === "per-tool"
         ? "runtime-policy"
         : input.actionGrant?.approvalRule ?? "runtime-policy",
@@ -281,6 +293,7 @@ export class SessionStore {
       requireOwnerConfirmationFor: [...new Set(
         input.egressGrant?.requireOwnerConfirmationFor ?? ["restricted"],
       )],
+      accountingMode: input.egressGrant?.accountingMode ?? "conservative",
       issuedByOwnerPolicy: input.egressGrant?.issuedByOwnerPolicy ?? "context-derived-default",
       issuedByPrincipalId: input.egressGrant?.issuedByPrincipalId,
       createdAt: now.toISOString(),
@@ -396,17 +409,22 @@ export class SessionStore {
       "SELECT grant_json FROM session_action_grants WHERE id=?",
     ).get(id) as { grant_json: string } | undefined;
     if (!row) return undefined;
-    const grant = JSON.parse(row.grant_json) as SessionActionGrant;
-    return grant.approvalRule === "per-tool"
-      ? { ...grant, approvalRule: "runtime-policy" }
-      : grant;
+    const grant = JSON.parse(row.grant_json) as SessionActionGrant & { resources?: string[] };
+    return {
+      ...grant,
+      allowedResources: grant.allowedResources ?? grant.resources ?? [],
+      deniedResources: grant.deniedResources ?? [],
+      approvalRule: grant.approvalRule === "per-tool" ? "runtime-policy" : grant.approvalRule,
+    };
   }
 
   getEgressGrant(id: string): EgressGrant | undefined {
     const row = this.gateway.db.prepare(
       "SELECT grant_json FROM session_egress_grants WHERE id=?",
     ).get(id) as { grant_json: string } | undefined;
-    return row ? JSON.parse(row.grant_json) as EgressGrant : undefined;
+    if (!row) return undefined;
+    const grant = JSON.parse(row.grant_json) as EgressGrant;
+    return { ...grant, accountingMode: grant.accountingMode ?? "conservative" };
   }
 
   getAuthorityBundle(sessionId: string, version?: number): SessionAuthorityBundle | undefined {
@@ -495,7 +513,8 @@ export class SessionStore {
     allowedOperations: Array<"ask" | "task" | "review">;
     actionScopes: string[];
     deniedScopes: string[];
-    resources: string[];
+    allowedResources: string[];
+    deniedResources: string[];
     actionApprovalRule: "per-session" | "per-task" | "runtime-policy" | "per-tool";
     egressAllowedAuthority?: EgressGrant["allowedAuthority"];
     egressAllowedSensitivity?: Sensitivity;
@@ -563,7 +582,8 @@ export class SessionStore {
       ...currentAction,
       allowedScopes: [...new Set(input.actionScopes)],
       deniedScopes: [...new Set(input.deniedScopes)],
-      resources: [...new Set(input.resources)],
+      allowedResources: [...new Set(input.allowedResources)],
+      deniedResources: [...new Set(input.deniedResources)],
       approvalRule: input.actionApprovalRule === "per-tool"
         ? "runtime-policy"
         : input.actionApprovalRule,
@@ -789,30 +809,40 @@ export class SessionStore {
   ): ExternalSessionEvent {
     this.gateway.db.exec("BEGIN IMMEDIATE");
     try {
-      const initial = Number((this.gateway.db.prepare(
-        "SELECT COALESCE(MAX(sequence),0)+1 AS sequence FROM external_session_events WHERE session_id=?",
-      ).get(sessionId) as { sequence: number }).sequence);
-      const counter = this.gateway.db.prepare(`
-        INSERT INTO external_session_counters(session_id,next_sequence) VALUES (?,?)
-        ON CONFLICT(session_id) DO UPDATE SET next_sequence=next_sequence+1
-        RETURNING next_sequence
-      `).get(sessionId, initial) as { next_sequence: number };
-      const event: ExternalSessionEvent = {
-        id: randomUUID(), sessionId, sequence: Number(counter.next_sequence), type, actorPrincipalId,
-        content, contentDigest: digest(content), contextRefs, createdAt: new Date().toISOString(),
-      };
-      this.gateway.db.prepare(`
-        INSERT INTO external_session_events(
-          id,session_id,sequence,type,event_json,content_digest,created_at
-        ) VALUES (?,?,?,?,?,?,?)
-      `).run(event.id, sessionId, event.sequence, type, JSON.stringify(event),
-        event.contentDigest, event.createdAt);
+      const event = this.appendEventInTransaction(
+        sessionId, type, actorPrincipalId, content, contextRefs,
+      );
       this.gateway.db.exec("COMMIT");
       return event;
     } catch (error) {
       this.gateway.db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  private appendEventInTransaction(
+    sessionId: string, type: ExternalSessionEvent["type"],
+    actorPrincipalId: string | undefined, content: unknown, contextRefs: string[],
+  ): ExternalSessionEvent {
+    const initial = Number((this.gateway.db.prepare(
+      "SELECT COALESCE(MAX(sequence),0)+1 AS sequence FROM external_session_events WHERE session_id=?",
+    ).get(sessionId) as { sequence: number }).sequence);
+    const counter = this.gateway.db.prepare(`
+      INSERT INTO external_session_counters(session_id,next_sequence) VALUES (?,?)
+      ON CONFLICT(session_id) DO UPDATE SET next_sequence=next_sequence+1
+      RETURNING next_sequence
+    `).get(sessionId, initial) as { next_sequence: number };
+    const event: ExternalSessionEvent = {
+      id: randomUUID(), sessionId, sequence: Number(counter.next_sequence), type, actorPrincipalId,
+      content, contentDigest: digest(content), contextRefs, createdAt: new Date().toISOString(),
+    };
+    this.gateway.db.prepare(`
+      INSERT INTO external_session_events(
+        id,session_id,sequence,type,event_json,content_digest,created_at
+      ) VALUES (?,?,?,?,?,?,?)
+    `).run(event.id, sessionId, event.sequence, type, JSON.stringify(event),
+      event.contentDigest, event.createdAt);
+    return event;
   }
 
   listEvents(sessionId: string, limit = 100): ExternalSessionEvent[] {
@@ -862,6 +892,13 @@ export class SessionStore {
       throw error;
     }
     return task;
+  }
+
+  getTask(sessionId: string, externalTaskId: string): ExternalTaskRecord | undefined {
+    const row = this.gateway.db.prepare(
+      "SELECT task_json FROM external_tasks WHERE session_id=? AND external_task_id=?",
+    ).get(sessionId, externalTaskId) as { task_json: string } | undefined;
+    return row ? JSON.parse(row.task_json) as ExternalTaskRecord : undefined;
   }
 
   completeTask(
@@ -936,61 +973,81 @@ export class SessionStore {
     if (input.expectedDraftDigest && input.expectedDraftDigest !== current.draftDigest) {
       throw new Error("egress challenge draft digest mismatch");
     }
+    const releasedAnswer = input.decision === "released"
+      ? validateReleasedAnswer(
+          input.releasedAnswer ?? current.draft,
+          new Set(current.projectedContextRefs),
+        )
+      : undefined;
     const resolvedAt = new Date().toISOString();
     const next: EgressChallenge = {
       ...current,
       status: input.decision,
       resolvedAt,
       resolvedByPrincipalId: input.ownerPrincipalId,
-      releasedAnswer: input.decision === "released"
-        ? input.releasedAnswer ?? current.draft
-        : undefined,
+      releasedAnswer,
+      ownerOverride: input.decision === "released",
+      originalEgressViolation: current.reason,
+      releasedAnswerDigest: releasedAnswer ? digest(releasedAnswer) : undefined,
     };
-    this.gateway.db.prepare(`
-      UPDATE egress_challenges SET status=?,challenge_json=?,resolved_at=? WHERE id=?
-    `).run(next.status, JSON.stringify(next), resolvedAt, next.id);
-    if (next.status === "released" && next.releasedAnswer) {
-      this.appendEvent(
-        current.sessionId,
-        "agent-message",
-        input.ownerPrincipalId,
-        {
-          ...next.releasedAnswer,
-          ownerConfirmedEgress: true,
-          egressChallengeId: current.id,
-          draftDigest: current.draftDigest,
-        },
-        next.releasedAnswer.disclosedContextRefs,
-      );
-      if (current.taskId) {
-        this.appendEvent(
+    this.gateway.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.gateway.db.prepare(`
+        UPDATE egress_challenges SET status=?,challenge_json=?,resolved_at=? WHERE id=?
+      `).run(next.status, JSON.stringify(next), resolvedAt, next.id);
+      if (next.status === "released" && next.releasedAnswer) {
+        this.appendEventInTransaction(
           current.sessionId,
-          "artifact",
+          "agent-message",
           input.ownerPrincipalId,
           {
-            taskId: current.taskId,
-            mediaType: "application/json",
-            result: next.releasedAnswer,
-            digest: digest(next.releasedAnswer),
+            ...next.releasedAnswer,
+            ownerConfirmedEgress: true,
+            ownerOverride: true,
+            originalEgressViolation: current.reason,
             egressChallengeId: current.id,
+            draftDigest: current.draftDigest,
+            releasedAnswerDigest: next.releasedAnswerDigest,
           },
           next.releasedAnswer.disclosedContextRefs,
         );
+        if (current.taskId) {
+          this.appendEventInTransaction(
+            current.sessionId,
+            "artifact",
+            input.ownerPrincipalId,
+            {
+              taskId: current.taskId,
+              mediaType: "application/json",
+              result: next.releasedAnswer,
+              digest: next.releasedAnswerDigest,
+              egressChallengeId: current.id,
+              ownerOverride: true,
+            },
+            next.releasedAnswer.disclosedContextRefs,
+          );
+        }
       }
+      if (current.taskId) {
+        this.completeTask(
+          current.sessionId,
+          current.taskId,
+          input.decision === "released" ? "completed" : "failed",
+        );
+      }
+      this.appendEventInTransaction(current.sessionId, "status", input.ownerPrincipalId, {
+        egressChallengeId: current.id,
+        decision: input.decision,
+        draftDigest: current.draftDigest,
+        ownerOverride: input.decision === "released",
+        originalEgressViolation: current.reason,
+        releasedAnswerDigest: next.releasedAnswerDigest,
+      }, current.projectedContextRefs);
+      this.gateway.db.exec("COMMIT");
+    } catch (error) {
+      this.gateway.db.exec("ROLLBACK");
+      throw error;
     }
-    if (current.taskId) {
-      this.completeTask(
-        current.sessionId,
-        current.taskId,
-        input.decision === "released" ? "completed" : "failed",
-      );
-    }
-    this.appendEvent(current.sessionId, "status", input.ownerPrincipalId, {
-      egressChallengeId: current.id,
-      decision: input.decision,
-      draftDigest: current.draftDigest,
-      releasedAnswerDigest: next.releasedAnswer ? digest(next.releasedAnswer) : undefined,
-    }, current.projectedContextRefs);
     return next;
   }
 
@@ -999,31 +1056,77 @@ export class SessionStore {
       SELECT checkpoint_json FROM session_checkpoints
       WHERE session_id=? ORDER BY up_to_sequence DESC LIMIT 1
     `).get(sessionId) as { checkpoint_json: string } | undefined;
-    return row ? JSON.parse(row.checkpoint_json) as SessionCheckpoint : undefined;
+    if (!row) return undefined;
+    const checkpoint = JSON.parse(row.checkpoint_json) as SessionCheckpoint;
+    return { ...checkpoint, confirmedClaims: checkpoint.confirmedClaims ?? [] };
+  }
+
+  getCheckpointForAuthority(session: ExternalSession): SessionCheckpoint | undefined {
+    const checkpoint = this.getCheckpoint(session.id);
+    if (!checkpoint) return undefined;
+    const confirmedClaims = checkpoint.confirmedClaims.filter((claim) =>
+      this.checkpointClaimAllowed(session, claim));
+    return {
+      ...checkpoint,
+      confirmedClaims,
+      confirmedConstraints: undefined,
+      summaryDigest: digest({
+        sourceCheckpointDigest: checkpoint.summaryDigest,
+        authorityDigest: session.authorityDigest,
+        confirmedClaims,
+      }),
+    };
   }
 
   maybeCheckpoint(sessionId: string, interval = 20): SessionCheckpoint | undefined {
     const events = this.listEvents(sessionId, 500);
     const latest = this.getCheckpoint(sessionId);
+    const session = this.getSessionRaw(sessionId);
+    if (!session) throw new Error("external session not found");
     const lastSequence = events.at(-1)?.sequence ?? 0;
     if (lastSequence === 0 || lastSequence - (latest?.upToSequence ?? 0) < interval) return latest;
-    const confirmedConstraints = [...new Set([...(latest?.confirmedConstraints ?? []), ...events.flatMap((event) => {
+    const newClaims = events.flatMap((event): CheckpointClaim[] => {
       if (event.type !== "agent-message" || !event.content || typeof event.content !== "object") {
         return [];
       }
       const claims = (event.content as { claims?: unknown }).claims;
       if (!Array.isArray(claims)) return [];
-      return claims.flatMap((claim) => {
+      return claims.flatMap((claim): CheckpointClaim[] => {
         if (!claim || typeof claim !== "object") return [];
         const value = claim as Record<string, unknown>;
-        return ["owner-confirmed", "project-record"].includes(String(value.status))
-          && typeof value.text === "string" ? [value.text] : [];
+        const authority = String(value.status);
+        const evidenceRefs = Array.isArray(value.evidenceRefs)
+          ? value.evidenceRefs.filter((ref): ref is string => typeof ref === "string")
+          : [];
+        if (
+          !["owner-confirmed", "project-record"].includes(authority)
+          || typeof value.text !== "string"
+          || evidenceRefs.length === 0
+        ) return [];
+        const items = evidenceRefs.map((ref) => this.getItem(ref));
+        if (items.some((item) => !item)) return [];
+        const checkpointClaim: CheckpointClaim = {
+          text: value.text,
+          authority: authority as CheckpointClaim["authority"],
+          sensitivity: items.reduce<Sensitivity>((level, item) =>
+            maxSensitivity(level, item!.sensitivity), "public"),
+          evidenceRefs,
+          disclosedAtEventId: event.id,
+          validUnderAuthorityDigest: session.authorityDigest,
+        };
+        return this.checkpointClaimAllowed(session, checkpointClaim) ? [checkpointClaim] : [];
       });
-    })])].slice(-50);
+    });
+    const claimMap = new Map<string, CheckpointClaim>();
+    for (const claim of [...(latest?.confirmedClaims ?? []), ...newClaims]) {
+      if (!this.checkpointClaimAllowed(session, claim)) continue;
+      claimMap.set(digest({ text: claim.text, evidenceRefs: claim.evidenceRefs }), claim);
+    }
+    const confirmedClaims = [...claimMap.values()].slice(-50);
     const checkpointBody = {
       sessionId,
       upToSequence: lastSequence,
-      confirmedConstraints,
+      confirmedClaims,
       unresolvedQuestions: [...new Set([...(latest?.unresolvedQuestions ?? []), ...events.filter((event) =>
         event.type === "caller-message"
         && typeof event.content === "string"
@@ -1046,6 +1149,31 @@ export class SessionStore {
     `).run(checkpoint.id, sessionId, checkpoint.upToSequence, JSON.stringify(checkpoint),
       checkpoint.createdAt);
     return checkpoint;
+  }
+
+  private checkpointClaimAllowed(session: ExternalSession, claim: CheckpointClaim): boolean {
+    const contextGrant = this.getGrant(session.contextGrantId);
+    const egressGrant = this.getEgressGrant(session.egressGrantId);
+    if (!contextGrant || !egressGrant || claim.evidenceRefs.length === 0) return false;
+    const sourceEvent = this.getSessionEvent(session.id, claim.disclosedAtEventId);
+    if (!sourceEvent || sourceEvent.type !== "agent-message"
+      || claim.evidenceRefs.some((ref) => !sourceEvent.contextRefs.includes(ref))) return false;
+    if (!egressGrant.allowedAuthority.includes(claim.authority)) return false;
+    if (SENSITIVITY.indexOf(claim.sensitivity)
+      > SENSITIVITY.indexOf(egressGrant.allowedSensitivity)) return false;
+    return claim.evidenceRefs.every((ref) => {
+      const item = this.getItem(ref);
+      return Boolean(
+        item
+        && AUTHORITY_RANK[item.authority] >= AUTHORITY_RANK[claim.authority]
+        && SENSITIVITY.indexOf(item.sensitivity) <= SENSITIVITY.indexOf(claim.sensitivity)
+        && contextGrant.allowedCollections.includes(item.collectionId)
+        && SENSITIVITY.indexOf(item.sensitivity)
+          <= SENSITIVITY.indexOf(contextGrant.sensitivityCeiling)
+        && SENSITIVITY.indexOf(item.sensitivity)
+          <= SENSITIVITY.indexOf(egressGrant.allowedSensitivity)
+      );
+    });
   }
 
   project(session: ExternalSession, query: string): ContextItem[] {
@@ -1431,6 +1559,7 @@ export class SessionStore {
         maxQuoteCharacters: 240,
         requireEvidenceRefs: contextGrant.allowedCollections.length > 0,
         requireOwnerConfirmationFor: ["restricted"],
+        accountingMode: "conservative",
         issuedByOwnerPolicy: "legacy-safe-migration",
         createdAt: contextGrant.createdAt,
         expiresAt: contextGrant.expiresAt,
@@ -1561,4 +1690,38 @@ function extractEvidenceRefs(value: unknown, depth = 0): string[] {
     }
   }
   return refs;
+}
+
+function validateReleasedAnswer(
+  value: unknown,
+  projectedRefs: Set<string>,
+): NonNullable<EgressChallenge["releasedAnswer"]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("released Egress answer must be a structured object");
+  }
+  const answer = value as Record<string, unknown>;
+  if (typeof answer.answer !== "string" || !Array.isArray(answer.claims)) {
+    throw new Error("released Egress answer requires answer and claims");
+  }
+  if (!Array.isArray(answer.disclosedContextRefs)
+    || !answer.disclosedContextRefs.every((ref) =>
+      typeof ref === "string" && projectedRefs.has(ref))) {
+    throw new Error("released Egress answer contains an invalid Context reference");
+  }
+  for (const rawClaim of answer.claims) {
+    if (!rawClaim || typeof rawClaim !== "object" || Array.isArray(rawClaim)) {
+      throw new Error("released Egress answer contains an invalid claim");
+    }
+    const claim = rawClaim as Record<string, unknown>;
+    if (typeof claim.text !== "string" || !Array.isArray(claim.evidenceRefs)
+      || !claim.evidenceRefs.every((ref) =>
+        typeof ref === "string" && projectedRefs.has(ref))) {
+      throw new Error("released Egress claim contains invalid evidence");
+    }
+  }
+  if (typeof answer.evidenceCoverage !== "number"
+    || typeof answer.ownerConfirmationRequired !== "boolean") {
+    throw new Error("released Egress answer has invalid provenance fields");
+  }
+  return value as NonNullable<EgressChallenge["releasedAnswer"]>;
 }

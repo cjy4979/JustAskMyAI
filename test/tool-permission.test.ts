@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { decideToolPermission } from "../src/policy/tool-permission.js";
 
 const options = [
@@ -54,7 +57,8 @@ test("runtime resource policy checks actual ACP paths and URLs", async () => {
     options,
     approvedScopes: ["read-workspace"],
     deniedScopes: [],
-    grantedResources: ["path:C:/projects/simulation-x/**"],
+    allowedResources: ["path:C:/projects/simulation-x/**"],
+    deniedResources: [],
   });
   assert.equal(allowed.decision.allowed, true);
   assert.equal(allowed.decision.matchedResources?.length, 1);
@@ -70,10 +74,8 @@ test("runtime resource policy checks actual ACP paths and URLs", async () => {
     options,
     approvedScopes: ["read-workspace"],
     deniedScopes: [],
-    grantedResources: [
-      "path:C:/projects/simulation-x/**",
-      "!path:C:/Users/Alice/**",
-    ],
+    allowedResources: ["path:C:/projects/simulation-x/**"],
+    deniedResources: ["path:C:/Users/Alice/**"],
   });
   assert.equal(denied.decision.allowed, false);
   assert.equal(denied.option?.optionId, "reject");
@@ -85,8 +87,85 @@ test("runtime resource policy checks actual ACP paths and URLs", async () => {
     options,
     approvedScopes: ["run-tools"],
     deniedScopes: [],
-    grantedResources: ["model:model-a"],
+    allowedResources: ["model:model-a"],
+    deniedResources: [],
   });
   assert.equal(unverifiable.decision.allowed, false);
   assert.match(unverifiable.decision.reason, /no verifiable resource/);
+});
+
+test("External Sessions deny generic terminal even when execute scope is granted", async () => {
+  const result = await decideToolPermission({
+    localToolsEnabled: true,
+    toolCall: { toolCallId: "terminal-1", kind: "execute", name: "powershell" },
+    options,
+    approvedScopes: ["run-tools"],
+    deniedScopes: [],
+    allowGenericTerminal: false,
+  });
+  assert.equal(result.decision.allowed, false);
+  assert.match(result.decision.reason, /generic Terminal tools are denied/);
+});
+
+test("relative resource paths resolve inside the adapter working directory", async () => {
+  const base = mkdtempSync(path.join(tmpdir(), "jamai-resource-relative-"));
+  try {
+    mkdirSync(path.join(base, "workspace"));
+    writeFileSync(path.join(base, "workspace", "model.json"), "{}");
+    const result = await decideToolPermission({
+      localToolsEnabled: true,
+      toolCall: {
+        toolCallId: "relative-1",
+        kind: "read",
+        name: "read_file",
+        rawInput: { file: "workspace/model.json" },
+      },
+      options,
+      approvedScopes: ["read-workspace"],
+      deniedScopes: [],
+      allowedResources: ["path:workspace/**"],
+      deniedResources: [],
+      resourceBasePath: base,
+    });
+    assert.equal(result.decision.allowed, true);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("realpath enforcement blocks a symlink escape from an allowed root", async (t) => {
+  const base = mkdtempSync(path.join(tmpdir(), "jamai-resource-link-"));
+  try {
+    const safe = path.join(base, "safe");
+    const outside = path.join(base, "outside");
+    mkdirSync(safe);
+    mkdirSync(outside);
+    writeFileSync(path.join(outside, "secret.txt"), "secret");
+    const link = path.join(safe, "linked");
+    try {
+      symlinkSync(outside, link, process.platform === "win32" ? "junction" : "dir");
+    } catch (error) {
+      t.skip(`symlink creation unavailable: ${String(error)}`);
+      return;
+    }
+    const result = await decideToolPermission({
+      localToolsEnabled: true,
+      toolCall: {
+        toolCallId: "link-1",
+        kind: "read",
+        name: "read_file",
+        rawInput: { path: path.join(link, "secret.txt") },
+      },
+      options,
+      approvedScopes: ["read-workspace"],
+      deniedScopes: [],
+      allowedResources: [`path:${safe.replaceAll("\\", "/")}/**`],
+      deniedResources: [],
+      resourceBasePath: base,
+    });
+    assert.equal(result.decision.allowed, false);
+    assert.match(result.decision.reason, /outside Action Grant/);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 });

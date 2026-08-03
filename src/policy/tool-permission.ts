@@ -19,7 +19,10 @@ export async function decideToolPermission(input: {
   options: PermissionOptionLike[];
   approvedScopes: Iterable<string>;
   deniedScopes: Iterable<string>;
-  grantedResources?: Iterable<string>;
+  allowedResources?: Iterable<string>;
+  deniedResources?: Iterable<string>;
+  resourceBasePath?: string;
+  allowGenericTerminal?: boolean;
   persistDecision?: (decision: PermissionDecision) => Promise<void>;
 }): Promise<{ decision: PermissionDecision; option?: PermissionOptionLike }> {
   const scopeDecision = evaluateToolScope(
@@ -31,10 +34,14 @@ export async function decideToolPermission(input: {
   const resourceDecision = evaluateToolResources({
     rawInput: input.toolCall.rawInput,
     locations: input.toolCall.locations ?? undefined,
-    grantedResources: input.grantedResources ?? [],
+    allowedResources: input.allowedResources ?? [],
+    deniedResources: input.deniedResources ?? [],
+    basePath: input.resourceBasePath,
   });
+  const terminalDenied = input.allowGenericTerminal === false
+    && isGenericTerminal(input.toolCall.kind, input.toolCall.name);
   const allowed = Boolean(
-    input.localToolsEnabled && scopeDecision.allowed && resourceDecision.allowed
+    input.localToolsEnabled && scopeDecision.allowed && resourceDecision.allowed && !terminalDenied
   );
   const desiredKind = allowed ? "allow_once" : "reject_once";
   let option = input.options.find((item) => item.kind === desiredKind);
@@ -55,6 +62,8 @@ export async function decideToolPermission(input: {
         ? `explicitly denied by scope ${scopeDecision.deniedByScope}`
         : !scopeDecision.matchedScope
           ? "tool action is outside approved scopes"
+          : terminalDenied
+            ? "generic Terminal tools are denied in External Sessions; use a structured tool or fixed command template"
           : !resourceDecision.allowed
             ? resourceDecision.reason ?? "tool resource is outside the Action Grant"
           : option
@@ -69,4 +78,10 @@ export async function decideToolPermission(input: {
     option = input.options.find((item) => item.kind === "reject_once");
   }
   return { decision, option };
+}
+
+function isGenericTerminal(kind: string | null | undefined, name: string | null | undefined): boolean {
+  if (kind !== "execute") return false;
+  const normalized = name?.trim().toLowerCase() ?? "";
+  return !normalized || /^(terminal|shell|command|exec|execute|bash|sh|cmd|powershell|pwsh)$/.test(normalized);
 }

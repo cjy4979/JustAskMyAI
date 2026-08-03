@@ -3,7 +3,10 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createSandboxLaunch } from "../src/adapters/acp-sandbox.js";
+import {
+  createSandboxLaunch,
+  EnforcedAcpSandboxAdapter,
+} from "../src/adapters/acp-sandbox.js";
 
 test("enforced ACP sandbox has isolated state, isolated workspace, and no network", async () => {
   const base = mkdtempSync(path.join(tmpdir(), "jamai-sandbox-test-"));
@@ -26,6 +29,11 @@ test("enforced ACP sandbox has isolated state, isolated workspace, and no networ
       sandboxBase: base,
     });
     assert.equal(first.memoryIsolationEvidence?.assurance, "enforced");
+    assert.equal(first.memoryIsolationEvidence?.evidenceKind, "local-enforcement");
+    assert.equal(first.memoryIsolationEvidence?.ownerNativeMemoryAccessible, false);
+    assert.equal(first.memoryIsolationEvidence?.sessionNativeMemoryPersistent, false);
+    assert.equal(first.memoryIsolationEvidence?.configuredImage, "example/agent:test");
+    assert.match(first.memoryIsolationEvidence?.mountManifestDigest ?? "", /^[a-f0-9]{64}$/);
     assert.equal(first.memoryIsolationEvidence?.ownerSessionMounted, false);
     assert.equal(first.memoryIsolationEvidence?.networkMode, "none");
     assert.notEqual(
@@ -57,4 +65,14 @@ test("enforced ACP sandbox has isolated state, isolated workspace, and no networ
     rmSync(base, { recursive: true, force: true });
     rmSync(workspace, { recursive: true, force: true });
   }
+});
+
+test("strict ephemeral sandbox never advertises native session resume", () => {
+  const adapter = new EnforcedAcpSandboxAdapter({
+    command: "agent",
+    args: ["acp"],
+    cwd: process.cwd(),
+    image: "example/agent:test",
+  });
+  assert.equal(adapter.capabilities.sessionResume, false);
 });

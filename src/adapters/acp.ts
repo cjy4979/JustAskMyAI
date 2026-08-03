@@ -40,7 +40,9 @@ interface AcpRuntime {
   queue: Promise<void>;
   approvedScopes: Set<string>;
   deniedScopes: Set<string>;
-  grantedResources: Set<string>;
+  allowedResources: Set<string>;
+  deniedResources: Set<string>;
+  allowGenericTerminal: boolean;
   degradedRehydration: boolean;
   onPermissionDecision?: (decision: PermissionDecision) => Promise<void>;
   memoryIsolationEvidence?: MemoryIsolationEvidence;
@@ -83,7 +85,9 @@ export class AcpAdapter implements AgentAdapter {
     runtime.chunks = [];
     runtime.approvedScopes = new Set(request.approvedScopes);
     runtime.deniedScopes = new Set(request.deniedScopes);
-    runtime.grantedResources = new Set(request.grantedResources ?? []);
+    runtime.allowedResources = new Set(request.allowedResources ?? []);
+    runtime.deniedResources = new Set(request.deniedResources ?? []);
+    runtime.allowGenericTerminal = !request.externalSessionId;
     runtime.onPermissionDecision = request.onPermissionDecision;
     const abort = () => {
       void runtime.connection.cancel({ sessionId: runtime.sessionId });
@@ -161,7 +165,9 @@ export class AcpAdapter implements AgentAdapter {
     runtime.queue = Promise.resolve();
     runtime.approvedScopes = new Set();
     runtime.deniedScopes = new Set();
-    runtime.grantedResources = new Set();
+    runtime.allowedResources = new Set();
+    runtime.deniedResources = new Set();
+    runtime.allowGenericTerminal = true;
     runtime.degradedRehydration = false;
     runtime.memoryIsolationEvidence = launch.memoryIsolationEvidence;
     runtime.cleanup = launch.cleanup;
@@ -189,7 +195,10 @@ export class AcpAdapter implements AgentAdapter {
           options,
           approvedScopes: runtime.approvedScopes,
           deniedScopes: runtime.deniedScopes,
-          grantedResources: runtime.grantedResources,
+          allowedResources: runtime.allowedResources,
+          deniedResources: runtime.deniedResources,
+          resourceBasePath: runtime.agentCwd,
+          allowGenericTerminal: runtime.allowGenericTerminal,
           persistDecision: runtime.onPermissionDecision,
         });
         return option

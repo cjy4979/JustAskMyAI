@@ -19,7 +19,8 @@ export interface AgentRequest {
   signal: AbortSignal;
   approvedScopes: string[];
   deniedScopes: string[];
-  grantedResources?: string[];
+  allowedResources?: string[];
+  deniedResources?: string[];
   externalSessionId?: string;
   resumeSessionId?: string;
   onPermissionDecision?: (decision: PermissionDecision) => Promise<void>;

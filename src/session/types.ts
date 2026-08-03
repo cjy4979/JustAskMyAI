@@ -15,10 +15,16 @@ export interface EnforcedMemoryIsolationEvidence {
   assurance: "enforced";
   namespaceId: string;
   sandboxRootDigest: string;
-  nativeMemoryDisabled: boolean;
+  evidenceKind: "local-enforcement";
+  ownerNativeMemoryAccessible: false;
+  sessionNativeMemoryNamespace: string;
+  sessionNativeMemoryPersistent: false;
   ownerSessionMounted: false;
   workspaceMode: "isolated" | "read-only";
   networkMode: "none";
+  configuredImage: string;
+  mountManifestDigest: string;
+  runtime: "docker";
   createdAt: string;
 }
 
@@ -139,7 +145,8 @@ export interface SessionActionGrant {
   sessionId: string;
   allowedScopes: string[];
   deniedScopes: string[];
-  resources: string[];
+  allowedResources: string[];
+  deniedResources: string[];
   approvalRule: "per-session" | "per-task" | "runtime-policy" | "per-tool";
   issuedByOwnerPolicy: string;
   issuedByPrincipalId?: string;
@@ -156,6 +163,7 @@ export interface EgressGrant {
   maxQuoteCharacters: number;
   requireEvidenceRefs: boolean;
   requireOwnerConfirmationFor: string[];
+  accountingMode: "declared" | "conservative";
   issuedByOwnerPolicy: string;
   issuedByPrincipalId?: string;
   createdAt: string;
@@ -221,7 +229,8 @@ export interface ExternalSessionEnvelope {
   operation: "session.open" | "session.message" | "session.task" | "session.close"
     | "writeback.propose";
   sessionId?: string;
-  grantDigest?: string;
+  authorityVersion?: number;
+  authorityDigest?: string;
   callerPrincipalId: string;
   callerAgentId?: string;
   purpose: string;
@@ -235,6 +244,7 @@ export interface SignedSessionGrant {
   operationGrant: SessionOperationGrant;
   actionGrant: SessionActionGrant;
   egressGrant: EgressGrant;
+  authorityBundle: SessionAuthorityBundle;
   proof: SignedStatement;
 }
 
@@ -261,7 +271,8 @@ export interface ExternalTaskRecord {
   requestDigest: string;
   requestedScopes: string[];
   deniedScopes: string[];
-  resources: string[];
+  requestedResources: string[];
+  deniedResources: string[];
   status:
     | "registered" | "running" | "awaiting_owner_confirmation"
     | "completed" | "failed" | "cancelled";
@@ -300,13 +311,27 @@ export interface EgressChallenge {
   resolvedAt?: string;
   resolvedByPrincipalId?: string;
   releasedAnswer?: ContextualAnswer;
+  ownerOverride?: boolean;
+  originalEgressViolation?: string;
+  releasedAnswerDigest?: string;
+}
+
+export interface CheckpointClaim {
+  text: string;
+  authority: ContextAuthority;
+  sensitivity: Sensitivity;
+  evidenceRefs: string[];
+  disclosedAtEventId: string;
+  validUnderAuthorityDigest: string;
 }
 
 export interface SessionCheckpoint {
   id: string;
   sessionId: string;
   upToSequence: number;
-  confirmedConstraints: string[];
+  confirmedClaims: CheckpointClaim[];
+  /** Legacy checkpoints are read but their unprovenanced strings are never reinjected. */
+  confirmedConstraints?: string[];
   unresolvedQuestions: string[];
   acceptedArtifacts: string[];
   rejectedAssumptions: string[];

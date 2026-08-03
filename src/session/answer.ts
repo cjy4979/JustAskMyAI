@@ -113,10 +113,13 @@ export function normalizeContextualAnswer(
     ? obj.disclosedContextRefs.filter((ref): ref is string =>
       typeof ref === "string" && byId.has(ref))
     : [];
-  const disclosed = [...new Set([
+  const declaredDisclosure = [...new Set([
     ...finalClaims.flatMap((claim) => claim.evidenceRefs),
     ...declaredDisclosed,
   ])];
+  const disclosed = egressGrant?.accountingMode === "conservative"
+    ? projected.map((item) => item.id)
+    : declaredDisclosure;
   const answer: ContextualAnswer = {
     answer: typeof obj.answer === "string" ? obj.answer : finalClaims.map((c) => c.text).join("\n"),
     claims: finalClaims,
@@ -130,7 +133,9 @@ export function normalizeContextualAnswer(
     return {
       draft: answer,
       escalationReason: egressReason ?? "Agent requested Owner confirmation for this draft",
-      possiblyDisclosedRefs: disclosed,
+      possiblyDisclosedRefs: egressGrant?.accountingMode === "conservative"
+        ? projected.map((item) => item.id)
+        : disclosed,
     };
   }
   return { answer };
@@ -161,11 +166,12 @@ function evaluateEgress(
   const referenced = answer.disclosedContextRefs
     .map((ref) => byId.get(ref))
     .filter((item): item is ContextItem => Boolean(item));
-  if (referenced.some((item) => !grant.allowedAuthority.includes(item.authority))) {
+  const accounted = grant.accountingMode === "conservative" ? projected : referenced;
+  if (accounted.some((item) => !grant.allowedAuthority.includes(item.authority))) {
     return "egress references a Context authority outside the Egress Grant";
   }
   const ceiling = sensitivityRank(grant.allowedSensitivity);
-  if (referenced.some((item) => sensitivityRank(item.sensitivity) > ceiling)) {
+  if (accounted.some((item) => sensitivityRank(item.sensitivity) > ceiling)) {
     return "egress sensitivity exceeds the Egress Grant";
   }
   if (
@@ -178,8 +184,9 @@ function evaluateEgress(
   if (grant.quoteMode === "none" && referenced.length > 0) {
     return "Egress Grant forbids quoting or disclosing projected Context";
   }
-  const quoteCharacters = referenced.reduce(
-    (total, item) => total + quotedCharacters(answer.answer, item.content ?? item.summary),
+  const serializedAnswer = JSON.stringify(answer);
+  const quoteCharacters = projected.reduce(
+    (total, item) => total + quotedCharacters(serializedAnswer, item.content ?? item.summary),
     0,
   );
   if (grant.quoteMode === "summary-only" && quoteCharacters > 0) {
@@ -189,7 +196,7 @@ function evaluateEgress(
     return "draft excerpt exceeds the Egress Grant quote limit";
   }
   if (grant.requireOwnerConfirmationFor.some((rule) =>
-    referenced.some((item) =>
+    accounted.some((item) =>
       item.sensitivity === rule || item.authority === rule || item.collectionId === rule))) {
     return "Egress Grant requires Owner confirmation for referenced Context";
   }

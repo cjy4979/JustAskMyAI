@@ -48,15 +48,15 @@ perform bounded work within that authority.
 - Persistent External Sessions for multi-turn Human-to-Agent and Agent-to-Agent access
 - Dependency-free Managed ACP Profiles with separate per-Session Agent memory/configuration
 - Optional Docker-backed strict isolation for sensitive deployments
-- Session leases, caller/purpose/issued-grant binding, pause, revoke, close, and 7-day hard limits
+- Session leases and envelopes bound to caller, purpose, and the complete Authority Bundle
 - Requested-versus-issued Context Grants intersected with Owner collection policy
 - Separate operation and action grants, with exact task-bound Human approval
-- Runtime ACP resource enforcement over actual tool paths, URLs, locations, and typed resource IDs
+- Runtime ACP allow/deny enforcement over real paths, URLs, locations, and typed resource IDs
 - Explicit Context Collections backed by SQLite FTS5, with visibility, caller, mode,
   collection, sensitivity, item, and token ceilings
 - Physically session-scoped External Thread events that never enter Context Collections automatically
 - Atomic event sequencing, durable task replay protection, and periodic session checkpoints
-- Versioned, gateway-signed Authority Bundles linked by previous digest
+- Versioned, gateway-signed Authority Bundles linked by previous digest and bound to every message
 - Structured contextual answers with validated evidence references and authority ceilings
 - Independent Egress Grants for authority, sensitivity, quote mode, excerpt size, and evidence
 - Durable Owner-confirmation challenges that withhold, release, or reject exact answer drafts
@@ -134,16 +134,20 @@ npm run dev:node
 
 The sandbox uses an independent HOME/XDG namespace and empty Workspace per External Session,
 a read-only root filesystem, a separate writable `/output`, no Linux capabilities, no
-network, and no Owner session mount. The gateway records isolation evidence and destroys the
-session namespace when its ACP process terminates. Grant sandbox paths as
+network, and no Owner session mount. The gateway records local enforcement evidence—not remote
+host or image attestation—and destroys the session namespace when its ACP process terminates.
+The strict adapter therefore rehydrates instead of advertising native resume. Grant paths as
 `path:/workspace/**` or `path:/output/**`. An explicit
 `JAMAI_ACP_SANDBOX_MOUNT_OWNER_WORKSPACE=read-only` opt-in mounts the configured Workspace;
 only use it when that entire root is approved for the Session.
 
-Denied scopes take precedence over allowed scopes, including wildcard grants. `run-tests`
+Denied scopes and denied resources take precedence over allows, including wildcard grants.
+Relative paths resolve from the adapter working directory and real-path checks block symlink
+escape. `run-tests`
 matches only a dedicated test tool name such as `pytest`, `jest`, or `run-tests`; it never
-authorizes a generic terminal. Broad execution requires an explicit scope such as
-`tool:terminal` or `run-tools`.
+authorizes a generic terminal. External Sessions reject generic terminal and shell tools even
+when broad execution scope is present; adapters must expose structured tools or fixed command
+templates instead.
 
 When approving a request, the owner may reduce its authority:
 
