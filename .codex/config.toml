@@ -1,0 +1,12 @@
+[mcp_servers.just_ask_my_ai]
+command = "node"
+args = ["dist/src/mcp.js"]
+cwd = "."
+enabled = true
+required = false
+startup_timeout_sec = 20
+tool_timeout_sec = 1800
+default_tools_approval_mode = "prompt"
+
+[mcp_servers.just_ask_my_ai.env]
+JAMAI_DAEMON_URL = "http://127.0.0.1:43121"

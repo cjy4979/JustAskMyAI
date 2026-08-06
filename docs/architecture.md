@@ -26,7 +26,8 @@ The human is the Principal, not a worker inserted into an Agent loop.
 
 - MCP: installation surface for Codex, Claude Code, Hermes, OpenClaw, and other hosts.
 - A2A v1.0: cross-gateway task, message, artifact, continuation, and cancellation protocol.
-- ACP: preferred adapter to the owner's existing local Agent.
+- ACP: preferred adapter to an Agent that exposes ACP and tool-permission callbacks.
+- Codex CLI: compatibility adapter using non-interactive JSONL runs and resumable threads.
 - Native headless/API adapters: compatibility fallback, not a new Agent runtime.
 
 ```mermaid
@@ -37,7 +38,7 @@ flowchart LR
   GBM["Gateway B: localhost management"] --> GBP
   HB["Human B (Principal)"] -->|"local policy / consent"| GBM
   HB -->|"localhost only"| GBM
-  GBP -->|"context-bound ACP session"| AB["Existing personal AI B"]
+  GBP -->|"ACP or bounded Codex CLI run"| AB["Existing personal AI B"]
   AB -->|"artifact / question / status"| GBP
   GBP -->|"A2A"| GA
   GA --> LA["Local task + audit ledger A"]
@@ -53,6 +54,12 @@ owner's policy always wins.
 `continue_remote_task` uses the same A2A task and context. During one gateway process
 lifetime, that context maps to the same local ACP process and session. Restart recovery is
 not implemented.
+
+The Codex CLI adapter instead starts `codex exec --json`, records the emitted thread ID,
+and uses `codex exec resume` for later turns in the same context. It is a coarse compatibility
+boundary: JAMA selects a read-only or workspace-write Codex sandbox, disables network, MCP,
+plugins, hooks, and Web search, and does not claim ACP per-tool policy evidence or External
+Session memory isolation.
 
 ## Consent
 

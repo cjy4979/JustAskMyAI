@@ -3,7 +3,21 @@
 Computer A asks or delegates through its existing Agent. Computer B runs its own existing
 Agent and remains controlled by B.
 
-Both machines need Node.js 22.13+ and this repository.
+Both machines need Node.js 22.13+, this repository, and Codex signed in to the intended
+ChatGPT/Codex account. The accounts may be different; gateway trust is based on the local
+JAMA key pairing, not on matching OpenAI accounts.
+
+On each receiving machine, confirm that a standalone Codex CLI is callable from the same
+terminal that will start the gateway and is signed in to the intended account:
+
+```powershell
+codex --version
+codex exec --json --sandbox read-only "Reply with: Codex CLI ready"
+```
+
+The desktop app's packaged executable or app alias may not be launchable by child processes
+on every Windows installation. If the second command fails, install/update the standalone
+Codex CLI and sign in before starting the gateway.
 
 ## 1. Start B's gateway
 
@@ -17,15 +31,17 @@ $env:JAMAI_HOST="0.0.0.0"
 $env:JAMAI_PORT="43122"
 $env:JAMAI_PUBLIC_URL="http://192.168.1.52:43122"
 $env:JAMAI_POLICY="always_ask"
-$env:JAMAI_ADAPTER="acp"
-$env:JAMAI_ACP_COMMAND="hermes"
-$env:JAMAI_ACP_ARGS='["acp"]'
+$env:JAMAI_ADAPTER="codex"
+$env:JAMAI_CODEX_COMMAND="codex"
 $env:JAMAI_AGENT_CWD="D:\projects\the-project"
-$env:JAMAI_ACP_ALLOW_TOOLS="true"
 npm run dev:node
 ```
 
 B chooses `JAMAI_AGENT_CWD`; A cannot choose an arbitrary directory on B.
+The gateway invokes the Codex CLI using B's locally authenticated account. The default
+adapter ignores B's Codex user configuration, disables network, MCP, plugins, hooks, and Web
+search, and starts in `read-only`; it uses `workspace-write` only after B approves
+`edit-workspace`.
 
 From A, verify only the public Agent Card:
 
@@ -80,11 +96,18 @@ Pairing is a local human action. mDNS discovery alone does not grant trust.
 
 ## 3. Connect the MCP on A
 
+This repository contains `.codex/config.toml`, so Codex opened on the repository can load
+`just_ask_my_ai` after the project has been built and the Codex task/app has been restarted.
+Use `/mcp` to confirm the server is active.
+
 Configure A's Codex/Claude Code/Hermes MCP command as:
 
 ```text
 node G:\JustAskMyAI\dist\src\mcp.js
 ```
+
+For ChatGPT desktop, open **Settings > MCP servers**, choose **STDIO**, and use the same
+command plus `JAMAI_DAEMON_URL=http://127.0.0.1:43121`. Restart ChatGPT after saving.
 
 For a visible smoke test:
 
@@ -131,7 +154,7 @@ On A call `continue_remote_task` using the exact original delegation fields plus
 
 - state `COMPLETED`
 - artifact named `delegate-result`
-- remote Agent session ID in artifact metadata
+- remote Codex thread ID in artifact metadata
 - result/report produced from B's locally selected workspace
 
 Changing the request after approval intentionally creates a new approval requirement.
@@ -149,7 +172,8 @@ Invoke-RestMethod "http://127.0.0.1:43121/api/audit?taskId=<taskId>"
 Invoke-RestMethod "http://127.0.0.1:43121/api/audit/verify"
 ```
 
-The final verification should return `"valid": true`.
+The final verification should return `"valid": true`. A follow-up in the same context should
+carry the same Codex thread ID, proving that `codex exec resume` was used.
 
 Source delivery is explicit. A general delegation never implies commit, push, publish, deploy,
 or contacting third parties.

@@ -86,6 +86,54 @@ npm run dev:mcp
 The default public A2A URL is `http://127.0.0.1:43120`. Local management is
 available only at `http://127.0.0.1:43121`.
 
+### Use with Codex or ChatGPT
+
+This repository includes a project-scoped Codex MCP configuration at
+`.codex/config.toml`. Build the project, start the local gateway, then restart Codex or
+open a new Codex task in this repository. The `just_ask_my_ai` MCP server exposes the
+remote discovery, ask, delegation, continuation, and task-control tools.
+
+The ChatGPT desktop app can use the same STDIO server. In **Settings > MCP servers**,
+add a server named `just_ask_my_ai` with:
+
+```text
+command: node
+arguments: E:\path\to\JustAskMyAI\dist\src\mcp.js
+environment: JAMAI_DAEMON_URL=http://127.0.0.1:43121
+```
+
+To make a locally signed-in Codex account the receiving AI, use the Codex CLI adapter:
+
+```powershell
+codex --version
+codex exec --json --sandbox read-only "Reply with: Codex CLI ready"
+```
+
+Both commands must work in the same terminal that starts the gateway. On Windows, the
+desktop app's packaged command alias may not be executable by child processes, so install
+or update the standalone Codex CLI if this smoke test fails. Then start the gateway:
+
+```powershell
+$env:JAMAI_ADAPTER="codex"
+$env:JAMAI_CODEX_COMMAND="codex"
+$env:JAMAI_AGENT_CWD="D:\projects\owner-selected-project"
+$env:JAMAI_POLICY="always_ask"
+npm run dev:node
+```
+
+The adapter uses `codex exec --json` and resumes the returned Codex thread for follow-up
+turns in the same JAMA context. It always disables interactive Codex approval prompts,
+MCP servers, plugins, hooks, Web search, and workspace network access. It selects
+`read-only` unless the receiving Human approved
+`edit-workspace`, in which case it selects `workspace-write`. It also ignores the receiving
+account's Codex user configuration by default, so personal MCP tools cannot silently expand
+the remote task's authority. Set `JAMAI_CODEX_IGNORE_USER_CONFIG=false` only when the Owner
+has reviewed and intentionally trusts that configuration.
+
+The Codex adapter is intended for bounded A2A ask, review, and delegation tasks. It does not
+claim ACP-style per-tool permission hooks or Managed Profile isolation, so context-rich
+External Sessions remain unavailable with this adapter.
+
 To connect an existing ACP-compatible agent:
 
 ```powershell
@@ -161,6 +209,10 @@ Invoke-RestMethod `
 
 ## Current limitations
 
+- The Codex CLI adapter maps JAMA authority to Codex's coarse `read-only` or
+  `workspace-write` sandbox. It deliberately keeps network, MCP, plugins, hooks, and Web
+  search disabled and does not provide
+  ACP per-tool permission evidence or isolated External Sessions.
 - Managed ACP Profiles isolate normal Agent configuration and memory paths but are not an
   OS security boundary against a malicious local Agent process. Strict deployments should
   use `JAMAI_ISOLATION_POLICY=strict` with `acp-sandbox`; its configured image remains part
