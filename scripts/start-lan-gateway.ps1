@@ -1,6 +1,7 @@
 param(
   [string]$Name = "$env:COMPUTERNAME AI",
-  [string]$PublicIp = "192.168.1.46",
+  [Parameter(Mandatory = $true)]
+  [string]$PublicIp,
   [int]$PublicPort = 43120,
   [int]$ManagementPort = 43121,
   [ValidateSet("mock", "codex", "acp", "acp-sandbox")]
