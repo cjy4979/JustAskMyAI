@@ -10,3 +10,4 @@ default_tools_approval_mode = "prompt"
 
 [mcp_servers.just_ask_my_ai.env]
 JAMAI_DAEMON_URL = "http://127.0.0.1:43121"
+JAMAI_DB_PATH = ".jamai/lan-gateway.db"

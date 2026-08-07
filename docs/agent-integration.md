@@ -37,13 +37,16 @@ The boundary is deliberate:
    npm install
    npm run build
    $env:JAMAI_ADAPTER="provider"
+   $env:JAMAI_DB_PATH=".jamai/lan-gateway.db"
    npm run dev:node
    ```
 
 2. Configure the repository's `just_ask_my_ai` STDIO MCP server in the Agent. The project
    scoped Codex configuration is an example; use the Agent's normal MCP configuration
-   mechanism.
-3. Give the Agent [the JAMA Provider Skill](../skills/jama-provider/SKILL.md). The Skill tells
+   mechanism. The MCP process and gateway must use the same absolute or working-directory-
+   relative `JAMAI_DB_PATH`; the included LAN script and Codex config both use
+   `.jamai/lan-gateway.db`.
+3. Give the Agent [the JAMA Provider Skill](../.agents/skills/jama-provider/SKILL.md). The Skill tells
    it how to register, preserve credentials, claim work, renew leases, resume native sessions,
    and return contextual answers.
 4. The Agent calls `register_local_agent`. First registration returns a one-time credential;
@@ -83,7 +86,7 @@ sessions, native resume, and structured contextual output.
 
 ## Caller Agents
 
-Install [the JAMA Caller Skill](../skills/jama-caller/SKILL.md) in an Agent that should contact
+Install [the JAMA Caller Skill](../.agents/skills/jama-caller/SKILL.md) in an Agent that should contact
 other people through JAMA. It uses the existing MCP discovery, A2A, Group, External Session,
 egress, and writeback tools. Parallelism and result synthesis stay in the caller Agent; JAMA
 routes and audits bounded requests rather than becoming a team orchestrator.

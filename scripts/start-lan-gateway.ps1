@@ -4,7 +4,7 @@ param(
   [string]$PublicIp,
   [int]$PublicPort = 43120,
   [int]$ManagementPort = 43121,
-  [ValidateSet("mock", "codex", "acp", "acp-sandbox")]
+  [ValidateSet("mock", "provider", "codex", "acp", "acp-sandbox")]
   [string]$Adapter = "mock",
   [string]$AgentCwd = (Get-Location).Path,
   [string]$DbPath = ".jamai/lan-gateway.db",

@@ -113,13 +113,14 @@ gateway restart. Its planning, tools, memory, and vendor configuration remain Ag
 ```powershell
 $env:JAMAI_ADAPTER="provider"
 $env:JAMAI_PROVIDER_TIMEOUT_MS="900000"
+$env:JAMAI_DB_PATH=".jamai/lan-gateway.db"
 npm run dev:node
 ```
 
 Configure the `just_ask_my_ai` MCP server in the receiving Agent, then give it
-[`skills/jama-provider`](./skills/jama-provider/SKILL.md). It will appear as pending in the
+[`jama-provider`](./.agents/skills/jama-provider/SKILL.md). It will appear as pending in the
 Owner Hub; confirm it there before it can receive work. Agents that contact other people can
-use [`skills/jama-caller`](./skills/jama-caller/SKILL.md).
+use [`jama-caller`](./.agents/skills/jama-caller/SKILL.md).
 
 This is the common path for WorkBuddy, Hermes, OpenClaw, Claude Code, Codex, and future Agents
 that can use MCP and follow a Skill. ACP, Codex CLI, and other adapters remain compatibility
