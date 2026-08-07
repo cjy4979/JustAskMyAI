@@ -57,6 +57,7 @@ import type {
 } from "./session/types.js";
 import { ownerPage } from "./ui/owner-page.js";
 import { guestPage } from "./ui/guest-page.js";
+import { ProviderStore } from "./provider/store.js";
 
 const config = loadConfig();
 const store = new GatewayStore();
@@ -70,13 +71,14 @@ const identity = {
   agentId,
   signStatement: gatewayIdentity.signStatement.bind(gatewayIdentity),
 };
-const adapter = createAdapter(config.adapter);
+const adapter = createAdapter(config.adapter, store);
 const approvals = new ApprovalPolicy(config.policy, store);
 const groups = new GroupStore(store, gatewayIdentity);
 const sessions = new SessionStore(
   store,
   (statement) => gatewayIdentity.signStatement(statement),
 );
+const providerAgents = new ProviderStore(store);
 const guestRateWindows = new Map<string, { startedAt: number; count: number }>();
 const peers = new PeerRegistry();
 const discovery = new LanDiscovery({ id: nodeId, name: config.name, port: config.port }, peers);
@@ -751,7 +753,8 @@ managementApp.get("/api/capabilities", (_req, res) => res.json({
   nodeId,
   name: config.name,
   adapter: adapter.id,
-  canExecuteWork: adapter.id !== "mock",
+  canExecuteWork: adapter.id !== "mock"
+    && (adapter.id !== "provider" || providerAgents.hasActiveSessionProvider()),
   humanApproval: config.policy,
   acpToolPermissions: process.env.JAMAI_ACP_ALLOW_TOOLS === "true",
   isolationPolicy: contextIsolationPolicy(),
@@ -759,6 +762,42 @@ managementApp.get("/api/capabilities", (_req, res) => res.json({
   dockerRequired: contextIsolationPolicy() === "strict" && adapter.id === "acp-sandbox",
   profile: sessions.getProfile(agentId) ?? defaultProfile,
 }));
+managementApp.get("/api/provider-agents", (_req, res) => res.json(providerAgents.listAgents()));
+managementApp.get("/api/provider-jobs", (_req, res) => res.json(providerAgents.listJobs()));
+managementApp.post("/api/provider-agents/:id/activate", (req, res) => {
+  try {
+    const activated = providerAgents.approve(req.params.id);
+    store.appendAudit({
+      eventType: "provider.agent-activated",
+      principalId,
+      agentId,
+      action: "activate-local-agent",
+      resource: activated.id,
+      decision: "approved",
+      metadata: {
+        providerName: activated.name,
+        capabilities: activated.capabilities,
+        assurance: "owner-attested",
+      },
+    });
+    return res.json(activated);
+  } catch (error) { return res.status(400).json({ error: String(error) }); }
+});
+managementApp.post("/api/provider-agents/:id/suspend", (req, res) => {
+  try {
+    const suspended = providerAgents.suspend(req.params.id);
+    store.appendAudit({
+      eventType: "provider.agent-suspended",
+      principalId,
+      agentId,
+      action: "suspend-local-agent",
+      resource: suspended.id,
+      decision: "revoked",
+      metadata: { providerName: suspended.name },
+    });
+    return res.json(suspended);
+  } catch (error) { return res.status(400).json({ error: String(error) }); }
+});
 managementApp.get("/api/settings", (_req, res) => res.json({
   guestInvitesEnabled: guestInvitesEnabled(),
   publicUrl: config.publicUrl,
@@ -2098,6 +2137,7 @@ function contextIsolationPolicy(): "managed" | "strict" {
 function contextIsolationAllowed(): boolean {
   const assurance = adapter.capabilities.memoryIsolationAssurance;
   if (contextIsolationPolicy() === "strict") return assurance === "enforced";
+  if (adapter.contextIsolationAvailable?.()) return true;
   if (assurance === "enforced" || assurance === "adapter-attested") return true;
   return assurance === "operator-attested"
     && process.env.JAMAI_ALLOW_OPERATOR_ATTESTED_EXTERNAL_CONTEXT === "true";

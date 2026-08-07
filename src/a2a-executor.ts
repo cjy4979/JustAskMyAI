@@ -561,10 +561,12 @@ export class BridgeExecutor implements AgentExecutor {
       preflight: groupEnvelope?.approvalProofs ?? [],
     };
     try {
+      const previousAgentSession = this.store.getAgentSession(contextId);
       const result = await this.adapter.run({
         prompt,
         taskId,
         contextId,
+        resumeSessionId: previousAgentSession?.localSessionId,
         signal: controller.signal,
         approvedScopes,
         deniedScopes,

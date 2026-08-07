@@ -17,7 +17,8 @@
     "test": "node --test --import tsx test/*.test.ts",
     "test:e2e": "node test/e2e-runner.mjs",
     "test:mcp-e2e": "node test/mcp-e2e-runner.mjs",
-    "check": "npm run build && npm test && npm run test:e2e && npm run test:mcp-e2e"
+    "test:provider-e2e": "node test/provider-e2e-runner.mjs",
+    "check": "npm run build && npm test && npm run test:e2e && npm run test:mcp-e2e && npm run test:provider-e2e"
   },
   "dependencies": {
     "@a2a-js/sdk": "^1.0.0",

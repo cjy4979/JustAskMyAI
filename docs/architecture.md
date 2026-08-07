@@ -24,8 +24,12 @@ The human is the Principal, not a worker inserted into an Agent loop.
 
 ## Protocol boundaries
 
-- MCP: installation surface for Codex, Claude Code, Hermes, OpenClaw, and other hosts.
+- MCP + Skills: preferred installation surface for Codex, Claude Code, Hermes, OpenClaw,
+  WorkBuddy, and other hosts. A capable Agent can serve durable local work without a
+  vendor-specific JAMA adapter.
 - A2A v1.0: cross-gateway task, message, artifact, continuation, and cancellation protocol.
+- Provider contract: durable local job leases, Owner activation, native-session resume, and
+  structured results while Agent internals remain Agent-owned.
 - ACP: preferred adapter to an Agent that exposes ACP and tool-permission callbacks.
 - Codex CLI: compatibility adapter using non-interactive JSONL runs and resumable threads.
 - Native headless/API adapters: compatibility fallback, not a new Agent runtime.
@@ -38,7 +42,7 @@ flowchart LR
   GBM["Gateway B: localhost management"] --> GBP
   HB["Human B (Principal)"] -->|"local policy / consent"| GBM
   HB -->|"localhost only"| GBM
-  GBP -->|"ACP or bounded Codex CLI run"| AB["Existing personal AI B"]
+  GBP -->|"Provider MCP, ACP, or compatibility adapter"| AB["Existing personal AI B"]
   AB -->|"artifact / question / status"| GBP
   GBP -->|"A2A"| GA
   GA --> LA["Local task + audit ledger A"]
@@ -51,9 +55,10 @@ Every request has a mode (`ask`, `delegate`, `review`, or `execute`), objective,
 context, acceptance criteria, expected result, and caller-declared authority. The receiving
 owner's policy always wins.
 
-`continue_remote_task` uses the same A2A task and context. During one gateway process
-lifetime, that context maps to the same local ACP process and session. Restart recovery is
-not implemented.
+`continue_remote_task` uses the same A2A task and context. The Provider contract persists the
+native Agent session ID and supplies it on a later turn after gateway or MCP reconnection.
+ACP Managed Profiles may instead reconstruct from the durable JAMA thread when native resume
+is unavailable.
 
 The Codex CLI adapter instead starts `codex exec --json`, records the emitted thread ID,
 and uses `codex exec resume` for later turns in the same context. It is a coarse compatibility
@@ -189,5 +194,6 @@ identity revocation/key rotation, and rate limits are implemented.
 The relay remains optional and should only route opaque frames. Identity, policy, credentials,
 Agent sessions, artifacts, and audit records stay at the edge.
 
-The A2A Task Store and gateway ledger are both SQLite-backed. ACP session IDs are recorded
-for evidence and in-process continuity, not restart resumption.
+The A2A Task Store, gateway ledger, provider queue, provider registrations, and native-session
+mappings are SQLite-backed. Provider native-session mappings support restart resumption;
+adapter-specific guarantees remain accurately reported by each adapter.

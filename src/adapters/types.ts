@@ -38,6 +38,7 @@ export interface AgentAdapter {
   readonly displayName: string;
   readonly capabilities: AgentAdapterCapabilities;
   run(request: AgentRequest): Promise<AgentResult>;
+  contextIsolationAvailable?(): boolean;
   closeSession?(externalSessionId: string): Promise<void> | void;
   close?(): Promise<void> | void;
 }

@@ -103,6 +103,29 @@ internal IDs. It provides:
 Guest links remain disabled by default. The Owner can enable them from **Settings** or while
 creating the first invite. The choice is stored locally and can be reversed at any time.
 
+### Connect any MCP-capable Agent
+
+The preferred receiving-Agent integration is the durable Provider contract. JAMA exposes a
+small MCP job protocol and ships a Provider Skill so a capable Agent can register itself,
+wait for Owner activation, claim authorized work, and resume its own native session after a
+gateway restart. Its planning, tools, memory, and vendor configuration remain Agent-owned.
+
+```powershell
+$env:JAMAI_ADAPTER="provider"
+$env:JAMAI_PROVIDER_TIMEOUT_MS="900000"
+npm run dev:node
+```
+
+Configure the `just_ask_my_ai` MCP server in the receiving Agent, then give it
+[`skills/jama-provider`](./skills/jama-provider/SKILL.md). It will appear as pending in the
+Owner Hub; confirm it there before it can receive work. Agents that contact other people can
+use [`skills/jama-caller`](./skills/jama-caller/SKILL.md).
+
+This is the common path for WorkBuddy, Hermes, OpenClaw, Claude Code, Codex, and future Agents
+that can use MCP and follow a Skill. ACP, Codex CLI, and other adapters remain compatibility
+options rather than the long-term integration boundary. See the
+[Agent Integration Guide](./docs/agent-integration.md) for persistence and trust semantics.
+
 ### Use with Codex or ChatGPT
 
 This repository includes a project-scoped Codex MCP configuration at
@@ -268,6 +291,18 @@ identities, performs bilateral pairing, then runs A2A and MCP delegation tests.
 
 ## MCP tools
 
+Provider Agents use:
+
+- `register_local_agent`
+- `get_local_agent_status`
+- `claim_local_agent_request`
+- `renew_local_agent_request`
+- `report_local_agent_progress`
+- `complete_local_agent_request`
+- `fail_local_agent_request`
+
+Caller Agents use:
+
 - `list_remote_ais`
 - `ask_remote_ai`
 - `delegate_remote_task`
@@ -305,3 +340,5 @@ See the [architecture](./docs/architecture.md), the
 boundaries are described in the [Group Layer guide](./docs/group-layer.md).
 External Session isolation, Context Projection, provenance, and guest invitations are
 described in the [External Session guide](./docs/external-sessions.md).
+Generic Agent onboarding, the durable Provider contract, and restart recovery are described
+in the [Agent Integration Guide](./docs/agent-integration.md).

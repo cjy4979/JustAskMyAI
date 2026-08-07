@@ -1,0 +1,4 @@
+interface:
+  display_name: "JAMA Caller"
+  short_description: "Delegate work safely through JAMA"
+  default_prompt: "Use $jama-caller to discover a JAMA peer and delegate a scoped task."

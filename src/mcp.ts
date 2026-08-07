@@ -44,6 +44,7 @@ import {
 import { selectDisclosurePaths } from "./group/disclosure.js";
 import { SessionStore } from "./session/store.js";
 import type { ExternalSessionEnvelope } from "./session/types.js";
+import { ProviderStore } from "./provider/store.js";
 
 const daemonUrl = process.env.JAMAI_DAEMON_URL ?? "http://127.0.0.1:43121";
 const extensionParameters = { "A2A-Extensions": JAMAI_EXTENSION_URI };
@@ -52,6 +53,7 @@ const store = new GatewayStore();
 const identity = new GatewayIdentity(store);
 const groups = new GroupStore(store, identity);
 const sessions = new SessionStore(store);
+const providers = new ProviderStore(store);
 const principalId = store.getOrCreateId("principalId");
 const agentId = store.getOrCreateId("agentId");
 const localPeerId = identity.peerId;
@@ -70,6 +72,202 @@ const commonInput = {
   deniedActions: z.array(z.string().min(1)).default([]),
   resources: z.array(z.string().min(1)).default([]),
 };
+
+const providerIdentityInput = {
+  agentId: z.string().uuid(),
+  accessToken: z.string().min(32),
+};
+
+server.registerTool(
+  "register_local_agent",
+  {
+    description:
+      "Register this local Agent as a JAMA work provider. Owner activation is required before work can be claimed.",
+    inputSchema: {
+      instanceKey: z.string().min(3).max(200)
+        .describe("Stable ID owned by the Agent installation, not a JAMA or vendor name"),
+      name: z.string().min(1).max(120),
+      description: z.string().max(500).default(""),
+      accessToken: z.string().min(32).optional()
+        .describe("Credential returned by the first registration; provide it when updating"),
+      isolatedSessions: z.boolean().default(true),
+      sessionResume: z.boolean().default(true),
+      structuredContextualOutput: z.boolean().default(true),
+      separateMemoryNamespace: z.boolean().default(true),
+      supportsCancellation: z.boolean().default(true),
+      maxConcurrency: z.number().int().min(1).max(32).default(1),
+      operations: z.array(z.string().min(1)).default(["ask", "task", "review"]),
+      artifactTypes: z.array(z.string().min(1)).default(["text", "report"]),
+      isolationAssurance: z.enum(["self-reported", "owner-attested", "enforced", "unknown"])
+        .default("self-reported"),
+    },
+  },
+  async (input) => {
+    const result = providers.register({
+      instanceKey: input.instanceKey,
+      name: input.name,
+      description: input.description,
+      accessToken: input.accessToken,
+      capabilities: {
+        isolatedSessions: input.isolatedSessions,
+        sessionResume: input.sessionResume,
+        structuredContextualOutput: input.structuredContextualOutput,
+        separateMemoryNamespace: input.separateMemoryNamespace,
+        supportsCancellation: input.supportsCancellation,
+        maxConcurrency: input.maxConcurrency,
+        operations: input.operations,
+        artifactTypes: input.artifactTypes,
+        isolationAssurance: input.isolationAssurance,
+      },
+    });
+    store.appendAudit({
+      eventType: "provider.agent-registered",
+      principalId,
+      agentId,
+      action: "register-local-agent",
+      resource: result.agent.id,
+      decision: result.agent.status === "active" ? "approved" : undefined,
+      metadata: {
+        providerName: result.agent.name,
+        providerInstanceKey: result.agent.instanceKey,
+        created: result.created,
+        capabilities: result.agent.capabilities,
+      },
+    });
+    return text(JSON.stringify({
+      agent: result.agent,
+      accessToken: result.accessToken,
+      credentialNotice: result.accessToken
+        ? "Store this token in the Agent's own private configuration; JAMA cannot display it again."
+        : undefined,
+      next: result.agent.status === "pending"
+        ? "Ask the Owner to activate this Agent in the JAMA Owner Hub."
+        : "The Agent may claim work now.",
+    }, null, 2));
+  },
+);
+
+server.registerTool(
+  "get_local_agent_status",
+  {
+    description: "Authenticate, heartbeat, and read this local provider Agent's activation status.",
+    inputSchema: providerIdentityInput,
+  },
+  async ({ agentId: providerAgentId, accessToken }) => text(JSON.stringify(
+    providers.heartbeat(providerAgentId, accessToken),
+    null,
+    2,
+  )),
+);
+
+server.registerTool(
+  "claim_local_agent_request",
+  {
+    description:
+      "Wait for and lease the next authorized JAMA request. Repeat when no request is returned.",
+    inputSchema: {
+      ...providerIdentityInput,
+      leaseSeconds: z.number().int().min(15).max(300).default(60),
+      waitSeconds: z.number().int().min(0).max(25).default(20),
+    },
+  },
+  async ({ agentId: providerAgentId, accessToken, leaseSeconds, waitSeconds }) => {
+    const deadline = Date.now() + waitSeconds * 1000;
+    do {
+      const job = providers.claim(providerAgentId, accessToken, leaseSeconds);
+      if (job) return text(JSON.stringify({ status: "CLAIMED", job }, null, 2));
+      if (Date.now() >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    } while (true);
+    return text(JSON.stringify({ status: "IDLE", retryAfterSeconds: 2 }, null, 2));
+  },
+);
+
+server.registerTool(
+  "renew_local_agent_request",
+  {
+    description: "Renew a claimed request lease while the Agent continues working.",
+    inputSchema: {
+      ...providerIdentityInput,
+      jobId: z.string().uuid(),
+      leaseToken: z.string().min(32),
+      leaseSeconds: z.number().int().min(15).max(300).default(60),
+    },
+  },
+  async ({ agentId: providerAgentId, accessToken, jobId, leaseToken, leaseSeconds }) =>
+    text(JSON.stringify(
+      providers.renew(providerAgentId, accessToken, jobId, leaseToken, leaseSeconds),
+      null,
+      2,
+    )),
+);
+
+server.registerTool(
+  "report_local_agent_progress",
+  {
+    description: "Publish concise progress for the Owner without exposing private reasoning.",
+    inputSchema: {
+      ...providerIdentityInput,
+      jobId: z.string().uuid(),
+      leaseToken: z.string().min(32),
+      message: z.string().min(1).max(500),
+      percent: z.number().min(0).max(100).optional(),
+    },
+  },
+  async ({ agentId: providerAgentId, accessToken, jobId, leaseToken, message, percent }) =>
+    text(JSON.stringify(providers.reportProgress(
+      providerAgentId,
+      accessToken,
+      jobId,
+      leaseToken,
+      { message, percent },
+    ), null, 2)),
+);
+
+server.registerTool(
+  "complete_local_agent_request",
+  {
+    description:
+      "Complete a leased request and persist the Agent's session ID for the next External Session turn.",
+    inputSchema: {
+      ...providerIdentityInput,
+      jobId: z.string().uuid(),
+      leaseToken: z.string().min(32),
+      text: z.string().min(1),
+      sessionId: z.string().min(1).max(500).optional(),
+      degradedRehydration: z.boolean().default(false),
+    },
+  },
+  async ({
+    agentId: providerAgentId, accessToken, jobId, leaseToken,
+    text: resultText, sessionId, degradedRehydration,
+  }) => text(JSON.stringify(providers.complete(
+    providerAgentId,
+    accessToken,
+    jobId,
+    leaseToken,
+    { text: resultText, sessionId, degradedRehydration },
+  ), null, 2)),
+);
+
+server.registerTool(
+  "fail_local_agent_request",
+  {
+    description: "Fail a leased request with a concise operational reason.",
+    inputSchema: {
+      ...providerIdentityInput,
+      jobId: z.string().uuid(),
+      leaseToken: z.string().min(32),
+      error: z.string().min(1).max(1000),
+    },
+  },
+  async ({ agentId: providerAgentId, accessToken, jobId, leaseToken, error }) =>
+    text(JSON.stringify(
+      providers.fail(providerAgentId, accessToken, jobId, leaseToken, error),
+      null,
+      2,
+    )),
+);
 
 server.registerTool(
   "list_remote_ais",

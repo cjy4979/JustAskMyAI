@@ -3,9 +3,11 @@ import { AcpAdapter } from "./acp.js";
 import { EnforcedAcpSandboxAdapter } from "./acp-sandbox.js";
 import { ManagedAcpAdapter } from "./acp-managed.js";
 import { CodexAdapter } from "./codex.js";
+import { ProviderAdapter } from "./provider.js";
 import type { AgentAdapter } from "./types.js";
+import type { GatewayStore } from "../storage/sqlite.js";
 
-export function createAdapter(id: string): AgentAdapter {
+export function createAdapter(id: string, store?: GatewayStore): AgentAdapter {
   switch (id) {
     case "mock":
       return new MockAdapter();
@@ -17,6 +19,11 @@ export function createAdapter(id: string): AgentAdapter {
         timeoutMs: parsePositiveInteger(process.env.JAMAI_CODEX_TIMEOUT_MS),
         skipGitRepoCheck: process.env.JAMAI_CODEX_SKIP_GIT_REPO_CHECK === "true",
         ignoreUserConfig: process.env.JAMAI_CODEX_IGNORE_USER_CONFIG !== "false",
+      });
+    case "provider":
+      if (!store) throw new Error("ProviderAdapter requires the gateway store");
+      return new ProviderAdapter(store, {
+        timeoutMs: parsePositiveInteger(process.env.JAMAI_PROVIDER_TIMEOUT_MS),
       });
     case "acp": {
       const command = process.env.JAMAI_ACP_COMMAND;
@@ -80,7 +87,7 @@ function parsePositiveInteger(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) {
-    throw new Error("JAMAI_CODEX_TIMEOUT_MS must be a positive integer");
+    throw new Error("adapter timeout must be a positive integer");
   }
   return parsed;
 }
