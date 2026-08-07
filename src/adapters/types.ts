@@ -23,6 +23,9 @@ export interface AgentRequest {
   deniedResources?: string[];
   externalSessionId?: string;
   resumeSessionId?: string;
+  sessionIntent?: "continue" | "new" | "switch";
+  requestedNativeSessionGeneration?: number;
+  nativeSessionGeneration?: number;
   onPermissionDecision?: (decision: PermissionDecision) => Promise<void>;
 }
 

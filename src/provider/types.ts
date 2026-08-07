@@ -3,6 +3,10 @@ import type { AgentRequest, AgentResult } from "../adapters/types.js";
 export type ProviderAgentStatus = "pending" | "active" | "suspended";
 export type ProviderJobStatus =
   | "pending" | "claimed" | "completed" | "failed" | "cancelled";
+export type ProviderEventType =
+  | "job.available" | "job.claimed" | "job.requeued"
+  | "job.completed" | "job.failed" | "job.cancelled"
+  | "agent.activated" | "agent.suspended";
 
 export interface ProviderCapabilities {
   isolatedSessions: boolean;
@@ -35,6 +39,9 @@ export interface ProviderJobRequest {
   taskId: string;
   externalSessionId?: string;
   resumeSessionId?: string;
+  sessionIntent?: "continue" | "new" | "switch";
+  nativeSessionGeneration?: number;
+  requestedNativeSessionGeneration?: number;
   approvedScopes: string[];
   deniedScopes: string[];
   allowedResources: string[];
@@ -44,6 +51,7 @@ export interface ProviderJobRequest {
 export interface ProviderJob {
   id: string;
   agentId?: string;
+  targetAgentId?: string;
   status: ProviderJobStatus;
   request: ProviderJobRequest;
   result?: AgentResult;
@@ -61,6 +69,16 @@ export interface ClaimedProviderJob extends ProviderJob {
   leaseToken: string;
 }
 
+export interface ProviderEvent {
+  sequence: number;
+  id: string;
+  type: ProviderEventType;
+  agentId?: string;
+  jobId?: string;
+  data: Record<string, unknown>;
+  createdAt: string;
+}
+
 export function providerRequest(input: AgentRequest): ProviderJobRequest {
   return {
     prompt: input.prompt,
@@ -68,6 +86,9 @@ export function providerRequest(input: AgentRequest): ProviderJobRequest {
     taskId: input.taskId,
     externalSessionId: input.externalSessionId,
     resumeSessionId: input.resumeSessionId,
+    sessionIntent: input.sessionIntent ?? "continue",
+    nativeSessionGeneration: input.nativeSessionGeneration ?? 0,
+    requestedNativeSessionGeneration: input.requestedNativeSessionGeneration,
     approvedScopes: input.approvedScopes,
     deniedScopes: input.deniedScopes,
     allowedResources: input.allowedResources ?? [],

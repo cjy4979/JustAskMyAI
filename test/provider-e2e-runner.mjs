@@ -3,36 +3,38 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { ProviderConnector } from "../dist/src/provider/connector.js";
 
 const root = mkdtempSync(path.join(tmpdir(), "jamai-provider-e2e-"));
 const dbPath = path.join(root, "gateway.db");
 const publicUrl = "http://127.0.0.1:43230";
 const managementUrl = "http://127.0.0.1:43231";
 let gateway;
-let mcp;
+let connector;
 
 try {
   gateway = startGateway();
   await waitReady();
-  mcp = await connectMcp("provider-e2e-1");
-  const registered = await tool(mcp, "register_local_agent", {
+  const registered = await ProviderConnector.register({
+    managementUrl,
     instanceKey: "provider-e2e-agent",
     name: "Provider E2E Agent",
-    isolatedSessions: true,
-    sessionResume: true,
-    structuredContextualOutput: true,
-    separateMemoryNamespace: true,
-    supportsCancellation: true,
-    maxConcurrency: 1,
-    operations: ["ask", "task", "review"],
-    artifactTypes: ["text", "report"],
-    isolationAssurance: "self-reported",
+    capabilities: {
+      isolatedSessions: true,
+      sessionResume: true,
+      structuredContextualOutput: true,
+      separateMemoryNamespace: true,
+      supportsCancellation: true,
+      maxConcurrency: 1,
+      operations: ["ask", "task", "review"],
+      artifactTypes: ["text", "report"],
+      isolationAssurance: "self-reported",
+    },
   });
   if (!registered.accessToken) throw new Error("initial provider registration returned no token");
   const agentId = registered.agent.id;
   const accessToken = registered.accessToken;
+  connector = new ProviderConnector({ managementUrl, agentId, accessToken, reconnectDelayMs: 50 });
   await post(`${managementUrl}/api/provider-agents/${agentId}/activate`, {});
   await put(`${managementUrl}/api/settings`, { guestInvitesEnabled: true });
   const invite = await post(`${managementUrl}/api/session-invites`, {
@@ -68,26 +70,14 @@ try {
     actionApprovalRule: "runtime-policy",
   });
 
-  const firstResponsePromise = guestMessage(session.id, cookie, "first turn");
-  const firstClaim = await tool(mcp, "claim_local_agent_request", {
-    agentId,
-    accessToken,
-    leaseSeconds: 60,
-    waitSeconds: 10,
+  const firstWorker = serveOne(connector, (job) => {
+    if (job.request.resumeSessionId !== undefined) {
+      throw new Error("first provider turn unexpectedly had a resume session");
+    }
+    return { text: answer("first answer"), sessionId: "native-session-persistent-1" };
   });
-  if (firstClaim.status !== "CLAIMED") throw new Error("first provider job was not claimed");
-  if (firstClaim.job.request.resumeSessionId !== undefined) {
-    throw new Error("first provider turn unexpectedly had a resume session");
-  }
-  await tool(mcp, "complete_local_agent_request", {
-    agentId,
-    accessToken,
-    jobId: firstClaim.job.id,
-    leaseToken: firstClaim.job.leaseToken,
-    text: answer("first answer"),
-    sessionId: "native-session-persistent-1",
-  });
-  const firstResponse = await firstResponsePromise;
+  const firstResponse = await guestMessage(session.id, cookie, "first turn");
+  await firstWorker;
   if (firstResponse.answer?.answer !== "first answer") {
     throw new Error("first guest response did not contain the provider answer");
   }
@@ -95,48 +85,64 @@ try {
   await stopGateway(gateway);
   gateway = startGateway();
   await waitReady();
-  await mcp.close();
-  mcp = await connectMcp("provider-e2e-2");
-  const reconnected = await tool(mcp, "register_local_agent", {
+  const reconnected = await ProviderConnector.register({
+    managementUrl,
     instanceKey: "provider-e2e-agent",
     name: "Provider E2E Agent",
     accessToken,
-    isolatedSessions: true,
-    sessionResume: true,
-    structuredContextualOutput: true,
-    separateMemoryNamespace: true,
-    supportsCancellation: true,
-    maxConcurrency: 1,
-    operations: ["ask", "task", "review"],
-    artifactTypes: ["text", "report"],
-    isolationAssurance: "self-reported",
+    capabilities: registered.agent.capabilities,
   });
   if (reconnected.agent.status !== "active") {
     throw new Error("provider Agent activation did not survive reconnect");
   }
 
-  const secondResponsePromise = guestMessage(session.id, cookie, "second turn");
-  const secondClaim = await tool(mcp, "claim_local_agent_request", {
-    agentId,
-    accessToken,
-    leaseSeconds: 60,
-    waitSeconds: 10,
+  connector = new ProviderConnector({ managementUrl, agentId, accessToken, reconnectDelayMs: 50 });
+  let resumedNativeSession;
+  const secondWorker = serveOne(connector, (job) => {
+    resumedNativeSession = job.request.resumeSessionId;
+    if (resumedNativeSession !== "native-session-persistent-1") {
+      throw new Error("second provider turn did not resume the persisted Agent session");
+    }
+    return { text: answer("second answer"), sessionId: "native-session-persistent-1" };
   });
-  if (secondClaim.status !== "CLAIMED") throw new Error("second provider job was not claimed");
-  if (secondClaim.job.request.resumeSessionId !== "native-session-persistent-1") {
-    throw new Error("second provider turn did not resume the persisted Agent session");
-  }
-  await tool(mcp, "complete_local_agent_request", {
-    agentId,
-    accessToken,
-    jobId: secondClaim.job.id,
-    leaseToken: secondClaim.job.leaseToken,
-    text: answer("second answer"),
-    sessionId: "native-session-persistent-1",
-  });
-  const secondResponse = await secondResponsePromise;
+  const secondResponse = await guestMessage(session.id, cookie, "second turn");
+  await secondWorker;
   if (secondResponse.answer?.answer !== "second answer") {
     throw new Error("second guest response did not contain the resumed provider answer");
+  }
+
+  const freshWorker = serveOne(connector, (job) => {
+    if (job.request.sessionIntent !== "new" || job.request.resumeSessionId !== undefined) {
+      throw new Error("new session intent did not create a fresh native session");
+    }
+    if (job.request.nativeSessionGeneration !== 2) {
+      throw new Error("new native session did not advance the opaque generation");
+    }
+    return { text: answer("fresh answer"), sessionId: "native-session-persistent-2" };
+  });
+  const freshResponse = await guestMessage(session.id, cookie, "fresh turn", {
+    sessionIntent: "new",
+  });
+  await freshWorker;
+  if (freshResponse.answer?.answer !== "fresh answer") {
+    throw new Error("fresh native session response was not returned");
+  }
+
+  const switchWorker = serveOne(connector, (job) => {
+    if (job.request.sessionIntent !== "switch"
+      || job.request.nativeSessionGeneration !== 1
+      || job.request.resumeSessionId !== "native-session-persistent-1") {
+      throw new Error("opaque native session generation was not switched safely");
+    }
+    return { text: answer("switched answer"), sessionId: "native-session-persistent-1" };
+  });
+  const switchResponse = await guestMessage(session.id, cookie, "switch turn", {
+    sessionIntent: "switch",
+    sessionGeneration: 1,
+  });
+  await switchWorker;
+  if (switchResponse.answer?.answer !== "switched answer") {
+    throw new Error("switched native session response was not returned");
   }
 
   console.log(JSON.stringify({
@@ -146,11 +152,13 @@ try {
     firstTurnCompleted: true,
     gatewayRestarted: true,
     providerReconnected: true,
-    resumedNativeSession: secondClaim.job.request.resumeSessionId,
+    passiveEventDelivery: true,
+    resumedNativeSession,
+    freshNativeSessionGeneration: 2,
+    opaqueSessionSwitch: true,
     secondTurnCompleted: true,
   }));
 } finally {
-  await mcp?.close().catch(() => undefined);
   if (gateway) await stopGateway(gateway).catch(() => undefined);
   rmSync(root, { recursive: true, force: true });
 }
@@ -204,29 +212,32 @@ async function waitReady() {
   throw new Error(`provider gateway did not become ready: ${gateway?.getOutput()}`);
 }
 
-async function connectMcp(name) {
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: ["dist/src/mcp.js"],
-    env: { ...process.env, JAMAI_DAEMON_URL: managementUrl, JAMAI_DB_PATH: dbPath },
-  });
-  const client = new Client({ name, version: "0.1.0" });
-  await client.connect(transport);
-  return client;
+async function serveOne(provider, handler) {
+  const controller = new AbortController();
+  let handled = false;
+  const running = provider.serve(async (job) => {
+    handled = true;
+    return handler(job);
+  }, controller.signal);
+  return {
+    then(resolve, reject) {
+      const deadline = Date.now() + 10_000;
+      const finish = async () => {
+        while (!handled && Date.now() < deadline) await delay(20);
+        controller.abort();
+        await running;
+        if (!handled) throw new Error("passive Provider Connector did not receive a job event");
+      };
+      finish().then(resolve, reject);
+    },
+  };
 }
 
-async function tool(client, name, args) {
-  const result = await client.callTool({ name, arguments: args });
-  const block = result.content?.find((item) => item.type === "text");
-  if (!block || block.type !== "text") throw new Error(`${name} returned no text`);
-  return JSON.parse(block.text);
-}
-
-async function guestMessage(sessionId, cookie, message) {
+async function guestMessage(sessionId, cookie, message, sessionControl = {}) {
   const response = await fetch(`${publicUrl}/guest/sessions/${sessionId}/messages`, {
     method: "POST",
     headers: { "content-type": "application/json", cookie },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, ...sessionControl }),
   });
   const text = await response.text();
   if (!response.ok) throw new Error(`guest message failed ${response.status}: ${text}`);

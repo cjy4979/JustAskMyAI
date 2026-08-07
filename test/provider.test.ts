@@ -50,6 +50,41 @@ test("Provider registration requires Owner activation before claiming work", () 
   gateway.close();
 });
 
+test("Provider event cursor reports durable arrival and lease requeue", () => {
+  const gateway = new GatewayStore(":memory:");
+  const providers = new ProviderStore(gateway);
+  const registered = providers.register({
+    instanceKey: "event-agent",
+    name: "Event Agent",
+    capabilities,
+  });
+  providers.approve(registered.agent.id);
+  const queued = providers.enqueue({
+    prompt: "event work",
+    contextId: "context-event",
+    taskId: "task-event",
+    externalSessionId: "external-event",
+    approvedScopes: [],
+    deniedScopes: [],
+    allowedResources: [],
+    deniedResources: [],
+  }, registered.agent.id);
+  const first = providers.listEvents(registered.agent.id);
+  assert.ok(first.some((event) => event.type === "job.available" && event.jobId === queued.id));
+  const claimed = providers.claim(registered.agent.id, registered.accessToken!);
+  assert.ok(claimed);
+  gateway.db.prepare("UPDATE provider_jobs SET lease_expires_at=? WHERE id=?")
+    .run(new Date(0).toISOString(), queued.id);
+  assert.equal(providers.listJobs().find((job) => job.id === queued.id)?.status, "pending");
+  const after = providers.listEvents(
+    registered.agent.id,
+    first[first.length - 1]!.sequence,
+  );
+  assert.ok(after.some((event) => event.type === "job.requeued" && event.jobId === queued.id));
+  assert.ok(after.some((event) => event.type === "job.available" && event.jobId === queued.id));
+  gateway.close();
+});
+
 test("ProviderAdapter persists an Agent session and resumes it after adapter restart", async () => {
   const root = mkdtempSync(path.join(tmpdir(), "jamai-provider-test-"));
   const filename = path.join(root, "gateway.db");

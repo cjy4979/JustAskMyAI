@@ -445,6 +445,7 @@ publicApp.post("/external/sessions/:id/messages", async (req, res) => {
       operation === "task" ? "task" : "caller-message",
       task,
       taskAuthority,
+      parseNativeSessionIntent(req.body?.sessionIntent, req.body?.sessionGeneration),
     ));
   } catch (error) {
     return res.status(400).json({ error: String(error) });
@@ -679,6 +680,8 @@ publicApp.post("/guest/redeem", (req, res) => {
       sessions.requireActive(req.params.id, guest.principalId);
       return res.json(await executeExternalMessage(
         req.params.id, requiredString(req.body?.message, "message"),
+        "caller-message", undefined, undefined,
+        parseNativeSessionIntent(req.body?.sessionIntent, req.body?.sessionGeneration),
       ));
     } catch (error) {
       return res.status(401).json({ error: String(error) });
@@ -764,6 +767,123 @@ managementApp.get("/api/capabilities", (_req, res) => res.json({
 }));
 managementApp.get("/api/provider-agents", (_req, res) => res.json(providerAgents.listAgents()));
 managementApp.get("/api/provider-jobs", (_req, res) => res.json(providerAgents.listJobs()));
+managementApp.get("/api/provider-jobs/:id", (req, res) => {
+  const job = providerAgents.getJob(req.params.id);
+  return job ? res.json(job) : res.status(404).json({ error: "provider job not found" });
+});
+managementApp.post("/api/provider/connect/register", (req, res) => {
+  try {
+    const capabilities = req.body?.capabilities;
+    if (!req.body?.instanceKey || !req.body?.name || !capabilities) {
+      return res.status(400).json({ error: "instanceKey, name, and capabilities are required" });
+    }
+    return res.json(providerAgents.register({
+      instanceKey: String(req.body.instanceKey),
+      name: String(req.body.name),
+      description: typeof req.body.description === "string" ? req.body.description : "",
+      accessToken: typeof req.body.accessToken === "string" ? req.body.accessToken : undefined,
+      capabilities,
+    }));
+  } catch (error) { return res.status(400).json({ error: String(error) }); }
+});
+managementApp.get("/api/provider/connect/status", (req, res) => {
+  try {
+    const credential = providerCredential(req);
+    return res.json(providerAgents.heartbeat(credential.agentId, credential.accessToken));
+  } catch (error) { return res.status(401).json({ error: String(error) }); }
+});
+managementApp.get("/api/provider/connect/events", (req, res) => {
+  let credential: { agentId: string; accessToken: string };
+  try {
+    credential = providerCredential(req);
+    providerAgents.heartbeat(credential.agentId, credential.accessToken);
+  } catch (error) { return res.status(401).json({ error: String(error) }); }
+  let cursor = Math.max(0, Number.parseInt(String(req.query.after ?? "0"), 10) || 0);
+  res.status(200);
+  res.setHeader("content-type", "text/event-stream");
+  res.setHeader("cache-control", "no-cache, no-transform");
+  res.setHeader("connection", "keep-alive");
+  res.flushHeaders();
+  let lastHeartbeat = Date.now();
+  const send = () => {
+    try {
+      const agent = Date.now() - lastHeartbeat >= 15_000
+        ? providerAgents.heartbeat(credential.agentId, credential.accessToken)
+        : providerAgents.getAgent(credential.agentId)!;
+      if (Date.now() - lastHeartbeat >= 15_000) lastHeartbeat = Date.now();
+      if (agent.status === "suspended") {
+        res.write("event: suspended\ndata: {}\n\n");
+        clearInterval(timer);
+        return res.end();
+      }
+      for (const event of providerAgents.listEvents(credential.agentId, cursor)) {
+        cursor = event.sequence;
+        res.write(`id: ${event.sequence}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+      }
+      res.write(`: heartbeat ${new Date().toISOString()}\n\n`);
+    } catch (error) {
+      res.write(`event: error\ndata: ${JSON.stringify({ error: String(error) })}\n\n`);
+      clearInterval(timer);
+      res.end();
+    }
+  };
+  const timer = setInterval(send, 1000);
+  timer.unref();
+  req.on("close", () => clearInterval(timer));
+  send();
+});
+managementApp.post("/api/provider/connect/claim", (req, res) => {
+  try {
+    const credential = providerCredential(req);
+    const job = providerAgents.claim(
+      credential.agentId, credential.accessToken, Number(req.body?.leaseSeconds ?? 45),
+    );
+    return res.json(job ? { status: "CLAIMED", job } : { status: "IDLE" });
+  } catch (error) { return res.status(401).json({ error: String(error) }); }
+});
+managementApp.post("/api/provider/connect/jobs/:id/renew", (req, res) => {
+  try {
+    const credential = providerCredential(req);
+    return res.json(providerAgents.renew(
+      credential.agentId, credential.accessToken, req.params.id,
+      String(req.body?.leaseToken ?? ""), Number(req.body?.leaseSeconds ?? 45),
+    ));
+  } catch (error) { return res.status(400).json({ error: String(error) }); }
+});
+managementApp.post("/api/provider/connect/jobs/:id/progress", (req, res) => {
+  try {
+    const credential = providerCredential(req);
+    return res.json(providerAgents.reportProgress(
+      credential.agentId, credential.accessToken, req.params.id,
+      String(req.body?.leaseToken ?? ""), {
+        message: String(req.body?.message ?? ""),
+        percent: typeof req.body?.percent === "number" ? req.body.percent : undefined,
+      },
+    ));
+  } catch (error) { return res.status(400).json({ error: String(error) }); }
+});
+managementApp.post("/api/provider/connect/jobs/:id/complete", (req, res) => {
+  try {
+    const credential = providerCredential(req);
+    return res.json(providerAgents.complete(
+      credential.agentId, credential.accessToken, req.params.id,
+      String(req.body?.leaseToken ?? ""), {
+        text: String(req.body?.text ?? ""),
+        sessionId: typeof req.body?.sessionId === "string" ? req.body.sessionId : undefined,
+        degradedRehydration: req.body?.degradedRehydration === true,
+      },
+    ));
+  } catch (error) { return res.status(400).json({ error: String(error) }); }
+});
+managementApp.post("/api/provider/connect/jobs/:id/fail", (req, res) => {
+  try {
+    const credential = providerCredential(req);
+    return res.json(providerAgents.fail(
+      credential.agentId, credential.accessToken, req.params.id,
+      String(req.body?.leaseToken ?? ""), String(req.body?.error ?? "provider failed"),
+    ));
+  } catch (error) { return res.status(400).json({ error: String(error) }); }
+});
 managementApp.post("/api/provider-agents/:id/activate", (req, res) => {
   try {
     const activated = providerAgents.approve(req.params.id);
@@ -1654,7 +1774,13 @@ async function executeExternalMessage(
     allowedResources: string[];
     deniedResources: string[];
   },
+  sessionControl: { intent: "continue" | "new" | "switch"; generation?: number }
+    = { intent: "continue" },
 ): Promise<unknown> {
+  const sessionIntent = sessionControl.intent;
+  if (sessionIntent === "switch" && adapter.id !== "provider") {
+    throw new Error("native session switching requires a Provider Connector");
+  }
   const session = sessions.getSession(sessionId);
   if (!session || session.status !== "active") {
     if (session && ["revoked", "expired", "closed"].includes(session.status)) {
@@ -1720,6 +1846,7 @@ async function executeExternalMessage(
       selectedContextRefs: projected.map((item) => item.id),
       checkpointId: checkpoint?.id,
       checkpointDigest: checkpoint?.summaryDigest,
+      nativeSessionIntent: sessionIntent,
     },
   });
   const controller = new AbortController();
@@ -1730,7 +1857,9 @@ async function executeExternalMessage(
       prompt,
       contextId: session.a2aContextId ?? session.id,
       externalSessionId: session.id,
-      resumeSessionId: previous?.localSessionId,
+      resumeSessionId: sessionIntent === "continue" ? previous?.localSessionId : undefined,
+      sessionIntent,
+      requestedNativeSessionGeneration: sessionControl.generation,
       taskId: typeof task?.id === "string" ? task.id : randomUUID(),
       signal: controller.signal,
       approvedScopes: taskAuthority?.allowedScopes ?? [],
@@ -1933,6 +2062,30 @@ function streamSessionEvents(
     clearInterval(eventTimer);
     clearInterval(heartbeat);
   });
+}
+
+function providerCredential(req: { header(name: string): string | undefined }): {
+  agentId: string;
+  accessToken: string;
+} {
+  const authorization = req.header("authorization") ?? "";
+  const accessToken = authorization.startsWith("Bearer ")
+    ? authorization.slice("Bearer ".length).trim() : "";
+  const agentId = (req.header("x-jama-provider-agent") ?? "").trim();
+  if (!agentId || !accessToken) throw new Error("provider credential is required");
+  return { agentId, accessToken };
+}
+
+function parseNativeSessionIntent(
+  value: unknown,
+  generation: unknown,
+): { intent: "continue" | "new" | "switch"; generation?: number } {
+  if (value === undefined || value === "continue") return { intent: "continue" };
+  if (value === "new") return { intent: "new" };
+  if (value === "switch" && Number.isInteger(generation) && Number(generation) >= 0) {
+    return { intent: "switch", generation: Number(generation) };
+  }
+  throw new Error("sessionIntent must be continue, new, or switch with a valid sessionGeneration");
 }
 
 function parseSensitivity(value: unknown): Sensitivity {

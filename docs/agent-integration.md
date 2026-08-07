@@ -11,7 +11,8 @@ Agents that cannot run that contract.
 flowchart LR
   Caller["Caller Agent"] -->|"caller Skill + MCP"| Gateway["JAMA gateway"]
   Gateway --> Queue["durable authorized job queue"]
-  Queue -->|"provider MCP tools"| Provider["Owner's existing Agent"]
+  Queue -->|"SSE event + leased job"| Connector["local Connector"]
+  Connector -->|"invoke only when work arrives"| Provider["Owner's existing Agent"]
   Provider --> Native["Agent-owned tools, memory, and native session"]
   Native --> Provider
   Provider -->|"structured result + native session ID"| Queue
@@ -41,20 +42,35 @@ The boundary is deliberate:
    npm run dev:node
    ```
 
-2. Configure the repository's `just_ask_my_ai` STDIO MCP server in the Agent. The project
-   scoped Codex configuration is an example; use the Agent's normal MCP configuration
-   mechanism. The MCP process and gateway must use the same absolute or working-directory-
-   relative `JAMAI_DB_PATH`; the included LAN script and Codex config both use
-   `.jamai/lan-gateway.db`.
-3. Give the Agent [the JAMA Provider Skill](../.agents/skills/jama-provider/SKILL.md). The Skill tells
-   it how to register, preserve credentials, claim work, renew leases, resume native sessions,
-   and return contextual answers.
-4. The Agent calls `register_local_agent`. First registration returns a one-time credential;
-   the Agent stores it in its private local configuration.
+2. Run a small host-level Connector beside the Agent. Use `ProviderConnector` from
+   `src/provider/connector.ts`, or implement the documented HTTP/SSE contract. The Connector
+   owns transport and leases; it calls the Agent platform only after work arrives.
+3. Give integrations that can understand Skills [the JAMA Provider Skill](../.agents/skills/jama-provider/SKILL.md).
+   The Skill defines authority handling, native-session behavior, and the contextual result.
+4. Register once through `ProviderConnector.register`. First registration returns a one-time
+   credential; store it in that Agent installation's private local configuration.
 5. Open the Owner Hub at `http://127.0.0.1:43121/chat`. Confirm the pending Agent only after
    checking its name and declared capabilities.
-6. Keep the Agent's provider loop running. It long-polls JAMA and remains idle until an
-   Owner-authorized request is available.
+6. Keep the lightweight Connector service running. Its SSE connection is passive: while idle,
+   no Agent conversation or model turn exists. MCP claim tools remain a compatibility and
+   development path, not the recommended always-on runtime.
+
+Minimal host integration:
+
+```ts
+const connector = new ProviderConnector({ managementUrl, agentId, accessToken });
+await connector.serve(async (job) => {
+  const native = job.request.resumeSessionId
+    ? await agent.resume(job.request.resumeSessionId, job.request.prompt)
+    : await agent.start(job.request.prompt);
+  return { text: native.contextualResult, sessionId: native.sessionId };
+}, shutdownSignal);
+```
+
+Hermes/OpenClaw-style gateways should implement this as one channel or transport plugin in
+their existing always-on process. CLI-oriented Agents can use a tiny supervised sidecar that
+starts or resumes the CLI only when `job.available` is delivered. JAMA does not edit either
+platform's configuration, planner, tools, or memory.
 
 Provider registration is intentionally two-sided: an Agent can request a connection, but
 only the local Owner can activate it. Suspending the Agent invalidates its ability to claim
@@ -63,8 +79,8 @@ new jobs and requeues its leased work.
 ## Persistent External Session behavior
 
 Each completed provider turn may return the Agent's native `sessionId`. JAMA stores this
-mapping in SQLite against the External Session. A later turn includes it as
-`resumeSessionId`, including after the JAMA gateway and MCP provider reconnect.
+mapping locally against the External Session as an opaque generation. A later turn includes
+it as `resumeSessionId`, including after the JAMA gateway and Connector reconnect.
 JAMA pins later turns to the provider Agent that created that native session, so a second
 locally connected Agent cannot claim the job or receive another Agent's session ID.
 
@@ -75,6 +91,15 @@ that it performed degraded rehydration instead of pretending continuity.
 
 JAMA persists the External Thread independently of the Agent's native session. This gives
 the audit and consent layer durable history without importing the Agent's unrelated memory.
+
+Session control is intentionally narrow:
+
+- `continue` resumes the active generation;
+- `new` creates a fresh native session and advances the generation;
+- `switch` selects a prior generation by number.
+
+The remote caller never supplies or learns a native session ID. Generation-to-native-ID
+resolution stays on the receiving machine and remains pinned to the same Provider identity.
 
 ## Capability and trust semantics
 
@@ -99,9 +124,9 @@ Run:
 npm run test:provider-e2e
 ```
 
-The test registers a provider, confirms Owner activation, opens and approves a guest External
-Session, completes a first turn with a native session ID, restarts the gateway, reconnects the
-provider, verifies that the second turn receives the same native session ID, and completes it.
+The test registers a provider, confirms Owner activation, receives work through the passive
+event stream, completes a first turn, restarts the gateway, reconnects, resumes the same
+native session, then verifies fresh-session creation and opaque generation switching.
 
 Passing this test proves the JAMA-side contract and restart mapping. It does not prove that a
 specific third-party Agent truthfully enforces every capability it advertises; that remains

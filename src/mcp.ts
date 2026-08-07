@@ -803,10 +803,14 @@ server.registerTool(
       peerUrl: z.string().url(),
       sessionId: z.string().min(1),
       message: z.string().min(1),
+      sessionIntent: z.enum(["continue", "new", "switch"]).default("continue"),
+      sessionGeneration: z.number().int().nonnegative().optional(),
     },
   },
-  async ({ peerUrl, sessionId, message }) => text(JSON.stringify(
-    await sendExternalInteraction(peerUrl, sessionId, message, "ask"),
+  async ({ peerUrl, sessionId, message, sessionIntent, sessionGeneration }) => text(JSON.stringify(
+    await sendExternalInteraction(
+      peerUrl, sessionId, message, "ask", sessionIntent, sessionGeneration,
+    ),
     null,
     2,
   )),
@@ -828,11 +832,14 @@ server.registerTool(
       deniedResources: z.array(z.string().min(1)).default([]),
       taskId: z.string().min(1).optional(),
       taskApprovalId: z.string().min(1).optional(),
+      sessionIntent: z.enum(["continue", "new", "switch"]).default("continue"),
+      sessionGeneration: z.number().int().nonnegative().optional(),
     },
   },
   async ({
     peerUrl, sessionId, objective, acceptanceCriteria, expectedArtifactType,
     requestedScopes, deniedScopes, resources, deniedResources, taskId, taskApprovalId,
+    sessionIntent, sessionGeneration,
   }) => {
     const task = {
       id: taskId ?? randomUUID(),
@@ -850,6 +857,8 @@ server.registerTool(
       task,
       taskApprovalId,
       message: JSON.stringify(task),
+      sessionIntent,
+      sessionGeneration,
     };
     return text(JSON.stringify(await signedExternalFetch(
       peerUrl,
@@ -1496,8 +1505,12 @@ async function sendExternalInteraction(
   sessionId: string,
   message: string,
   operation: "ask" | "task",
+  sessionIntent: "continue" | "new" | "switch" = "continue",
+  sessionGeneration?: number,
 ): Promise<unknown> {
-  const body = { callerPrincipalId: principalId, operation, message };
+  const body = {
+    callerPrincipalId: principalId, operation, message, sessionIntent, sessionGeneration,
+  };
   return signedExternalFetch(
     peerUrl,
     `/external/sessions/${encodeURIComponent(sessionId)}/messages`,

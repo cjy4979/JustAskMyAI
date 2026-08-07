@@ -32,15 +32,32 @@ export class ProviderAdapter implements AgentAdapter {
   }
 
   async run(request: AgentRequest): Promise<AgentResult> {
+    const sessionIntent = request.sessionIntent ?? "continue";
     const persisted = request.externalSessionId
       ? this.gateway.getAgentSession(request.externalSessionId)
       : undefined;
+    const requestedGeneration = sessionIntent === "switch"
+      ? request.requestedNativeSessionGeneration : undefined;
+    const binding = request.externalSessionId
+      ? this.providers.getSessionBinding(request.externalSessionId, requestedGeneration)
+      : undefined;
+    if (sessionIntent === "switch" && !binding) {
+      throw new Error("requested native session generation is not available");
+    }
+    const generation = sessionIntent === "new"
+      ? (request.externalSessionId
+        ? (this.providers.getSessionBinding(request.externalSessionId)?.generation ?? 0) + 1
+        : 1)
+      : binding?.generation ?? 1;
     const job = this.providers.enqueue(providerRequest({
       ...request,
-      resumeSessionId: request.resumeSessionId ?? persisted?.localSessionId,
-    }), persisted?.peerId.startsWith("provider:")
+      sessionIntent,
+      nativeSessionGeneration: generation,
+      resumeSessionId: sessionIntent === "new" ? undefined
+        : binding?.nativeSessionId ?? request.resumeSessionId ?? persisted?.localSessionId,
+    }), binding?.agentId ?? (persisted?.peerId.startsWith("provider:")
       ? persisted.peerId.slice("provider:".length)
-      : undefined);
+      : undefined));
     const deadline = Date.now() + this.timeoutMs;
     while (Date.now() < deadline) {
       if (request.signal.aborted) {

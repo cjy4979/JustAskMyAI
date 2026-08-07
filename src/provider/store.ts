@@ -6,9 +6,19 @@ import type {
   ProviderCapabilities,
   ProviderJob,
   ProviderJobRequest,
+  ProviderEvent,
+  ProviderEventType,
 } from "./types.js";
 
 type Row = Record<string, unknown>;
+
+export interface ProviderSessionBinding {
+  externalSessionId: string;
+  agentId: string;
+  nativeSessionId: string;
+  generation: number;
+  updatedAt: string;
+}
 
 export class ProviderStore {
   constructor(private readonly gateway: GatewayStore) {
@@ -100,6 +110,7 @@ export class ProviderStore {
       SET status='active', capabilities_json=?, approved_at=?, updated_at=?
       WHERE id=?
     `).run(JSON.stringify(capabilities), now, now, agentId);
+    this.emit("agent.activated", { agentId }, agentId);
     return this.getAgent(agentId)!;
   }
 
@@ -108,12 +119,14 @@ export class ProviderStore {
     this.gateway.db.prepare(
       "UPDATE provider_agents SET status='suspended', updated_at=? WHERE id=?",
     ).run(new Date().toISOString(), agentId);
-    this.gateway.db.prepare(`
+    const requeued = this.gateway.db.prepare(`
       UPDATE provider_jobs
       SET status='pending', agent_id=NULL, lease_token_hash=NULL, lease_expires_at=NULL,
           updated_at=?
       WHERE agent_id=? AND status='claimed'
     `).run(new Date().toISOString(), agentId);
+    if (requeued.changes > 0) this.emit("job.requeued", { reason: "agent-suspended" });
+    this.emit("agent.suspended", { agentId }, agentId);
     return this.getAgent(agentId)!;
   }
 
@@ -169,6 +182,7 @@ export class ProviderStore {
       now,
       now,
     );
+    this.emit("job.available", { status: "pending" }, preferredAgentId, id);
     return this.getJob(id)!;
   }
 
@@ -203,6 +217,7 @@ export class ProviderStore {
       `).run(agentId, hash(leaseToken), expiresAt, now, String(row.id));
       this.gateway.db.exec("COMMIT");
       if (changed.changes !== 1) return undefined;
+      this.emit("job.claimed", { attempt: Number(row.attempt) + 1 }, agentId, String(row.id));
       return { ...this.getJob(String(row.id))!, agentId, leaseToken };
     } catch (error) {
       this.gateway.db.exec("ROLLBACK");
@@ -272,12 +287,44 @@ export class ProviderStore {
           adapterId: "provider",
           localSessionId: result.sessionId,
         });
+        this.gateway.db.prepare(`
+          INSERT INTO provider_session_bindings (
+            external_session_id, agent_id, native_session_id, generation, updated_at
+          ) VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(external_session_id) DO UPDATE SET
+            agent_id=excluded.agent_id,
+            native_session_id=excluded.native_session_id,
+            generation=excluded.generation,
+            updated_at=excluded.updated_at
+        `).run(
+          job.request.externalSessionId,
+          agentId,
+          result.sessionId,
+          job.request.nativeSessionGeneration ?? (job.request.resumeSessionId ? 1 : 0),
+          now,
+        );
+        this.gateway.db.prepare(`
+          INSERT INTO provider_native_sessions (
+            external_session_id, generation, agent_id, native_session_id, updated_at
+          ) VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(external_session_id, generation) DO UPDATE SET
+            agent_id=excluded.agent_id,
+            native_session_id=excluded.native_session_id,
+            updated_at=excluded.updated_at
+        `).run(
+          job.request.externalSessionId,
+          job.request.nativeSessionGeneration ?? (job.request.resumeSessionId ? 1 : 0),
+          agentId,
+          result.sessionId,
+          now,
+        );
       }
       this.gateway.db.exec("COMMIT");
     } catch (error) {
       this.gateway.db.exec("ROLLBACK");
       throw error;
     }
+    this.emit("job.completed", { status: "completed" }, agentId, jobId);
     return this.getJob(jobId)!;
   }
 
@@ -296,6 +343,7 @@ export class ProviderStore {
           lease_token_hash=NULL, lease_expires_at=NULL
       WHERE id=? AND agent_id=? AND status='claimed'
     `).run(error, now, now, jobId, agentId);
+    this.emit("job.failed", { error }, agentId, jobId);
     return this.getJob(jobId)!;
   }
 
@@ -307,6 +355,7 @@ export class ProviderStore {
       UPDATE provider_jobs SET status='cancelled', completed_at=?, updated_at=?,
         lease_token_hash=NULL, lease_expires_at=NULL WHERE id=?
     `).run(now, now, jobId);
+    this.emit("job.cancelled", { status: "cancelled" }, job.agentId, jobId);
     return this.getJob(jobId);
   }
 
@@ -329,9 +378,46 @@ export class ProviderStore {
     `).all(limit) as Row[]).map(mapJob);
   }
 
+  getSessionBinding(
+    externalSessionId: string,
+    generation?: number,
+  ): ProviderSessionBinding | undefined {
+    const row = generation === undefined
+      ? this.gateway.db.prepare(`
+          SELECT * FROM provider_session_bindings WHERE external_session_id=?
+        `).get(externalSessionId) as Row | undefined
+      : this.gateway.db.prepare(`
+          SELECT * FROM provider_native_sessions
+          WHERE external_session_id=? AND generation=?
+        `).get(externalSessionId, generation) as Row | undefined;
+    return row ? {
+      externalSessionId: String(row.external_session_id),
+      agentId: String(row.agent_id),
+      nativeSessionId: String(row.native_session_id),
+      generation: Number(row.generation),
+      updatedAt: String(row.updated_at),
+    } : undefined;
+  }
+
+  listEvents(agentId: string, afterSequence = 0, limit = 100): ProviderEvent[] {
+    this.requireKnownAgent(agentId);
+    return (this.gateway.db.prepare(`
+      SELECT * FROM provider_events
+      WHERE sequence>? AND (agent_id IS NULL OR agent_id=?)
+      ORDER BY sequence ASC LIMIT ?
+    `).all(Math.max(0, Math.floor(afterSequence)), agentId, Math.min(500, Math.max(1, limit))) as Row[])
+      .map(mapEvent);
+  }
+
   private requireAuth(agentId: string, accessToken: string): ProviderAgent {
     if (!this.authenticate(agentId, accessToken)) throw new Error("invalid provider credential");
     return this.getAgent(agentId)!;
+  }
+
+  private requireKnownAgent(agentId: string): ProviderAgent {
+    const agent = this.getAgent(agentId);
+    if (!agent) throw new Error("provider agent not found");
+    return agent;
   }
 
   private requireLease(
@@ -355,12 +441,33 @@ export class ProviderStore {
 
   private requeueExpired(): void {
     const now = new Date().toISOString();
+    const expired = this.gateway.db.prepare(`
+      SELECT id, target_agent_id FROM provider_jobs
+      WHERE status='claimed' AND lease_expires_at<=?
+    `).all(now) as Array<{ id: string; target_agent_id?: string }>;
     this.gateway.db.prepare(`
       UPDATE provider_jobs
       SET status='pending', agent_id=NULL, lease_token_hash=NULL, lease_expires_at=NULL,
           updated_at=?
       WHERE status='claimed' AND lease_expires_at<=?
     `).run(now, now);
+    for (const job of expired) {
+      this.emit("job.requeued", { reason: "lease-expired" }, job.target_agent_id, job.id);
+      this.emit("job.available", { status: "pending", reason: "lease-expired" }, job.target_agent_id, job.id);
+    }
+  }
+
+
+  private emit(
+    type: ProviderEventType,
+    data: Record<string, unknown>,
+    agentId?: string,
+    jobId?: string,
+  ): void {
+    this.gateway.db.prepare(`
+      INSERT INTO provider_events (id, type, agent_id, job_id, data_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(randomUUID(), type, agentId ?? null, jobId ?? null, JSON.stringify(data), new Date().toISOString());
   }
 
   private migrate(): void {
@@ -402,6 +509,38 @@ export class ProviderStore {
         ON provider_jobs(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_provider_jobs_session
         ON provider_jobs(external_session_id, created_at);
+      CREATE TABLE IF NOT EXISTS provider_events (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        id TEXT NOT NULL UNIQUE,
+        type TEXT NOT NULL,
+        agent_id TEXT,
+        job_id TEXT,
+        data_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_provider_events_agent_sequence
+        ON provider_events(agent_id, sequence);
+      CREATE TABLE IF NOT EXISTS provider_session_bindings (
+        external_session_id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        native_session_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(agent_id) REFERENCES provider_agents(id)
+      );
+      CREATE TABLE IF NOT EXISTS provider_native_sessions (
+        external_session_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        agent_id TEXT NOT NULL,
+        native_session_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(external_session_id, generation),
+        FOREIGN KEY(agent_id) REFERENCES provider_agents(id)
+      );
+      INSERT OR IGNORE INTO provider_native_sessions (
+        external_session_id, generation, agent_id, native_session_id, updated_at
+      ) SELECT external_session_id, generation, agent_id, native_session_id, updated_at
+        FROM provider_session_bindings;
     `);
     const columns = this.gateway.db.prepare("PRAGMA table_info(provider_jobs)")
       .all() as Array<{ name: string }>;
@@ -409,6 +548,18 @@ export class ProviderStore {
       this.gateway.db.exec("ALTER TABLE provider_jobs ADD COLUMN target_agent_id TEXT");
     }
   }
+}
+
+function mapEvent(row: Row): ProviderEvent {
+  return {
+    sequence: Number(row.sequence),
+    id: String(row.id),
+    type: String(row.type) as ProviderEvent["type"],
+    agentId: nullable(row.agent_id),
+    jobId: nullable(row.job_id),
+    data: JSON.parse(String(row.data_json)) as Record<string, unknown>,
+    createdAt: String(row.created_at),
+  };
 }
 
 function normalizeCapabilities(value: ProviderCapabilities): ProviderCapabilities {
@@ -443,11 +594,18 @@ function mapAgent(row: Row): ProviderAgent {
 }
 
 function mapJob(row: Row): ProviderJob {
+  const parsed = JSON.parse(String(row.request_json)) as ProviderJobRequest;
+  const request = {
+    ...parsed,
+    sessionIntent: parsed.sessionIntent ?? "continue",
+    nativeSessionGeneration: parsed.nativeSessionGeneration ?? (parsed.resumeSessionId ? 1 : 0),
+  } satisfies ProviderJobRequest;
   return {
     id: String(row.id),
     agentId: nullable(row.agent_id),
+    targetAgentId: nullable(row.target_agent_id),
     status: String(row.status) as ProviderJob["status"],
-    request: JSON.parse(String(row.request_json)) as ProviderJobRequest,
+    request,
     result: row.result_json ? JSON.parse(String(row.result_json)) : undefined,
     error: nullable(row.error),
     progress: row.progress_json ? JSON.parse(String(row.progress_json)) : undefined,

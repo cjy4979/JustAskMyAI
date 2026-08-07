@@ -1,4 +1,4 @@
 interface:
   display_name: "JAMA Provider"
-  short_description: "Serve durable JAMA work through MCP"
-  default_prompt: "Use $jama-provider to connect this Agent to JAMA and serve authorized External Session work."
+  short_description: "Serve passive, durable JAMA work"
+  default_prompt: "Use $jama-provider to connect this Agent through a passive Connector and serve authorized External Session work."

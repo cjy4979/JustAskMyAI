@@ -1,4 +1,19 @@
-# Provider MCP Protocol
+# Provider Connector Protocol
+
+## Preferred passive transport
+
+Connect to the localhost management API with `Authorization: Bearer <accessToken>` and
+`X-JAMA-Provider-Agent: <agentId>`. Keep credentials in the host's private configuration.
+
+`GET /api/provider/connect/events?after=<sequence>` is an SSE stream. Events have durable,
+monotonic sequence numbers. Reconnect with the last observed sequence; replay is safe because
+claim is atomic. The open stream and heartbeat run in ordinary code and do not require an
+Agent/model turn. On `job.available`, call `POST /api/provider/connect/claim` until it returns
+`IDLE`.
+
+The TypeScript reference client is `src/provider/connector.ts`. It handles stream reconnect,
+claim draining, lease renewal, completion, and failure. The receiving platform supplies only
+the function that starts or resumes its own native Agent session.
 
 ## Registration
 
@@ -6,7 +21,7 @@
 
 Store credentials in the Agent host's private configuration. JAMA stores only a token hash and cannot reveal the token again.
 
-## Durable Claim Loop
+## MCP compatibility loop
 
 Call `claim_local_agent_request` with `agentId`, `accessToken`, a 15-300 second lease, and an optional 0-25 second wait. A claimed response contains:
 
@@ -23,6 +38,8 @@ Call `claim_local_agent_request` with `agentId`, `accessToken`, a 15-300 second 
       "taskId": "JAMA task",
       "externalSessionId": "optional durable External Session",
       "resumeSessionId": "optional native Agent session",
+      "sessionIntent": "continue | new | switch",
+      "nativeSessionGeneration": 1,
       "approvedScopes": [],
       "deniedScopes": [],
       "allowedResources": [],
@@ -34,7 +51,12 @@ Call `claim_local_agent_request` with `agentId`, `accessToken`, a 15-300 second 
 
 The lease token is job-specific. Renew it before expiration. Expired claims can be requeued after a gateway or Agent crash. Completion is idempotence-sensitive: do not repeat irreversible side effects after losing a lease.
 
-JAMA persists `externalSessionId -> native sessionId` when completion succeeds. After either process restarts, the next job includes `resumeSessionId`. If native resume is unavailable, create an isolated replacement and set `degradedRehydration: true`; do not falsely claim native continuity.
+JAMA persists native sessions locally as opaque generations. `continue` uses the active
+generation, `new` creates the next generation, and `switch` selects a prior generation. A
+remote caller may name only the generation; JAMA resolves the private native session ID on
+the receiving machine. After either process restarts, the job includes the resolved
+`resumeSessionId`. If native resume is unavailable, create an isolated replacement and set
+`degradedRehydration: true`; do not falsely claim native continuity.
 
 Later turns are pinned to the provider Agent that returned the native session ID. Do not
 transfer or disclose native session IDs between Agent installations.
