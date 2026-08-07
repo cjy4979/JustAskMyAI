@@ -149,12 +149,20 @@ than relying on the most recent thread window.
 
 ## Guest invitations
 
-Guest endpoints are disabled unless `JAMAI_ENABLE_GUEST_INVITES=true`. A link contains a
-256-bit token in its URL fragment. The database stores only its SHA-256 hash. Tokens expire
-after 15 minutes and can be redeemed once. The resulting cookie is HttpOnly and SameSite
-Strict, and receives `Secure` when the configured public URL uses HTTPS.
+Guest redemption is disabled by default. The Owner can enable it from the localhost Owner
+Hub; the setting is persisted locally. `JAMAI_ENABLE_GUEST_INVITES=true` remains a startup
+default for automated deployments, but a persisted Owner choice takes precedence. The public
+guest page may remain reachable while redemption is disabled so it can fail with a clear
+message rather than a missing route. A link contains a 256-bit token in its URL fragment. The
+database stores only its SHA-256 hash. Tokens expire after 15 minutes and can be redeemed
+once. The resulting cookie is HttpOnly and SameSite Strict, and receives `Secure` when the
+configured public URL uses HTTPS.
 The server also stores a hashed session binding with its own expiry; cookie presence alone
 does not authorize HTTP or SSE access.
+
+The guest UI follows status events and also polls an authenticated session snapshot. This
+allows a request-only invitation to unlock after Owner approval even when SSE is unavailable
+or temporarily interrupted.
 
 An invitation binds the Owner Agent, purpose, collections, sensitivity, operations, maximum
 lease, and whether redemption is pre-authorized or requires Owner consent. Guests are marked

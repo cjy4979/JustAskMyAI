@@ -86,6 +86,23 @@ npm run dev:mcp
 The default public A2A URL is `http://127.0.0.1:43120`. Local management is
 available only at `http://127.0.0.1:43121`.
 
+### Use the Owner Hub
+
+Open `http://127.0.0.1:43121/chat` after the gateway starts. The Owner Hub is the
+primary human interface; normal use should not require management API commands or copying
+internal IDs. It provides:
+
+- a single inbox for access requests, task approvals, egress confirmations, and writebacks;
+- persistent External Session cards with pause, resume, revoke, and conversation history;
+- a multi-task board, paired people directory, and explicit Context Collection manager;
+- an in-product setup checklist and runtime switch for guest invitation links;
+- invite creation with human-readable purpose, selected knowledge, actions, and lease;
+- a responsive guest chat that unlocks automatically after Owner approval and falls back
+  to authenticated polling when a streaming connection is interrupted.
+
+Guest links remain disabled by default. The Owner can enable them from **Settings** or while
+creating the first invite. The choice is stored locally and can be reversed at any time.
+
 ### Use with Codex or ChatGPT
 
 This repository includes a project-scoped Codex MCP configuration at

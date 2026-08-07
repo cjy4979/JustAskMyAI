@@ -55,6 +55,8 @@ import type {
   AgentProfile, ContextAuthority, ContextCollection, EgressGrant, ExternalSession,
   ExternalSessionEnvelope, Sensitivity, SessionInvite, SessionStatus,
 } from "./session/types.js";
+import { ownerPage } from "./ui/owner-page.js";
+import { guestPage } from "./ui/guest-page.js";
 
 const config = loadConfig();
 const store = new GatewayStore();
@@ -578,10 +580,12 @@ publicApp.post("/external/sessions/:id/close", (req, res) => {
   void adapter.closeSession?.(session.id);
   return res.json(closed);
 });
-if (process.env.JAMAI_ENABLE_GUEST_INVITES === "true") {
-  publicApp.get("/guest", (_req, res) => res.type("html").send(guestPage()));
-  publicApp.post("/guest/redeem", (req, res) => {
+publicApp.get("/guest", (_req, res) => res.type("html").send(guestPage()));
+publicApp.post("/guest/redeem", (req, res) => {
     try {
+      if (!guestInvitesEnabled()) {
+        return res.status(403).json({ error: "guest invitations are disabled" });
+      }
       if (!consumeGuestRate(`redeem:${req.ip}`, 10, 60_000)) {
         return res.status(429).json({ error: "guest invitation rate limit exceeded" });
       }
@@ -653,6 +657,16 @@ if (process.env.JAMAI_ENABLE_GUEST_INVITES === "true") {
       return res.status(400).json({ error: String(error) });
     }
   });
+  publicApp.get("/guest/sessions/:id", (req, res) => {
+    const guest = guestCookie(req.header("cookie"), sessions);
+    if (!guest || guest.sessionId !== req.params.id) {
+      return res.status(401).json({ error: "invalid guest session" });
+    }
+    const session = sessions.getSession(req.params.id);
+    return session
+      ? res.json({ session, events: sessions.listEvents(session.id) })
+      : res.status(404).json({ error: "session not found" });
+  });
   publicApp.post("/guest/sessions/:id/messages", async (req, res) => {
     try {
       if (!consumeGuestRate(`message:${req.params.id}:${req.ip}`, 30, 60_000)) {
@@ -675,7 +689,6 @@ if (process.env.JAMAI_ENABLE_GUEST_INVITES === "true") {
     }
     return streamSessionEvents(req.params.id, req, res);
   });
-}
 publicApp.use(`/${AGENT_CARD_PATH}`, agentCardHandler({ agentCardProvider: handler }));
 publicApp.get("/groups/:id/manifest", (req, res) => {
   try {
@@ -746,6 +759,29 @@ managementApp.get("/api/capabilities", (_req, res) => res.json({
   dockerRequired: contextIsolationPolicy() === "strict" && adapter.id === "acp-sandbox",
   profile: sessions.getProfile(agentId) ?? defaultProfile,
 }));
+managementApp.get("/api/settings", (_req, res) => res.json({
+  guestInvitesEnabled: guestInvitesEnabled(),
+  publicUrl: config.publicUrl,
+  managementUrl: config.managementUrl,
+  name: config.name,
+}));
+managementApp.put("/api/settings", (req, res) => {
+  if (typeof req.body?.guestInvitesEnabled === "boolean") {
+    store.setMeta("settings.guestInvitesEnabled", String(req.body.guestInvitesEnabled));
+    const profile = sessions.getProfile(agentId) ?? defaultProfile;
+    sessions.saveProfile({
+      ...profile,
+      allowGuest: req.body.guestInvitesEnabled,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+  return res.json({
+    guestInvitesEnabled: guestInvitesEnabled(),
+    publicUrl: config.publicUrl,
+    managementUrl: config.managementUrl,
+    name: config.name,
+  });
+});
 managementApp.get("/chat", (_req, res) => res.type("html").send(ownerPage()));
 managementApp.get("/api/remote-capabilities/:peerId", async (req, res) => {
   try {
@@ -1123,7 +1159,7 @@ managementApp.post("/api/writebacks/:id/resolve", (req, res) => {
 });
 managementApp.post("/api/session-invites", (req, res) => {
   try {
-    if (process.env.JAMAI_ENABLE_GUEST_INVITES !== "true") {
+    if (!guestInvitesEnabled()) {
       return res.status(403).json({ error: "guest invitations are disabled" });
     }
     const token = randomBytes(32).toString("base64url");
@@ -1987,95 +2023,6 @@ function consumeGuestRate(key: string, limit: number, windowMs: number): boolean
   return true;
 }
 
-function guestPage(): string {
-  return `<!doctype html><html><head><meta charset="utf-8"><title>Ask this AI</title>
-  <style>body{font:16px system-ui;max-width:760px;margin:40px auto;padding:0 18px}
-  textarea{width:100%;min-height:100px}pre{white-space:pre-wrap;background:#f4f4f4;padding:12px}</style>
-  </head><body><h1>Ask this person's AI</h1><p id="state">Redeeming invitation…</p>
-  <textarea id="message" placeholder="Ask a question"></textarea><button id="send" disabled>Send</button>
-  <pre id="output"></pre><script>
-  let session;const stateEl=document.getElementById("state"),sendEl=document.getElementById("send"),
-  messageEl=document.getElementById("message"),outputEl=document.getElementById("output");
-  async function start(){const token=location.hash.slice(1);history.replaceState(null,"",location.pathname);
-  const r=await fetch("/guest/redeem",{method:"POST",headers:{"content-type":"application/json"},
-  body:JSON.stringify({token})});session=await r.json();stateEl.textContent=session.status||session.error;
-  if(!r.ok)return;sendEl.disabled=session.status!=="active";
-  const events=new EventSource("/guest/sessions/"+session.id+"/events");
-  for(const name of ["caller-message","agent-message","task","escalation","status"]){
-  events.addEventListener(name,(event)=>{outputEl.textContent=event.data+"\\n"+outputEl.textContent})}}
-  sendEl.onclick=async()=>{sendEl.disabled=true;const r=await fetch("/guest/sessions/"+session.id+"/messages",{method:"POST",
-  headers:{"content-type":"application/json"},body:JSON.stringify({message:messageEl.value})});
-  const value=await r.json();if(!r.ok)outputEl.textContent=JSON.stringify(value,null,2)+"\\n"+outputEl.textContent;
-  messageEl.value="";sendEl.disabled=session.status!=="active"};start();</script></body></html>`;
-}
-
-function ownerPage(): string {
-  return `<!doctype html><html><head><meta charset="utf-8"><title>JAMA</title>
-  <style>body{font:15px system-ui;max-width:1100px;margin:32px auto;padding:0 18px;color:#18202a}
-  section{border:1px solid #d9dee5;border-radius:10px;padding:14px;margin:14px 0}button{margin:3px;padding:6px 10px}
-  pre{white-space:pre-wrap;background:#f4f6f8;padding:8px;border-radius:7px}.muted{color:#667085}</style></head><body>
-  <h1>JAMA Owner Console</h1><p class="muted">Owner control for External Sessions, Context, invitations and writeback.</p>
-  <section><h2>Paired Gateway Chat</h2>
-  <select id="remotePeer"></select><input id="remotePurpose" size="45" placeholder="Purpose">
-  <input id="remoteCollections" size="45" placeholder="Remote collection IDs, comma separated">
-  <button onclick="openRemote()">Open isolated session</button><br>
-  <textarea id="remoteMessage" style="width:90%;min-height:70px" placeholder="Ask the remote owner's AI"></textarea>
-  <button id="remoteSend" onclick="sendRemote()" disabled>Send</button><pre id="remoteOutput"></pre></section>
-  <button onclick="load()">Refresh</button><h2>Owned Sessions</h2><div id="sessions"></div>
-  <h2>Context Collections</h2><pre id="collections"></pre>
-  <h2>Pending Egress Confirmations</h2><div id="egress"></div>
-  <h2>Pending Writebacks</h2><div id="writebacks"></div><h2>Invitations</h2><pre id="invites"></pre>
-  <script>
-  async function api(path,method="GET",body){const r=await fetch(path,{method,headers:body?{"content-type":"application/json"}:{},
-  body:body?JSON.stringify(body):undefined});const v=await r.json();if(!r.ok)alert(v.error||r.status);return v}
-  async function status(id,value){if(value==="active"){
-  const detail=await api("/api/external-sessions/"+id);const request=detail.requestedGrant;
-  await api("/api/external-sessions/"+id+"/approve","POST",{
-  allowedCollections:request.requestedCollections,sensitivityCeiling:request.requestedSensitivity,
-  exactContentAllowed:false,maxItems:request.requestedLimits.maxItems,
-  maxTokens:request.requestedLimits.maxTokens,allowedOperations:detail.operationGrant.allowedOperations,
-  actionScopes:[],deniedScopes:[],allowedResources:[],deniedResources:[],actionApprovalRule:"runtime-policy"})}
-  else await api("/api/external-sessions/"+id+"/status","POST",{status:value});load()}
-  async function extend(id){await api("/api/external-sessions/"+id+"/extend","POST",{additionalSeconds:3600});load()}
-  async function resolve(id,decision){await api("/api/writebacks/"+id+"/resolve","POST",{decision});load()}
-  async function resolveEgress(id,decision,draftDigest){
-  await api("/api/egress-challenges/"+id+"/resolve","POST",{decision,draftDigest});load()}
-  let remoteSession;
-  async function openRemote(){const peerId=document.getElementById("remotePeer").value;
-  const purpose=document.getElementById("remotePurpose").value;
-  const collectionIds=document.getElementById("remoteCollections").value.split(",").map((v)=>v.trim()).filter(Boolean);
-  const result=await api("/api/remote-external-sessions","POST",{peerId,purpose,collectionIds,
-  exactContentAllowed:false,allowedActions:["ask","task"]});remoteSession=result.session;
-  document.getElementById("remoteOutput").textContent=JSON.stringify(result,null,2);
-  document.getElementById("remoteSend").disabled=!remoteSession||remoteSession.status!=="active"}
-  async function sendRemote(){const peerId=document.getElementById("remotePeer").value;
-  const message=document.getElementById("remoteMessage").value;
-  const result=await api("/api/remote-external-sessions/"+remoteSession.id+"/messages","POST",
-  {peerId,message,operation:"ask"});document.getElementById("remoteOutput").textContent=JSON.stringify(result,null,2)}
-  function esc(value){return String(value).replace(/[&<>"]/g,(c)=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
-  async function load(){const [ss,cc,ww,ii,ee]=await Promise.all([
-  api("/api/external-sessions"),api("/api/context-collections"),api("/api/writebacks"),
-  api("/api/session-invites"),api("/api/egress-challenges")]);
-  const pp=await api("/api/peers");document.getElementById("remotePeer").innerHTML=pp.map((p)=>
-  "<option value=\\""+esc(p.id)+"\\">"+esc(p.name+" · "+p.url)+"</option>").join("");
-  document.getElementById("sessions").innerHTML=ss.map((s)=>"<section><b>"+esc(s.purpose)+"</b><br>"+
-  esc(s.callerTrust+" · "+s.callerPrincipalId+" · "+s.status+" · expires "+s.expiresAt)+"<br>"+
-  ["active","paused","revoked","closed"].map((v)=>"<button onclick=\\"status('"+s.id+"','"+v+"')\\">"+v+"</button>").join("")+
-  "<button onclick=\\"extend('"+s.id+"')\\">+1 hour</button></section>").join("")||"<p>None</p>";
-  document.getElementById("collections").textContent=JSON.stringify(cc,null,2);
-  document.getElementById("egress").innerHTML=ee.filter((e)=>e.status==="pending").map((e)=>
-  "<section><b>"+esc(e.reason)+"</b><br>"+esc(e.draftDigest)+"<pre>"+
-  esc(JSON.stringify(e.draft,null,2))+"</pre><button onclick=\\"resolveEgress('"+e.id+
-  "','released','"+e.draftDigest+"')\\">release</button><button onclick=\\"resolveEgress('"+
-  e.id+"','rejected','"+e.draftDigest+"')\\">reject</button></section>").join("")||"<p>None</p>";
-  document.getElementById("writebacks").innerHTML=ww.map((w)=>"<section><b>"+esc(w.proposedSummary)+"</b><br>"+
-  esc(w.status+" · "+w.targetCollectionId)+"<br>"+(w.status==="pending"?
-  "<button onclick=\\"resolve('"+w.id+"','accepted')\\">accept</button><button onclick=\\"resolve('"+w.id+"','rejected')\\">reject</button>":"")+
-  "</section>").join("")||"<p>None</p>";
-  document.getElementById("invites").textContent=JSON.stringify(ii,null,2)}load()</script>
-  </body></html>`;
-}
-
 function requiredString(value: unknown, name: string): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(`${name} is required`);
   return value.trim();
@@ -2154,6 +2101,12 @@ function contextIsolationAllowed(): boolean {
   if (assurance === "enforced" || assurance === "adapter-attested") return true;
   return assurance === "operator-attested"
     && process.env.JAMAI_ALLOW_OPERATOR_ATTESTED_EXTERNAL_CONTEXT === "true";
+}
+
+function guestInvitesEnabled(): boolean {
+  const persisted = store.getMeta("settings.guestInvitesEnabled");
+  if (persisted !== undefined) return persisted === "true";
+  return process.env.JAMAI_ENABLE_GUEST_INVITES === "true";
 }
 
 function parseMemberStatus(value: unknown): "active" | "suspended" | "removed" {
