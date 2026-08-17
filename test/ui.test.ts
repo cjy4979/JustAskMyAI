@@ -16,7 +16,16 @@ test("Owner Hub renders product workflows with valid client JavaScript", () => {
   const page = ownerPage();
   assert.match(page, /今天/);
   assert.match(page, /待处理/);
-  assert.match(page, /跨 AI 任务板/);
+  assert.match(page, /统一任务中心/);
+  assert.match(page, /收到的 Provider 工作和发出的 A2A 任务不再分散/);
+  assert.match(page, /协作组/);
+  assert.match(page, /审计 Reviewer/);
+  assert.match(page, /const MOBILE_NAV=/);
+  assert.match(page, /\.side \.nav span:not\(\.ico\)/);
+  assert.match(page, /function unifiedTasks\(\)/);
+  assert.match(page, /function createGroup\(\)/);
+  assert.match(page, /function createGroupThread\(groupId\)/);
+  assert.match(page, /function groupDetail\(id\)/);
   assert.match(page, /知识库/);
   assert.doesNotThrow(() => new vm.Script(inlineScript(page)));
 });
