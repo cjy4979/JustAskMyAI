@@ -2,11 +2,30 @@
 
 > Let one person's AI safely discover, contact, ask, and delegate to another person's AI.
 
+> **DeepSeek Harness plugin preview is now in development.** JAMA's native Cordis bundle gives
+> independently owned DSH Agents a consent-bound collaboration boundary without replacing
+> their loop, tools, memory, or sessions. Follow the
+> [integration and launch plan](./docs/deepseek-harness-launch.md).
+
 “I have no idea how to explain it. Just let your AI ask mine.”
 
 JustAskMyAI is not another agent framework. It does not replace Codex, Claude Code,
 Hermes, OpenClaw, Manus, AutoGen, or any other existing agent. It provides the
 identity, consent, delegation, and audit layer between personal AIs.
+
+## DeepSeek Harness: the first native plugin target
+
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) describes its runtime as
+“everything is a plugin.” That makes it a natural host for JAMA's adapter-free architecture:
+DSH keeps its Agent loop, tools, memory, configuration, and native sessions, while JAMA adds
+cross-owner identity, consent, passive delivery, External Sessions, egress control, and audit.
+
+The integration is **in development**, not released to npm yet. The loadable Provider preview
+is tested against DSH `0.1.0-rc.6`: its profile bundle installs without peer conflicts and a
+clean DSH Web profile boots with it. Idle delivery is a passive HTTP/SSE connection, not
+model-driven polling. Native Caller tools and the two-computer persistent-session E2E remain
+release gates. See the [plugin package and local smoke-test guide](./integrations/deepseek-harness/README.md)
+or the [release scope, acceptance tests, and rollout plan](./docs/deepseek-harness-launch.md).
 
 The human remains the Principal: people decide who may contact their AI, what context
 may be disclosed, and what actions may be performed. Their AIs communicate context and

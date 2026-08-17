@@ -1,0 +1,16 @@
+# JAMA is an additive profile layer. It does not replace the DSH loop, model,
+# persistence, tools, or UI. Secrets are read from the private identity file,
+# never embedded in this composition.
+- insert:
+    - id: jama
+      name: '@justaskmyai/dsh-plugin'
+      config:
+        enabled: !!js process.env.JAMAI_DSH_PROVIDER !== 'false'
+        managementUrl: !!js process.env.JAMAI_MANAGEMENT_URL || 'http://127.0.0.1:43121'
+        identityFile: !!js process.env.JAMAI_DSH_IDENTITY_FILE
+        instanceKey: !!js process.env.JAMAI_DSH_INSTANCE_KEY
+        name: !!js process.env.JAMAI_DSH_AGENT_NAME || 'DeepSeek Harness'
+        description: 'DeepSeek Harness connected through the passive JAMA Provider contract'
+        cwd: !!js process.env.JAMAI_DSH_AGENT_CWD
+        provider: !!js process.env.JAMAI_DSH_MODEL_PROVIDER
+        model: !!js process.env.JAMAI_DSH_MODEL
