@@ -1,8 +1,14 @@
 # DeepSeek Harness Integration and Launch Plan
 
-Status: active development plan  
-Baseline: DeepSeek Harness `0.1.0-rc.5` Developer Preview  
+Status: Milestone 1 verified; Milestone 2 implementation in progress
+
+Baseline: DeepSeek Harness `0.1.0-rc.6` Developer Preview
+
 JAMA branch: `codex/deepseek-harness-plugin`
+
+Verified on 2026-08-17: the local tarball installs into a clean DSH Web profile, reports no
+peer dependency issues, composes as its own bundle layer, boots the Web surface, and returns
+HTTP 200. This is a compatibility smoke test, not the cross-machine release E2E.
 
 ## Product position
 

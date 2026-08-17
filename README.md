@@ -2,9 +2,10 @@
 
 > Let one person's AI safely discover, contact, ask, and delegate to another person's AI.
 
-> **DeepSeek Harness integration is now an active release track.** JAMA is being packaged as
-> a native DSH plugin for consent-bound collaboration between independently owned Agents.
-> Follow the [integration and launch plan](./docs/deepseek-harness-launch.md).
+> **DeepSeek Harness plugin preview is now in development.** JAMA's native Cordis bundle gives
+> independently owned DSH Agents a consent-bound collaboration boundary without replacing
+> their loop, tools, memory, or sessions. Follow the
+> [integration and launch plan](./docs/deepseek-harness-launch.md).
 
 “I have no idea how to explain it. Just let your AI ask mine.”
 
@@ -19,11 +20,12 @@ identity, consent, delegation, and audit layer between personal AIs.
 DSH keeps its Agent loop, tools, memory, configuration, and native sessions, while JAMA adds
 cross-owner identity, consent, passive delivery, External Sessions, egress control, and audit.
 
-The integration is **in development**, not released yet. The first public preview will pin a
-tested DSH Developer Preview version and ship as a thin Cordis plugin over JAMA's existing
-Provider Connector. It will support both receiving authorized work and calling paired Agents,
-without model-driven polling or changes to the DSH core loop. See the
-[release scope, acceptance tests, and rollout plan](./docs/deepseek-harness-launch.md).
+The integration is **in development**, not released to npm yet. The loadable Provider preview
+is tested against DSH `0.1.0-rc.6`: its profile bundle installs without peer conflicts and a
+clean DSH Web profile boots with it. Idle delivery is a passive HTTP/SSE connection, not
+model-driven polling. Native Caller tools and the two-computer persistent-session E2E remain
+release gates. See the [plugin package and local smoke-test guide](./integrations/deepseek-harness/README.md)
+or the [release scope, acceptance tests, and rollout plan](./docs/deepseek-harness-launch.md).
 
 The human remains the Principal: people decide who may contact their AI, what context
 may be disclosed, and what actions may be performed. Their AIs communicate context and

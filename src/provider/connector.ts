@@ -131,7 +131,10 @@ export class ProviderConnector {
   }
 
   async serve(
-    handler: (job: ClaimedProviderJob) => Promise<ProviderExecutionResult>,
+    handler: (
+      job: ClaimedProviderJob,
+      signal: AbortSignal,
+    ) => Promise<ProviderExecutionResult>,
     signal?: AbortSignal,
   ): Promise<void> {
     while (!signal?.aborted) {
@@ -149,26 +152,47 @@ export class ProviderConnector {
   }
 
   private async drain(
-    handler: (job: ClaimedProviderJob) => Promise<ProviderExecutionResult>,
+    handler: (
+      job: ClaimedProviderJob,
+      signal: AbortSignal,
+    ) => Promise<ProviderExecutionResult>,
     signal?: AbortSignal,
   ): Promise<void> {
     let job: ClaimedProviderJob | undefined;
-    while (!signal?.aborted && (job = await this.claim())) await this.execute(job, handler);
+    while (!signal?.aborted && (job = await this.claim())) await this.execute(job, handler, signal);
   }
 
   private async execute(
     job: ClaimedProviderJob,
-    handler: (job: ClaimedProviderJob) => Promise<ProviderExecutionResult>,
+    handler: (
+      job: ClaimedProviderJob,
+      signal: AbortSignal,
+    ) => Promise<ProviderExecutionResult>,
+    parentSignal?: AbortSignal,
   ): Promise<void> {
     const renewEveryMs = Math.max(5000, Math.floor(this.leaseSeconds * 500));
-    const timer = setInterval(() => void this.renew(job).catch(() => undefined), renewEveryMs);
+    const controller = new AbortController();
+    let ownershipLost = false;
+    const abortFromParent = (): void => controller.abort(parentSignal?.reason);
+    if (parentSignal?.aborted) abortFromParent();
+    else parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+    const timer = setInterval(() => {
+      void this.renew(job).catch((error: unknown) => {
+        ownershipLost = true;
+        controller.abort(error);
+      });
+    }, renewEveryMs);
     timer.unref();
     try {
-      await this.complete(job, await handler(job));
+      const result = await handler(job, controller.signal);
+      if (ownershipLost || parentSignal?.aborted) return;
+      await this.complete(job, result);
     } catch (error) {
+      if (ownershipLost || parentSignal?.aborted) return;
       await this.fail(job, error).catch(() => undefined);
     } finally {
       clearInterval(timer);
+      parentSignal?.removeEventListener("abort", abortFromParent);
     }
   }
 
