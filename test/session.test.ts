@@ -158,6 +158,9 @@ test("Contextual answers cannot forge evidence or upgrade authority", () => {
     }],
   }), [source]);
   assert.match(forged.escalationReason ?? "", /unauthorized Context reference/);
+  assert.equal(forged.draft?.answer, "The limit is 12.");
+  assert.deepEqual(forged.draft?.claims[0].evidenceRefs, [source.id]);
+  assert.equal(forged.draft?.claims[0].status, "external-claim");
   const normalized = normalizeContextualAnswer(JSON.stringify({
     answer: "The limit is 12.",
     claims: [{
@@ -678,6 +681,49 @@ test("Egress Grant blocks excerpts and Owner confirmation releases an immutable 
     decision: "released",
     ownerPrincipalId: "alice",
   }), /already resolved/);
+  env.gateway.close();
+});
+
+test("Egress challenge preserves and releases the answer when evidence refs are forged", () => {
+  const env = fixture();
+  const normalized = normalizeContextualAnswer(JSON.stringify({
+    answer: "The useful answer must survive review.",
+    claims: [{
+      text: "The useful answer must survive review.",
+      status: "owner-confirmed",
+      evidenceRefs: ["forged-context-ref"],
+    }],
+    disclosedContextRefs: ["forged-context-ref"],
+  }), [], env.egressGrant);
+  assert.match(normalized.escalationReason ?? "", /unauthorized Context reference/);
+  assert.equal(normalized.draft?.answer, "The useful answer must survive review.");
+  assert.deepEqual(normalized.draft?.claims[0].evidenceRefs, []);
+  assert.equal(normalized.draft?.claims[0].status, "agent-inference");
+
+  const challenge = env.sessions.createEgressChallenge({
+    sessionId: env.session.id,
+    draft: normalized.draft!,
+    projectedContextRefs: [],
+    possiblyDisclosedRefs: normalized.possiblyDisclosedRefs ?? [],
+    egressGrantId: env.egressGrant.id,
+    authorityVersion: env.session.authorityVersion,
+    reason: normalized.escalationReason!,
+  });
+  const released = env.sessions.resolveEgressChallenge({
+    id: challenge.id,
+    decision: "released",
+    ownerPrincipalId: "alice",
+    expectedDraftDigest: challenge.draftDigest,
+  });
+  assert.equal(released.releasedAnswer?.answer, "The useful answer must survive review.");
+  assert.equal(released.releasedAnswerDigest, challenge.draftDigest);
+  const answerEvent = env.sessions.listEvents(env.session.id).find(
+    (event) => event.type === "agent-message",
+  );
+  assert.equal(
+    (answerEvent?.content as { answer?: string } | undefined)?.answer,
+    "The useful answer must survive review.",
+  );
   env.gateway.close();
 });
 

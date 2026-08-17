@@ -68,12 +68,10 @@ export function normalizeContextualAnswer(
       ? obj.disclosedContextRefs.filter((ref): ref is string => typeof ref === "string")
       : []),
   ];
-  if (reportedRefs.some((ref) => !byId.has(ref))) {
-    return { escalationReason: "egress contains an unauthorized Context reference" };
-  }
-  if (reportedRefs.some((ref) => byId.get(ref)?.sensitivity === "restricted")) {
-    return { escalationReason: "egress attempts to disclose restricted Context" };
-  }
+  const hasUnauthorizedRef = reportedRefs.some((ref) => !byId.has(ref));
+  const hasRestrictedRef = reportedRefs.some(
+    (ref) => byId.get(ref)?.sensitivity === "restricted",
+  );
   const claims = claimsInput.map((value) => {
     const claim = value && typeof value === "object" ? value as Record<string, unknown> : {};
     const refs = Array.isArray(claim.evidenceRefs)
@@ -128,7 +126,11 @@ export function normalizeContextualAnswer(
       / finalClaims.length,
     ownerConfirmationRequired: obj.ownerConfirmationRequired === true,
   };
-  const egressReason = evaluateEgress(answer, projected, egressGrant);
+  const egressReason = hasUnauthorizedRef
+    ? "egress contains an unauthorized Context reference"
+    : hasRestrictedRef
+      ? "egress attempts to disclose restricted Context"
+      : evaluateEgress(answer, projected, egressGrant);
   if (answer.ownerConfirmationRequired || egressReason) {
     return {
       draft: answer,

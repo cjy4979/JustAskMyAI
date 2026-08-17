@@ -2150,8 +2150,13 @@ async function executeExternalMessage(
       sessionId: session.id,
       taskId: typeof task?.id === "string" ? task.id : undefined,
       draft: normalized.draft ?? {
-        answer: "[draft withheld by Egress Guard]",
-        claims: [],
+        answer: result.text,
+        claims: [{
+          text: result.text,
+          status: "agent-inference",
+          evidenceRefs: [],
+          agentReportedConfidence: null,
+        }],
         disclosedContextRefs: [],
         evidenceCoverage: 0,
         ownerConfirmationRequired: true,
