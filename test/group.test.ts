@@ -26,6 +26,7 @@ import {
   GatewayIdentity,
   verifySignedStatement,
 } from "../src/protocol/signed-request.js";
+import type { GroupInvitation } from "../src/group/types.js";
 
 function pairedGateways() {
   const aliceGateway = new GatewayStore(":memory:");
@@ -46,6 +47,58 @@ function pairedGateways() {
   });
   return { aliceGateway, bobGateway, aliceIdentity, bobIdentity };
 }
+
+test("group invitations bind one peer and role set through a terminal decision", () => {
+  const env = pairedGateways();
+  const groups = new GroupStore(env.aliceGateway, env.aliceIdentity);
+  const now = Date.now();
+  const invitation = {
+    version: 1,
+    id: "invite-1",
+    groupId: "group-1",
+    groupName: "Release team",
+    memberId: "member-bob",
+    inviterPeerId: env.aliceIdentity.peerId,
+    inviterUrl: "http://127.0.0.1:43220",
+    inviterDisplayName: "Alice",
+    inviteePeerId: env.bobIdentity.peerId,
+    inviteeDisplayName: "Bob",
+    roles: ["member"],
+    status: "pending",
+    createdAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + 60_000).toISOString(),
+  } satisfies GroupInvitation;
+
+  assert.equal(groups.saveInvitation(invitation).status, "pending");
+  assert.throws(() => groups.saveInvitation({
+    ...invitation,
+    roles: ["reviewer"],
+  }), /different content/);
+  assert.throws(() => groups.saveInvitation({
+    ...invitation,
+    id: "invite-mixed-reviewer",
+    memberId: "member-mixed-reviewer",
+    roles: ["reviewer", "member"],
+  }), /Reviewer must remain independent/);
+  assert.equal(groups.setInvitationStatus(invitation.id, "accepted").status, "accepted");
+  assert.throws(
+    () => groups.setInvitationStatus(invitation.id, "declined"),
+    /already accepted/,
+  );
+
+  const expired = {
+    ...invitation,
+    id: "invite-expired",
+    memberId: "member-expired",
+    createdAt: new Date(now - 120_000).toISOString(),
+    expiresAt: new Date(now - 60_000).toISOString(),
+  } satisfies GroupInvitation;
+  groups.saveInvitation(expired);
+  assert.equal(groups.getInvitation(expired.id)?.status, "expired");
+
+  env.aliceGateway.close();
+  env.bobGateway.close();
+});
 
 test("signed manifests bind sponsorship, authority, versions, and previous digest", () => {
   const env = pairedGateways();

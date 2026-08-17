@@ -25,6 +25,10 @@ test("Owner Hub renders product workflows with valid client JavaScript", () => {
   assert.match(page, /function unifiedTasks\(\)/);
   assert.match(page, /function createGroup\(\)/);
   assert.match(page, /function createGroupThread\(groupId\)/);
+  assert.match(page, /\/api\/group-invitations/);
+  assert.match(page, /function inviteGroupMember\(groupId\)/);
+  assert.match(page, /function editGroupMember\(groupId,memberId\)/);
+  assert.match(page, /function acceptGroupInvite\(id\)/);
   assert.match(page, /function groupDetail\(id\)/);
   assert.match(page, /知识库/);
   assert.doesNotThrow(() => new vm.Script(inlineScript(page)));

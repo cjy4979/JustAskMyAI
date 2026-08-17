@@ -18,6 +18,9 @@ export type SignedAction =
   | "task.get"
   | "task.cancel"
   | "group.manifest.get"
+  | "group.invitation.create"
+  | "group.invitation.decline"
+  | "group.membership.accept"
   | "capabilities.get"
   | "session.open"
   | "session.message"
@@ -263,8 +266,11 @@ function parseSignedRequest(value: unknown): SignedRequest | undefined {
       "task.continue",
       "task.get",
       "task.cancel",
-    "group.manifest.get",
-    "capabilities.get",
+      "group.manifest.get",
+      "group.invitation.create",
+      "group.invitation.decline",
+      "group.membership.accept",
+      "capabilities.get",
       "session.open",
       "session.message",
       "session.get",

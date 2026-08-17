@@ -20,6 +20,7 @@ import {
 } from "./protocol.js";
 import type {
   AgentSponsorship,
+  GroupInvitation,
   GroupManifest,
   GroupMember,
   GroupReceipt,
@@ -143,6 +144,88 @@ export class GroupStore {
     const row = this.gateway.db.prepare("SELECT * FROM workgroups WHERE id = ?")
       .get(groupId) as Row | undefined;
     return row ? mapWorkgroup(row) : undefined;
+  }
+
+  saveInvitation(invitation: GroupInvitation): GroupInvitation {
+    validateInvitation(invitation);
+    const existing = this.getInvitation(invitation.id);
+    if (existing) {
+      const immutable = (value: GroupInvitation) => ({
+        version: value.version,
+        id: value.id,
+        groupId: value.groupId,
+        groupName: value.groupName,
+        memberId: value.memberId,
+        inviterPeerId: value.inviterPeerId,
+        inviterUrl: value.inviterUrl,
+        inviterDisplayName: value.inviterDisplayName,
+        inviteePeerId: value.inviteePeerId,
+        inviteeDisplayName: value.inviteeDisplayName,
+        roles: value.roles,
+        createdAt: value.createdAt,
+        expiresAt: value.expiresAt,
+      });
+      if (digestValue(immutable(existing)) !== digestValue(immutable(invitation))) {
+        throw new Error("group invitation ID is already bound to different content");
+      }
+      return existing;
+    }
+    this.gateway.db.prepare(`
+      INSERT INTO group_invitations (
+        id, group_id, group_name, member_id, inviter_peer_id, inviter_url,
+        inviter_display_name, invitee_peer_id, invitee_display_name, roles_json,
+        status, created_at, expires_at, responded_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      invitation.id,
+      invitation.groupId,
+      invitation.groupName,
+      invitation.memberId,
+      invitation.inviterPeerId,
+      invitation.inviterUrl,
+      invitation.inviterDisplayName,
+      invitation.inviteePeerId,
+      invitation.inviteeDisplayName,
+      JSON.stringify(invitation.roles),
+      invitation.status,
+      invitation.createdAt,
+      invitation.expiresAt,
+      invitation.respondedAt ?? null,
+    );
+    return invitation;
+  }
+
+  getInvitation(invitationId: string): GroupInvitation | undefined {
+    this.expireInvitations();
+    const row = this.gateway.db.prepare("SELECT * FROM group_invitations WHERE id = ?")
+      .get(invitationId) as Row | undefined;
+    return row ? mapInvitation(row) : undefined;
+  }
+
+  listInvitations(): GroupInvitation[] {
+    this.expireInvitations();
+    return (this.gateway.db.prepare(
+      "SELECT * FROM group_invitations ORDER BY created_at DESC",
+    ).all() as Row[]).map(mapInvitation);
+  }
+
+  setInvitationStatus(
+    invitationId: string,
+    status: GroupInvitation["status"],
+  ): GroupInvitation {
+    const invitation = this.getInvitation(invitationId);
+    if (!invitation) throw new Error("group invitation not found");
+    if (invitation.status === status) return invitation;
+    if (["accepted", "declined", "expired"].includes(invitation.status)) {
+      throw new Error(`group invitation is already ${invitation.status}`);
+    }
+    const respondedAt = ["accepted", "declined"].includes(status)
+      ? new Date().toISOString()
+      : undefined;
+    this.gateway.db.prepare(`
+      UPDATE group_invitations SET status = ?, responded_at = ? WHERE id = ?
+    `).run(status, respondedAt ?? null, invitationId);
+    return this.getInvitation(invitationId)!;
   }
 
   listMembers(groupId: string): GroupMember[] {
@@ -1208,18 +1291,43 @@ export class GroupStore {
         detected_at TEXT NOT NULL,
         status TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS group_invitations (
+        id TEXT PRIMARY KEY,
+        group_id TEXT NOT NULL,
+        group_name TEXT NOT NULL,
+        member_id TEXT NOT NULL,
+        inviter_peer_id TEXT NOT NULL,
+        inviter_url TEXT NOT NULL,
+        inviter_display_name TEXT NOT NULL,
+        invitee_peer_id TEXT NOT NULL,
+        invitee_display_name TEXT NOT NULL,
+        roles_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        responded_at TEXT
+      );
       CREATE INDEX IF NOT EXISTS idx_group_members_peer
         ON group_members(group_id, gateway_peer_id, status);
       CREATE INDEX IF NOT EXISTS idx_group_receipts_thread
         ON group_receipts(group_id, thread_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_group_revocations_peer
         ON group_revocations(group_id, gateway_peer_id);
+      CREATE INDEX IF NOT EXISTS idx_group_invitations_status
+        ON group_invitations(status, created_at);
     `);
     ensureColumn(this.gateway, "group_members", "sponsorship_json", "TEXT NOT NULL DEFAULT '{}'");
     ensureColumn(this.gateway, "group_threads", "objective_digest", "TEXT NOT NULL DEFAULT ''");
     ensureColumn(this.gateway, "group_threads", "thread_version", "INTEGER NOT NULL DEFAULT 1");
     ensureColumn(this.gateway, "group_receipts", "proof_json", "TEXT NOT NULL DEFAULT '{}'");
     ensureColumn(this.gateway, "group_receipts", "receipt_json", "TEXT NOT NULL DEFAULT '{}'");
+  }
+
+  private expireInvitations(): void {
+    this.gateway.db.prepare(`
+      UPDATE group_invitations SET status = 'expired'
+      WHERE status IN ('pending', 'delivery_failed') AND expires_at <= ?
+    `).run(new Date().toISOString());
   }
 }
 
@@ -1254,6 +1362,54 @@ function mapMember(row: Row): GroupMember {
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
+}
+
+function mapInvitation(row: Row): GroupInvitation {
+  return {
+    version: 1,
+    id: String(row.id),
+    groupId: String(row.group_id),
+    groupName: String(row.group_name),
+    memberId: String(row.member_id),
+    inviterPeerId: String(row.inviter_peer_id),
+    inviterUrl: String(row.inviter_url),
+    inviterDisplayName: String(row.inviter_display_name),
+    inviteePeerId: String(row.invitee_peer_id),
+    inviteeDisplayName: String(row.invitee_display_name),
+    roles: JSON.parse(String(row.roles_json)) as string[],
+    status: String(row.status) as GroupInvitation["status"],
+    createdAt: String(row.created_at),
+    expiresAt: String(row.expires_at),
+    respondedAt: row.responded_at ? String(row.responded_at) : undefined,
+  };
+}
+
+function validateInvitation(invitation: GroupInvitation): void {
+  if (invitation.version !== 1) throw new Error("unsupported group invitation version");
+  for (const [label, value] of Object.entries({
+    id: invitation.id,
+    groupId: invitation.groupId,
+    groupName: invitation.groupName,
+    memberId: invitation.memberId,
+    inviterPeerId: invitation.inviterPeerId,
+    inviterUrl: invitation.inviterUrl,
+    inviterDisplayName: invitation.inviterDisplayName,
+    inviteePeerId: invitation.inviteePeerId,
+    inviteeDisplayName: invitation.inviteeDisplayName,
+  })) {
+    if (!value.trim()) throw new Error(`group invitation ${label} is required`);
+  }
+  if (invitation.roles.length === 0 || invitation.roles.includes("owner")) {
+    throw new Error("group invitation requires at least one non-Owner role");
+  }
+  if (invitation.roles.includes("reviewer") && invitation.roles.length > 1) {
+    throw new Error("Reviewer must remain independent from execution roles");
+  }
+  if (!Number.isFinite(Date.parse(invitation.createdAt))
+    || !Number.isFinite(Date.parse(invitation.expiresAt))
+    || Date.parse(invitation.expiresAt) <= Date.parse(invitation.createdAt)) {
+    throw new Error("group invitation lifetime is invalid");
+  }
 }
 
 function mapThread(row: Row): GroupThread {

@@ -31,25 +31,59 @@ try {
     (member) => member.gatewayPeerId === aliceIdentity.peerId,
   );
   if (!aliceMember) throw new Error("Alice group owner member was not created");
-  const memberResult = await postJson(
-    `${alice.managementUrl}/api/groups/${createdGroup.manifest.workgroup.id}/members`,
+  const groupInvitation = await postJson(
+    `${alice.managementUrl}/api/groups/${createdGroup.manifest.workgroup.id}/invitations`,
     {
-      principalId: bobIdentity.principalId,
-      agentId: bobIdentity.agentId,
-      gatewayPeerId: bobIdentity.peerId,
+      peerId: bobIdentity.peerId,
       displayName: "Bob MCP",
-      url: bob.publicUrl,
       roles: ["member"],
-      sponsoredBy: aliceIdentity.principalId,
-      sponsorship: bobIdentity.sponsorship,
-      status: "active",
     },
   );
-  const bobMember = memberResult.member;
-  const groupManifest = await getJson(
-    `${alice.managementUrl}/api/groups/${createdGroup.manifest.workgroup.id}/manifest`,
+  const bobInvitations = await getJson(`${bob.managementUrl}/api/group-invitations`);
+  const incomingInvitation = bobInvitations.find(
+    (invitation) => invitation.id === groupInvitation.id
+      && invitation.direction === "incoming"
+      && invitation.status === "pending",
   );
-  await postJson(`${bob.managementUrl}/api/groups/import`, groupManifest);
+  if (!incomingInvitation) throw new Error("Bob did not receive the signed Group invitation");
+  const acceptedInvitation = await postJson(
+    `${bob.managementUrl}/api/group-invitations/${groupInvitation.id}/accept`,
+    {},
+  );
+  const bobMember = acceptedInvitation.signedManifest.manifest.members.find(
+    (member) => member.gatewayPeerId === bobIdentity.peerId,
+  );
+  if (!bobMember || !bobMember.roles.includes("member")) {
+    throw new Error("Bob did not install the accepted Group membership");
+  }
+  const aliceInvitations = await getJson(`${alice.managementUrl}/api/group-invitations`);
+  if (!aliceInvitations.some(
+    (invitation) => invitation.id === groupInvitation.id
+      && invitation.direction === "outgoing"
+      && invitation.status === "accepted",
+  )) {
+    throw new Error("Alice did not persist Bob's accepted Group membership");
+  }
+  const declinedGroup = await postJson(`${alice.managementUrl}/api/groups`, {
+    name: "Consent rejection team",
+  });
+  const declinedInvitation = await postJson(
+    `${alice.managementUrl}/api/groups/${declinedGroup.manifest.workgroup.id}/invitations`,
+    { peerId: bobIdentity.peerId, displayName: "Bob Reviewer", roles: ["reviewer"] },
+  );
+  await postJson(
+    `${bob.managementUrl}/api/group-invitations/${declinedInvitation.id}/decline`,
+    {},
+  );
+  const declinedOnAlice = (await getJson(`${alice.managementUrl}/api/group-invitations`))
+    .find((invitation) => invitation.id === declinedInvitation.id);
+  if (declinedOnAlice?.status !== "declined") {
+    throw new Error("Group invitation rejection did not reach the Group Owner");
+  }
+  const bobGroupsAfterDecline = await getJson(`${bob.managementUrl}/api/groups`);
+  if (bobGroupsAfterDecline.some((group) => group.id === declinedGroup.manifest.workgroup.id)) {
+    throw new Error("declined Group invitation installed a manifest on Bob");
+  }
 
   const leakedManagement = await fetch(`${bob.publicUrl}/api/approvals`);
   if (leakedManagement.status !== 404) {
@@ -836,6 +870,8 @@ try {
     bobPeerId: bobIdentity.peerId,
     isolatedDatabases: true,
     bilateralPairing: true,
+    consentBoundGroupOnboarding: true,
+    groupInvitationDecline: true,
     delegationResult: true,
     signedGet: true,
     groupTask: true,

@@ -54,6 +54,24 @@ export interface GroupMember {
   updatedAt: string;
 }
 
+export interface GroupInvitation {
+  version: 1;
+  id: string;
+  groupId: string;
+  groupName: string;
+  memberId: string;
+  inviterPeerId: string;
+  inviterUrl: string;
+  inviterDisplayName: string;
+  inviteePeerId: string;
+  inviteeDisplayName: string;
+  roles: string[];
+  status: "pending" | "accepted" | "declined" | "delivery_failed" | "expired";
+  createdAt: string;
+  expiresAt: string;
+  respondedAt?: string;
+}
+
 export interface GroupThread {
   id: string;
   groupId: string;

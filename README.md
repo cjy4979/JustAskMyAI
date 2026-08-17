@@ -29,6 +29,7 @@ perform bounded work within that authority.
 - Signed and audience-bound send, continue, get, and cancel operations
 - ACP tool permission enforcement against approved scopes and local policy
 - Persistent workgroups, members, roles, and collaboration threads
+- Consent-bound Group invitations with automatic sponsorship exchange and Manifest install
 - Gateway-signed Human-to-Agent sponsorship bindings
 - Primary-Owner-signed Group Manifest changes linked by previous digest
 - Signed Admin governance proposals and Owner approval

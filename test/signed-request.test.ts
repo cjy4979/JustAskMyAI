@@ -34,6 +34,38 @@ test("signed delegation proves peer identity and rejects replay", () => {
   receiverStore.close();
 });
 
+test("group invitation signatures bind the invited roles and gateway", () => {
+  const senderStore = new GatewayStore(":memory:");
+  const receiverStore = new GatewayStore(":memory:");
+  const sender = new GatewayIdentity(senderStore);
+  const receiver = new GatewayIdentity(receiverStore);
+  receiverStore.pairPeer({ peerId: sender.peerId, publicKey: sender.publicKey });
+  const invitation = {
+    id: "invite-1",
+    groupId: "group-1",
+    inviteePeerId: receiver.peerId,
+    roles: ["reviewer"],
+  };
+  const request = {
+    audiencePeerId: receiver.peerId,
+    action: "group.invitation.create" as const,
+    payload: invitation,
+  };
+  const auth = sender.signRequest(request);
+  assert.equal(verifySignedRequest(auth, request, receiverStore).ok, true);
+
+  const secondAuth = sender.signRequest(request);
+  assert.deepEqual(
+    verifySignedRequest(secondAuth, {
+      ...request,
+      payload: { ...invitation, roles: ["member"] },
+    }, receiverStore),
+    { ok: false, reason: "signed payload digest does not match request" },
+  );
+  senderStore.close();
+  receiverStore.close();
+});
+
 test("signed delegation rejects changed payload", () => {
   const senderStore = new GatewayStore(":memory:");
   const receiverStore = new GatewayStore(":memory:");

@@ -39,6 +39,7 @@ import {
 } from "./group/protocol.js";
 import type {
   AgentSponsorship,
+  GroupInvitation,
   GroupOperation,
   GroupRoleGrant,
   GovernanceChange,
@@ -695,6 +696,117 @@ publicApp.post("/guest/redeem", (req, res) => {
     return streamSessionEvents(req.params.id, req, res);
   });
 publicApp.use(`/${AGENT_CARD_PATH}`, agentCardHandler({ agentCardProvider: handler }));
+publicApp.post("/groups/invitations", (req, res) => {
+  try {
+    const verified = verifySignedRequest(
+      decodeSignedRequest(req.header(JAMAI_AUTH_HEADER)),
+      { audiencePeerId: nodeId, action: "group.invitation.create", payload: req.body },
+      store,
+    );
+    if (!verified.ok) return res.status(401).json({ error: verified.reason });
+    const invitation = req.body as GroupInvitation;
+    if (invitation.inviterPeerId !== verified.peerId) {
+      throw new Error("group invitation signer does not match inviter");
+    }
+    if (invitation.inviteePeerId !== nodeId) {
+      throw new Error("group invitation targets a different gateway");
+    }
+    if (invitation.status !== "pending") throw new Error("new group invitation must be pending");
+    const inviter = requiredPairedPeer(verified.peerId);
+    if (new URL(invitation.inviterUrl).href !== new URL(inviter.url).href) {
+      throw new Error("group invitation owner URL does not match the paired gateway");
+    }
+    if (Date.parse(invitation.expiresAt) > Date.now() + 24 * 60 * 60_000) {
+      throw new Error("group invitation may not be valid for more than 24 hours");
+    }
+    const saved = groups.saveInvitation(invitation);
+    store.appendAudit({
+      eventType: "group.invitation-received",
+      principalId,
+      agentId,
+      peerId: verified.peerId,
+      action: "receive-group-invitation",
+      resource: invitation.groupId,
+      decision: "allowed",
+      metadata: { invitationId: invitation.id, roles: invitation.roles },
+    });
+    return res.status(201).json(saved);
+  } catch (error) {
+    return res.status(400).json({ error: String(error) });
+  }
+});
+publicApp.post("/groups/invitations/:id/decline", (req, res) => {
+  try {
+    const verified = verifySignedRequest(
+      decodeSignedRequest(req.header(JAMAI_AUTH_HEADER)),
+      { audiencePeerId: nodeId, action: "group.invitation.decline", payload: req.body },
+      store,
+    );
+    if (!verified.ok) return res.status(401).json({ error: verified.reason });
+    if (req.body?.invitationId !== req.params.id) {
+      throw new Error("decline payload does not match invitation URL");
+    }
+    const invitation = groups.getInvitation(req.params.id);
+    if (!invitation || invitation.inviterPeerId !== nodeId) {
+      throw new Error("outgoing group invitation not found");
+    }
+    if (invitation.inviteePeerId !== verified.peerId) {
+      throw new Error("only the invited gateway may decline this invitation");
+    }
+    return res.json(groups.setInvitationStatus(invitation.id, "declined"));
+  } catch (error) {
+    return res.status(400).json({ error: String(error) });
+  }
+});
+publicApp.post("/groups/:id/memberships", (req, res) => {
+  try {
+    const verified = verifySignedRequest(
+      decodeSignedRequest(req.header(JAMAI_AUTH_HEADER)),
+      { audiencePeerId: nodeId, action: "group.membership.accept", payload: req.body },
+      store,
+    );
+    if (!verified.ok) return res.status(401).json({ error: verified.reason });
+    const invitationId = requiredString(req.body?.invitationId, "invitationId");
+    const invitation = groups.getInvitation(invitationId);
+    if (!invitation || invitation.groupId !== req.params.id || invitation.inviterPeerId !== nodeId) {
+      throw new Error("outgoing group invitation not found");
+    }
+    if (invitation.inviteePeerId !== verified.peerId) {
+      throw new Error("only the invited gateway may accept this invitation");
+    }
+    if (invitation.status === "accepted") {
+      const member = groups.getMember(invitation.groupId, invitation.memberId);
+      const signedManifest = groups.getSignedManifest(invitation.groupId);
+      if (!member || !signedManifest) throw new Error("accepted group membership is incomplete");
+      return res.json({ member, workgroup: groups.getWorkgroup(invitation.groupId), signedManifest });
+    }
+    if (invitation.status !== "pending" && invitation.status !== "delivery_failed") {
+      throw new Error(`group invitation is ${invitation.status}`);
+    }
+    const { result, workgroup } = upsertLocalGroupMember(invitation.groupId, {
+      ...req.body,
+      id: invitation.memberId,
+      gatewayPeerId: verified.peerId,
+      roles: invitation.roles,
+      status: "active",
+      sponsoredBy: principalId,
+    });
+    groups.setInvitationStatus(invitation.id, "accepted");
+    auditGroupMemberChange(
+      invitation.groupId,
+      result.member,
+      workgroup,
+      result.signedManifest.manifestDigest,
+    );
+    return res.status(201).json({
+      member: result.member,
+      workgroup,
+      signedManifest: result.signedManifest,
+    });
+  } catch (error) {
+    return res.status(400).json({ error: String(error) });
+  }
+});
 publicApp.get("/groups/:id/manifest", (req, res) => {
   try {
     const after = typeof req.query.after === "string" ? req.query.after : undefined;
@@ -1458,6 +1570,12 @@ managementApp.get("/api/groups", (_req, res) => res.json(
     threads: groups.listThreads(group.id),
   })),
 ));
+managementApp.get("/api/group-invitations", (_req, res) => res.json(
+  groups.listInvitations().map((invitation) => ({
+    ...invitation,
+    direction: invitation.inviterPeerId === nodeId ? "outgoing" : "incoming",
+  })),
+));
 managementApp.post("/api/groups", (req, res) => {
   const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
   if (!name) return res.status(400).json({ error: "name is required" });
@@ -1487,6 +1605,150 @@ managementApp.post("/api/groups", (req, res) => {
       },
     });
     return res.status(201).json(signed);
+  } catch (error) {
+    return res.status(400).json({ error: String(error) });
+  }
+});
+managementApp.post("/api/groups/:id/invitations", async (req, res) => {
+  const peerId = typeof req.body?.peerId === "string" ? req.body.peerId : "";
+  let invitation: GroupInvitation | undefined;
+  try {
+    const workgroup = groups.getWorkgroup(req.params.id);
+    if (!workgroup) throw new Error("workgroup not found");
+    const owner = groups.findLocalMember(req.params.id, nodeId);
+    if (!owner?.roles.includes("owner")) {
+      throw new Error("local gateway is not the active Group Owner");
+    }
+    const peer = requiredPairedPeer(peerId);
+    if (groups.findLocalMember(req.params.id, peerId)) {
+      throw new Error("this gateway is already an active group member");
+    }
+    const roles = stringArray(req.body?.roles);
+    if (roles.length === 0 || roles.includes("owner")) {
+      throw new Error("select at least one non-Owner role");
+    }
+    if (roles.includes("reviewer") && roles.length > 1) {
+      throw new Error("Reviewer must remain independent from execution roles");
+    }
+    if (roles.some((role) => !workgroup.rolePolicy[role])) {
+      throw new Error("every invited role must exist in the workgroup role policy");
+    }
+    const now = new Date();
+    invitation = groups.saveInvitation({
+      version: 1,
+      id: randomUUID(),
+      groupId: workgroup.id,
+      groupName: workgroup.name,
+      memberId: randomUUID(),
+      inviterPeerId: nodeId,
+      inviterUrl: config.publicUrl,
+      inviterDisplayName: config.name,
+      inviteePeerId: peerId,
+      inviteeDisplayName: typeof req.body?.displayName === "string"
+        ? req.body.displayName.trim() || peerId
+        : peerId,
+      roles,
+      status: "pending",
+      createdAt: now.toISOString(),
+      expiresAt: new Date(now.getTime() + 24 * 60 * 60_000).toISOString(),
+    });
+    await callRemoteSession(peerId, "/groups/invitations", {
+      action: "group.invitation.create",
+      body: invitation,
+    });
+    store.appendAudit({
+      eventType: "group.invitation-sent",
+      principalId,
+      agentId,
+      peerId,
+      action: "invite-group-member",
+      resource: workgroup.id,
+      decision: "allowed",
+      metadata: { invitationId: invitation.id, roles },
+    });
+    return res.status(201).json(invitation);
+  } catch (error) {
+    if (invitation?.status === "pending") {
+      groups.setInvitationStatus(invitation.id, "delivery_failed");
+    }
+    return res.status(400).json({ error: String(error) });
+  }
+});
+managementApp.post("/api/group-invitations/:id/accept", async (req, res) => {
+  try {
+    const invitation = groups.getInvitation(req.params.id);
+    if (!invitation || invitation.inviteePeerId !== nodeId) {
+      throw new Error("incoming group invitation not found");
+    }
+    if (invitation.status !== "pending" && invitation.status !== "accepted") {
+      throw new Error(`group invitation is ${invitation.status}`);
+    }
+    const membership = await callRemoteSession(
+      invitation.inviterPeerId,
+      `/groups/${invitation.groupId}/memberships`,
+      {
+        action: "group.membership.accept",
+        body: {
+          invitationId: invitation.id,
+          principalId,
+          agentId,
+          gatewayPeerId: nodeId,
+          displayName: config.name,
+          url: config.publicUrl,
+          sponsorship: createSponsorship({
+            principalId,
+            agentId,
+            gatewayPeerId: nodeId,
+            capabilities: ["*"],
+          }, gatewayIdentity),
+        },
+      },
+    ) as { signedManifest?: SignedGroupManifest };
+    if (!membership.signedManifest) throw new Error("Group Owner did not return a signed manifest");
+    const imported = groups.importSignedManifest(membership.signedManifest, nodeId);
+    groups.setInvitationStatus(invitation.id, "accepted");
+    store.appendAudit({
+      eventType: "group.invitation-accepted",
+      principalId,
+      agentId,
+      peerId: invitation.inviterPeerId,
+      action: "accept-group-invitation",
+      resource: invitation.groupId,
+      decision: "approved",
+      outputDigest: imported.manifestDigest,
+      metadata: { invitationId: invitation.id, roles: invitation.roles },
+    });
+    return res.json({ invitation: groups.getInvitation(invitation.id), signedManifest: imported });
+  } catch (error) {
+    return res.status(400).json({ error: String(error) });
+  }
+});
+managementApp.post("/api/group-invitations/:id/decline", async (req, res) => {
+  try {
+    const invitation = groups.getInvitation(req.params.id);
+    if (!invitation || invitation.inviteePeerId !== nodeId || invitation.status !== "pending") {
+      throw new Error("pending incoming group invitation not found");
+    }
+    await callRemoteSession(
+      invitation.inviterPeerId,
+      `/groups/invitations/${invitation.id}/decline`,
+      {
+        action: "group.invitation.decline",
+        body: { invitationId: invitation.id },
+      },
+    );
+    const declined = groups.setInvitationStatus(invitation.id, "declined");
+    store.appendAudit({
+      eventType: "group.invitation-declined",
+      principalId,
+      agentId,
+      peerId: invitation.inviterPeerId,
+      action: "decline-group-invitation",
+      resource: invitation.groupId,
+      decision: "denied",
+      metadata: { invitationId: invitation.id },
+    });
+    return res.json(declined);
   } catch (error) {
     return res.status(400).json({ error: String(error) });
   }
@@ -1523,62 +1785,13 @@ managementApp.get("/api/groups/:id/manifest", (req, res) => {
 });
 managementApp.post("/api/groups/:id/members", (req, res) => {
   try {
-    const gatewayPeerId = requiredString(req.body?.gatewayPeerId, "gatewayPeerId");
-    const paired = gatewayPeerId === nodeId
-      ? { peerId: nodeId, url: config.publicUrl }
-      : store.getPairedPeer(gatewayPeerId);
-    if (!paired) throw new Error("group member gateway must be explicitly paired first");
-    const requestedUrl = typeof req.body?.url === "string" ? req.body.url : paired.url;
-    if (!requestedUrl) throw new Error("member url is required");
-    if (paired.url && new URL(requestedUrl).href !== new URL(paired.url).href) {
-      throw new Error("member url does not match the paired gateway url");
-    }
-    const roles = stringArray(req.body?.roles);
-    if (roles.length === 0) throw new Error("at least one role is required");
-    const workgroupBefore = groups.getWorkgroup(req.params.id);
-    if (!workgroupBefore) throw new Error("workgroup not found");
-    if (roles.some((role) => !workgroupBefore.rolePolicy[role])) {
-      throw new Error("every member role must exist in the workgroup role policy");
-    }
-    const issuer = groups.findLocalMember(req.params.id, nodeId);
-    if (!issuer || !issuer.roles.includes("owner")) {
-      throw new Error("local gateway is not the active Group Owner");
-    }
-    const sponsorship = req.body?.sponsorship as AgentSponsorship | undefined;
-    if (!sponsorship) throw new Error("signed agent sponsorship is required");
-    const result = groups.upsertMember({
-      id: typeof req.body?.id === "string" ? req.body.id : undefined,
-      groupId: req.params.id,
-      principalId: requiredString(req.body?.principalId, "principalId"),
-      agentId: requiredString(req.body?.agentId, "agentId"),
-      gatewayPeerId,
-      displayName: requiredString(req.body?.displayName, "displayName"),
-      url: requestedUrl,
-      roles,
-      sponsoredBy: typeof req.body?.sponsoredBy === "string"
-        ? req.body.sponsoredBy
-        : principalId,
-      sponsorship,
-      status: parseMemberStatus(req.body?.status),
-      issuedByMemberId: issuer.id,
-    });
-    const workgroup = groups.getWorkgroup(req.params.id)!;
-    store.appendAudit({
-      eventType: "group.member-upserted",
-      principalId,
-      agentId,
-      peerId: gatewayPeerId,
-      action: "upsert-group-member",
-      resource: req.params.id,
-      decision: "approved",
-      metadata: {
-        memberId: result.member.id,
-        roles: result.member.roles,
-        status: result.member.status,
-        membershipVersion: workgroup.membershipVersion,
-        manifestDigest: result.signedManifest.manifestDigest,
-      },
-    });
+    const { result, workgroup } = upsertLocalGroupMember(req.params.id, req.body ?? {});
+    auditGroupMemberChange(
+      req.params.id,
+      result.member,
+      workgroup,
+      result.signedManifest.manifestDigest,
+    );
     return res.status(201).json({
       member: result.member,
       workgroup,
@@ -2108,6 +2321,74 @@ function requiredPairedPeer(peerId: string): { peerId: string; publicKey: string
   const peer = store.getPairedPeer(peerId);
   if (!peer?.url) throw new Error("paired remote gateway URL is unavailable");
   return { peerId: peer.peerId, publicKey: peer.publicKey, url: peer.url };
+}
+
+function upsertLocalGroupMember(groupId: string, body: Record<string, unknown>) {
+  const gatewayPeerId = requiredString(body.gatewayPeerId, "gatewayPeerId");
+  const paired = gatewayPeerId === nodeId
+    ? { peerId: nodeId, url: config.publicUrl }
+    : store.getPairedPeer(gatewayPeerId);
+  if (!paired) throw new Error("group member gateway must be explicitly paired first");
+  const requestedUrl = typeof body.url === "string" ? body.url : paired.url;
+  if (!requestedUrl) throw new Error("member url is required");
+  if (paired.url && new URL(requestedUrl).href !== new URL(paired.url).href) {
+    throw new Error("member url does not match the paired gateway url");
+  }
+  const roles = stringArray(body.roles);
+  if (roles.length === 0) throw new Error("at least one role is required");
+  if (roles.includes("reviewer") && roles.length > 1) {
+    throw new Error("Reviewer must remain independent from execution roles");
+  }
+  const workgroupBefore = groups.getWorkgroup(groupId);
+  if (!workgroupBefore) throw new Error("workgroup not found");
+  if (roles.some((role) => !workgroupBefore.rolePolicy[role])) {
+    throw new Error("every member role must exist in the workgroup role policy");
+  }
+  const issuer = groups.findLocalMember(groupId, nodeId);
+  if (!issuer || !issuer.roles.includes("owner")) {
+    throw new Error("local gateway is not the active Group Owner");
+  }
+  const sponsorship = body.sponsorship as AgentSponsorship | undefined;
+  if (!sponsorship) throw new Error("signed agent sponsorship is required");
+  const result = groups.upsertMember({
+    id: typeof body.id === "string" ? body.id : undefined,
+    groupId,
+    principalId: requiredString(body.principalId, "principalId"),
+    agentId: requiredString(body.agentId, "agentId"),
+    gatewayPeerId,
+    displayName: requiredString(body.displayName, "displayName"),
+    url: requestedUrl,
+    roles,
+    sponsoredBy: typeof body.sponsoredBy === "string" ? body.sponsoredBy : principalId,
+    sponsorship,
+    status: parseMemberStatus(body.status),
+    issuedByMemberId: issuer.id,
+  });
+  return { result, workgroup: groups.getWorkgroup(groupId)! };
+}
+
+function auditGroupMemberChange(
+  groupId: string,
+  member: ReturnType<typeof upsertLocalGroupMember>["result"]["member"],
+  workgroup: ReturnType<typeof upsertLocalGroupMember>["workgroup"],
+  manifestDigest: string,
+): void {
+  store.appendAudit({
+    eventType: "group.member-upserted",
+    principalId,
+    agentId,
+    peerId: member.gatewayPeerId,
+    action: "upsert-group-member",
+    resource: groupId,
+    decision: "approved",
+    metadata: {
+      memberId: member.id,
+      roles: member.roles,
+      status: member.status,
+      membershipVersion: workgroup.membershipVersion,
+      manifestDigest,
+    },
+  });
 }
 
 function remoteSessionBindingKey(peerId: string, sessionId: string): string {

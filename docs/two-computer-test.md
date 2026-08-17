@@ -94,7 +94,25 @@ Invoke-RestMethod `
 
 Pairing is a local human action. mDNS discovery alone does not grant trust.
 
-## 3. Connect the MCP on A
+## 3. Test consent-bound Group onboarding
+
+Use the Owner Hub instead of copying sponsorship or manifest JSON between computers:
+
+1. On A, open `http://127.0.0.1:43121/chat`, choose **协作组**, and create a Group.
+2. Open the Group, choose **邀请成员**, select B, and assign **成员**.
+3. On B, open `http://127.0.0.1:43121/chat`. The invitation must appear under **待处理**.
+4. Review the Group name and roles, then choose **接受**.
+5. Both Owner Hubs must show the same Group, membership version, A as Owner, and B as Member.
+
+For a three-Agent audit scenario, pair C bilaterally with the Group Owner and repeat the same
+flow with the **审计 Reviewer** role. C must receive read/context authority but not edit,
+network, deploy, or push authority. A rejected invitation must remain absent from the
+invitee's Group list.
+
+No model is invoked by this onboarding handshake. The two gateways exchange signed
+sponsorship and the latest Owner-signed Manifest only after the invited person accepts.
+
+## 4. Connect the MCP on A
 
 This repository contains `.codex/config.toml`, so Codex opened on the repository can load
 `just_ask_my_ai` after the project has been built and the Codex task/app has been restarted.
@@ -134,7 +152,28 @@ Call `delegate_remote_task`:
 }
 ```
 
-## 4. B approves
+For the Group/Multi-Agent path, first call `list_workgroups`, then call
+`delegate_group_task` with the installed Group and B's member ID:
+
+```json
+{
+  "groupId": "<groupId>",
+  "threadObjective": "Verify the release candidate and produce an auditable conclusion",
+  "targetMemberId": "<bobMemberId>",
+  "mode": "delegate",
+  "objective": "Run the approved release checks and report exact evidence.",
+  "acceptanceCriteria": ["Return exact test results", "Do not push or deploy"],
+  "expectedResult": "report",
+  "allowedActions": ["read-workspace", "run-tests"],
+  "deniedActions": ["edit-workspace", "network", "push", "deploy"]
+}
+```
+
+The terminal result must contain exactly one signed Group receipt. A Reviewer can inspect the
+thread, artifact summary, authority, approvals, and receipt without receiving the executing
+Agent's private reasoning or workspace write authority.
+
+## 5. B approves
 
 The first response is `INPUT_REQUIRED` with `approvalId`, `taskId`, and `contextId`.
 
@@ -159,7 +198,7 @@ On A call `continue_remote_task` using the exact original delegation fields plus
 
 Changing the request after approval intentionally creates a new approval requirement.
 
-## 5. Verify continuity and audit
+## 6. Verify continuity and audit
 
 Continue the completed task with the same `contextId` and ask a follow-up referring to the
 previous turn. The artifact metadata should retain the same `agentSessionId`.

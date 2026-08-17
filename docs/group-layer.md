@@ -47,65 +47,34 @@ does not claim external legal identity or hardware attestation.
 
 ## Bootstrap a workgroup
 
-Create the workgroup through the Owner's localhost management listener:
+The normal product flow is consent-bound and does not require moving identity JSON or
+manifest files between computers:
 
-```powershell
-$group = Invoke-RestMethod `
-  -Method Post `
-  -ContentType "application/json" `
-  -Uri http://127.0.0.1:43121/api/groups `
-  -Body '{"name":"Release team"}'
-```
+1. Pair both gateways.
+2. In the Group Owner's Owner Hub, create a workgroup and choose **Invite member**.
+3. Select a paired contact and one or more non-Owner roles.
+4. The invitation appears in the other person's **Pending** view.
+5. When that person accepts, their gateway sends its own signed sponsorship to the Group
+   Owner. The Owner binds the preselected member ID and roles into a new signed manifest.
+6. The accepting gateway verifies and installs that manifest automatically.
 
-Read Bob's identity locally on Bob's computer:
+An invitation is bound to one Group, invitee gateway, member ID, role set, and 24-hour
+lifetime. The invitee gains no Group authority before accepting. Declining the invitation is
+also signed and propagated to the Group Owner. Delivery failures, expiry, replay, changed
+roles, and changed gateway identities fail closed.
 
-```powershell
-$bobIdentity = Invoke-RestMethod http://127.0.0.1:43121/api/identity
-```
+The same flow is available through the localhost management API:
 
-After bilateral pairing, add Bob through Alice's localhost listener. The request must include
-Bob's signed sponsorship:
+- `POST /api/groups/:id/invitations` creates and delivers an invitation to a paired gateway.
+- `GET /api/group-invitations` lists incoming and outgoing invitations.
+- `POST /api/group-invitations/:id/accept` exchanges sponsorship and installs the manifest.
+- `POST /api/group-invitations/:id/decline` records a consent refusal on both gateways.
 
-```powershell
-$body = @{
-  principalId = $bobIdentity.principalId
-  agentId = $bobIdentity.agentId
-  gatewayPeerId = $bobIdentity.peerId
-  displayName = "Bob"
-  url = "http://192.168.1.52:43122"
-  roles = @("member")
-  status = "active"
-  sponsorship = $bobIdentity.sponsorship
-} | ConvertTo-Json -Depth 20
-
-Invoke-RestMethod `
-  -Method Post `
-  -ContentType "application/json" `
-  -Uri "http://127.0.0.1:43121/api/groups/$($group.manifest.workgroup.id)/members" `
-  -Body $body
-```
-
-Export the latest signed checkpoint:
-
-```powershell
-$signedManifest = Invoke-RestMethod `
-  "http://127.0.0.1:43121/api/groups/$($group.manifest.workgroup.id)/manifest"
-$signedManifest | ConvertTo-Json -Depth 30 | Set-Content group-manifest.json
-```
-
-Import that checkpoint through Bob's localhost listener:
-
-```powershell
-Invoke-RestMethod `
-  -Method Post `
-  -ContentType "application/json" `
-  -Uri http://127.0.0.1:43121/api/groups/import `
-  -Body (Get-Content -Raw group-manifest.json)
-```
-
-Initial import requires an Owner-signed manifest containing the local gateway as an active
-member. Later changes must be signed by the primary Owner authorized in the previously
-installed manifest, match the previous digest, and advance exactly one governance version.
+`POST /api/groups/:id/members` and `POST /api/groups/import` remain available as low-level
+administrative and recovery primitives. Initial import still requires an Owner-signed manifest
+containing the local gateway as an active member. Later changes must be signed by the primary
+Owner authorized in the previously installed manifest, match the previous digest, and advance
+exactly one governance version.
 
 Admins create signed proposals through `/api/groups/:id/proposals`. The primary Owner may
 approve a proposal, after which it becomes a normal Owner-signed manifest update. Admins
