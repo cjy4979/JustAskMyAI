@@ -2,11 +2,28 @@
 
 > Let one person's AI safely discover, contact, ask, and delegate to another person's AI.
 
+> **DeepSeek Harness integration is now an active release track.** JAMA is being packaged as
+> a native DSH plugin for consent-bound collaboration between independently owned Agents.
+> Follow the [integration and launch plan](./docs/deepseek-harness-launch.md).
+
 “I have no idea how to explain it. Just let your AI ask mine.”
 
 JustAskMyAI is not another agent framework. It does not replace Codex, Claude Code,
 Hermes, OpenClaw, Manus, AutoGen, or any other existing agent. It provides the
 identity, consent, delegation, and audit layer between personal AIs.
+
+## DeepSeek Harness: the first native plugin target
+
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) describes its runtime as
+“everything is a plugin.” That makes it a natural host for JAMA's adapter-free architecture:
+DSH keeps its Agent loop, tools, memory, configuration, and native sessions, while JAMA adds
+cross-owner identity, consent, passive delivery, External Sessions, egress control, and audit.
+
+The integration is **in development**, not released yet. The first public preview will pin a
+tested DSH Developer Preview version and ship as a thin Cordis plugin over JAMA's existing
+Provider Connector. It will support both receiving authorized work and calling paired Agents,
+without model-driven polling or changes to the DSH core loop. See the
+[release scope, acceptance tests, and rollout plan](./docs/deepseek-harness-launch.md).
 
 The human remains the Principal: people decide who may contact their AI, what context
 may be disclosed, and what actions may be performed. Their AIs communicate context and
@@ -123,7 +140,9 @@ Owner Hub; confirm it there before it can receive work. MCP provider tools remai
 as a compatibility and development path. Agents that contact other people can use
 [`jama-caller`](./.agents/skills/jama-caller/SKILL.md).
 
-This is the common path for WorkBuddy, Hermes, OpenClaw, Claude Code, Codex, and future Agents.
+This is the common path for DeepSeek Harness, WorkBuddy, Hermes, OpenClaw, Claude Code, Codex,
+and future Agents. DeepSeek Harness is the first native plugin target; follow the
+[DSH integration status](./docs/deepseek-harness-launch.md).
 Always-on Agent gateways can add JAMA as a channel plugin; CLI Agents can use a supervised
 sidecar. ACP, Codex CLI, and other built-in adapters remain compatibility
 options rather than the long-term integration boundary. See the
