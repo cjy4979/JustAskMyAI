@@ -29,3 +29,34 @@ test("audit events form a tamper-evident hash chain", () => {
   assert.deepEqual(store.verifyAuditChain(), { valid: false, checked: 0, brokenAt: 1 });
   store.close();
 });
+
+test("audit chain survives metadata values that are undefined at write time", () => {
+  const store = new GatewayStore(":memory:");
+  store.appendAudit({
+    eventType: "external-session.context-projected",
+    principalId: "owner",
+    agentId: "agent",
+    contextId: "ctx-1",
+    action: "inject-context-projection",
+    metadata: {
+      selectedContextRefs: ["item-1"],
+      checkpointId: undefined,
+      checkpointDigest: undefined,
+      nativeSessionIntent: "continue",
+    },
+  });
+  store.appendAudit({
+    eventType: "external-session.message-completed",
+    principalId: "owner",
+    agentId: "agent",
+    contextId: "ctx-1",
+    action: "answer-external-message",
+    metadata: { projectedContextRefs: [], disclosedContextRefs: [], evidenceCoverage: 0 },
+  });
+  assert.deepEqual(store.verifyAuditChain(), { valid: true, checked: 2 });
+  const stored = store.listAudit().find(
+    (event) => event.eventType === "external-session.context-projected",
+  );
+  assert.equal(stored?.metadata?.checkpointId, undefined);
+  store.close();
+});

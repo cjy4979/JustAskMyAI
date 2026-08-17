@@ -20,6 +20,21 @@ test('extractAssistantText returns only the latest assistant output after the jo
   assert.equal(extractAssistantText(events, 1), '{"answer":"new"}')
 })
 
+test('extractAssistantText accepts the rc.5 nested assistant message shape', () => {
+  const events = [{
+    type: 'assistant/message',
+    data: {
+      message: {
+        content: [
+          { type: 'reasoning', text: 'private' },
+          { type: 'text', text: '{"answer":"rc.5"}' },
+        ],
+      },
+    },
+  }]
+  assert.equal(extractAssistantText(events), '{"answer":"rc.5"}')
+})
+
 test('provider identity round-trips through a private local file without logging the token', async () => {
   const root = join(tmpdir(), `jama-dsh-identity-${randomUUID()}`)
   const path = join(root, 'identity.json')

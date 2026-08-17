@@ -414,7 +414,7 @@ export class GatewayStore {
     const previousEventHash = previous?.event_hash ?? "";
     const sequence = (previous?.sequence ?? 0) + 1;
     const auditLevel = input.auditLevel ?? this.defaultAuditLevel;
-    const storedMetadata = redactMetadata(input.metadata ?? {}, auditLevel);
+    const storedMetadata = normalizeMetadata(redactMetadata(input.metadata ?? {}, auditLevel));
     const eventBody = {
       id,
       sequence,
@@ -722,6 +722,15 @@ function nullableString(value: unknown): string | undefined {
 function parseJson(value: unknown): unknown {
   if (typeof value !== "string" || value === "") return undefined;
   return JSON.parse(value);
+}
+
+function normalizeMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
+  // JSON round-trip mirrors the persisted shape: undefined values are dropped,
+  // so the object hashed into the chain equals the object read back at verify.
+  // Without this, a metadata value like `checkpoint?.id` (undefined when no
+  // checkpoint exists) is hashed as the literal "undefined" but vanishes from
+  // the stored JSON, breaking verifyAuditChain on the very next read.
+  return JSON.parse(JSON.stringify(metadata)) as Record<string, unknown>;
 }
 
 function redactMetadata(
