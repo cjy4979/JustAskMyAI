@@ -39,3 +39,6 @@ The preview creates or resumes a DSH-native session for each JAMA opaque generat
 ordinary DSH tool is hidden inside the non-owner External Session; only the authorized JAMA
 Context Projection reaches the model. Explicit action-grant-to-tool mapping is a later release
 gate and will never make a generic terminal an implicit grant.
+
+For the same restart, new-session, switch-session, lease, and audit checks used by Codex and
+Claude Code, follow the [Provider interoperability matrix](../../docs/provider-test-matrix.md).

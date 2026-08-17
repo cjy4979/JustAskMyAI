@@ -7,6 +7,10 @@ Both machines need Node.js 22.13+, this repository, and Codex signed in to the i
 ChatGPT/Codex account. The accounts may be different; gateway trust is based on the local
 JAMA key pairing, not on matching OpenAI accounts.
 
+This guide keeps the original direct Codex adapter flow for bounded A2A delegation. For
+persistent External Sessions through passive Codex, Claude Code, or DeepSeek Harness Providers,
+use the [Provider interoperability test matrix](./provider-test-matrix.md).
+
 On each receiving machine, confirm that a standalone Codex CLI is callable from the same
 terminal that will start the gateway and is signed in to the intended account:
 

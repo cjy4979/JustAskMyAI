@@ -72,6 +72,24 @@ their existing always-on process. CLI-oriented Agents can use a tiny supervised 
 starts or resumes the CLI only when `job.available` is delivered. JAMA does not edit either
 platform's configuration, planner, tools, or memory.
 
+JAMA ships that sidecar for the two CLI profiles used by the interoperability suite:
+
+```powershell
+# Choose exactly one receiving runtime on this gateway.
+.\scripts\start-cli-provider.ps1 -Agent codex -AgentCwd (Get-Location).Path
+.\scripts\start-cli-provider.ps1 -Agent claude-code -AgentCwd (Get-Location).Path
+```
+
+Both profiles share `ProviderConnector`; their small runtime modules only construct the native
+CLI invocation and parse its opaque session ID. Codex starts with ignored user configuration,
+empty MCP/plugins/hooks, no Web search, no workspace network, and a JAMA-grant-selected sandbox.
+Claude Code starts in bare mode with strict empty MCP and a JAMA-grant-selected built-in tool
+set. Neither CLI exists while the sidecar is idle.
+
+DeepSeek Harness uses the same contract inside a native Cordis plugin instead of a sidecar.
+See the [three-profile interoperability test](./provider-test-matrix.md) for exact startup and
+restart checks.
+
 Provider registration is intentionally two-sided: an Agent can request a connection, but
 only the local Owner can activate it. Suspending the Agent invalidates its ability to claim
 new jobs and requeues its leased work.

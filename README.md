@@ -149,6 +149,18 @@ sidecar. ACP, Codex CLI, and other built-in adapters remain compatibility
 options rather than the long-term integration boundary. See the
 [Agent Integration Guide](./docs/agent-integration.md) for persistence and trust semantics.
 
+Codex and Claude Code can use the bundled passive sidecar; it starts the CLI only after an
+authorized Provider job arrives:
+
+```powershell
+.\scripts\start-cli-provider.ps1 -Agent codex -AgentCwd (Get-Location).Path
+.\scripts\start-cli-provider.ps1 -Agent claude-code -AgentCwd (Get-Location).Path
+```
+
+DeepSeek Harness loads the same Provider contract as a native Cordis plugin. The reproducible
+Codex + Codex, Codex + Claude Code, and Codex + DeepSeek Harness sequence is in the
+[Provider interoperability test matrix](./docs/provider-test-matrix.md).
+
 ### Use with Codex or ChatGPT
 
 This repository includes a project-scoped Codex MCP configuration at

@@ -14,6 +14,7 @@
     "dev:node": "tsx src/daemon.ts",
     "dev:mcp": "tsx src/mcp.ts",
     "dev:hub": "tsx src/hub.ts",
+    "serve:provider": "node scripts/serve-cli-provider.mjs",
     "test": "npm run test:unit && npm run test:dsh",
     "test:unit": "node --test --test-concurrency=4 --import tsx test/*.test.ts",
     "test:dsh": "node --test integrations/deepseek-harness/test/*.test.mjs",

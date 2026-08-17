@@ -1,14 +1,18 @@
 # DeepSeek Harness Integration and Launch Plan
 
-Status: Milestone 1 verified; Milestone 2 implementation in progress
+Status: Milestone 1 verified; Milestone 2 implementation complete, two-computer E2E pending
 
 Baseline: DeepSeek Harness `0.1.0-rc.6` Developer Preview
 
-JAMA branch: `codex/deepseek-harness-plugin`
+JAMA branch: `codex/provider-test-matrix`
 
 Verified on 2026-08-17: the local tarball installs into a clean DSH Web profile, reports no
 peer dependency issues, composes as its own bundle layer, boots the Web surface, and returns
 HTTP 200. This is a compatibility smoke test, not the cross-machine release E2E.
+
+The passive Provider implementation, lease-loss cancellation, private identity persistence,
+and native session create/resume path are now in the shared interoperability branch. Follow
+the [Provider test matrix](./provider-test-matrix.md) for the pending real-machine sequence.
 
 ## Product position
 
