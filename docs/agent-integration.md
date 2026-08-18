@@ -121,11 +121,24 @@ resolution stays on the receiving machine and remains pinned to the same Provide
 
 ## Capability and trust semantics
 
-Initial capability declarations are self-reported. Owner activation upgrades ordinary
-isolation claims to `owner-attested`; it does not turn them into an OS security boundary.
-Use `enforced` only when the Agent host actually supplies and records an enforced isolation
-boundary. JAMA fails closed for External Sessions unless an active provider declares isolated
-sessions, native resume, and structured contextual output.
+Provider runtime claims and Owner trust are deliberately separate:
+
+- `capabilities.isolationAssurance` describes what the Agent runtime reports. It is
+  `self-reported`, `enforced`, or `unknown`; a Provider cannot submit `owner-attested` for
+  itself.
+- `ownerAttestation` records the local Owner's decision about one canonical capability
+  digest. Activation does not rewrite the Provider's runtime claim.
+- An authenticated reconnect with the same normalized capability digest preserves the
+  attestation. Reordering operation or artifact-type arrays does not change the digest.
+- A material capability change invalidates the attestation, moves an active Provider back to
+  `pending`, and safely requeues its claimed work. The Provider cannot claim another job until
+  the Owner reviews and attests the new digest.
+
+An Owner attestation means only that the local Owner reviewed that exact capability statement.
+It is not remote proof of an OS sandbox or hardware boundary. Use the runtime value `enforced`
+only when the Agent host actually supplies and records an enforced isolation boundary. JAMA
+fails closed for External Sessions unless an active, currently attested Provider declares
+isolated sessions, native resume, and structured contextual output.
 
 ## Caller Agents
 
@@ -142,9 +155,11 @@ Run:
 npm run test:provider-e2e
 ```
 
-The test registers a provider, confirms Owner activation, receives work through the passive
-event stream, completes a first turn, restarts the gateway, reconnects, resumes the same
-native session, then verifies fresh-session creation and opaque generation switching.
+The test registers a provider, confirms digest-bound Owner activation, receives work through
+the passive event stream, completes a first turn, restarts the gateway, reconnects without
+losing the unchanged attestation, resumes the same native session, and verifies fresh-session
+creation and opaque generation switching. It then changes a capability, verifies fail-closed
+attestation invalidation and lease recovery, and requires a new Owner activation.
 
 Passing this test proves the JAMA-side contract and restart mapping. It does not prove that a
 specific third-party Agent truthfully enforces every capability it advertises; that remains

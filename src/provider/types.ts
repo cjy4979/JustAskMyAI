@@ -6,7 +6,10 @@ export type ProviderJobStatus =
 export type ProviderEventType =
   | "job.available" | "job.claimed" | "job.requeued"
   | "job.completed" | "job.failed" | "job.cancelled"
-  | "agent.activated" | "agent.suspended";
+  | "agent.activated" | "agent.suspended" | "agent.attestation-invalidated";
+
+export type ProviderOwnerAttestationStatus =
+  | "unattested" | "owner-attested" | "invalidated";
 
 export interface ProviderCapabilities {
   isolatedSessions: boolean;
@@ -17,7 +20,18 @@ export interface ProviderCapabilities {
   maxConcurrency: number;
   operations: string[];
   artifactTypes: string[];
-  isolationAssurance: "self-reported" | "owner-attested" | "enforced" | "unknown";
+  isolationAssurance: "self-reported" | "enforced" | "unknown";
+}
+
+export interface ProviderOwnerAttestation {
+  status: ProviderOwnerAttestationStatus;
+  capabilitiesDigest: string;
+  attestedCapabilitiesDigest?: string;
+  attestedAt?: string;
+  attestedByPrincipalId?: string;
+  attestedByAgentId?: string;
+  invalidatedAt?: string;
+  invalidationReason?: string;
 }
 
 export interface ProviderAgent {
@@ -27,6 +41,7 @@ export interface ProviderAgent {
   description: string;
   status: ProviderAgentStatus;
   capabilities: ProviderCapabilities;
+  ownerAttestation: ProviderOwnerAttestation;
   registeredAt: string;
   updatedAt: string;
   lastSeenAt: string;

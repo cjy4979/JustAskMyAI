@@ -18,6 +18,9 @@ test("Owner Hub renders product workflows with valid client JavaScript", () => {
   assert.match(page, /待处理/);
   assert.match(page, /统一任务中心/);
   assert.match(page, /收到的 Provider 工作和发出的 A2A 任务不再分散/);
+  assert.match(page, /运行时声明与 Owner 证明分开记录/);
+  assert.match(page, /能力变化后已停止领取新工作/);
+  assert.match(page, /function providerTrustView\(\)/);
   assert.match(page, /协作组/);
   assert.match(page, /审计 Reviewer/);
   assert.match(page, /const MOBILE_NAV=/);

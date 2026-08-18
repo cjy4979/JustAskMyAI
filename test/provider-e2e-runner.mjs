@@ -35,7 +35,13 @@ try {
   const agentId = registered.agent.id;
   const accessToken = registered.accessToken;
   connector = new ProviderConnector({ managementUrl, agentId, accessToken, reconnectDelayMs: 50 });
-  await post(`${managementUrl}/api/provider-agents/${agentId}/activate`, {});
+  const activated = await post(`${managementUrl}/api/provider-agents/${agentId}/activate`, {});
+  if (activated.capabilities.isolationAssurance !== "self-reported"
+    || activated.ownerAttestation?.status !== "owner-attested"
+    || activated.ownerAttestation?.attestedCapabilitiesDigest
+      !== activated.ownerAttestation?.capabilitiesDigest) {
+    throw new Error("Provider activation did not create a separate digest-bound Owner attestation");
+  }
   await put(`${managementUrl}/api/settings`, { guestInvitesEnabled: true });
   const invite = await post(`${managementUrl}/api/session-invites`, {
     purpose: "Persistent provider E2E",
@@ -95,6 +101,12 @@ try {
   if (reconnected.agent.status !== "active") {
     throw new Error("provider Agent activation did not survive reconnect");
   }
+  if (reconnected.agent.capabilities.isolationAssurance !== "self-reported"
+    || reconnected.agent.ownerAttestation?.status !== "owner-attested"
+    || reconnected.agent.ownerAttestation?.attestedCapabilitiesDigest
+      !== activated.ownerAttestation.attestedCapabilitiesDigest) {
+    throw new Error("Provider reconnect downgraded or changed the Owner attestation");
+  }
 
   connector = new ProviderConnector({ managementUrl, agentId, accessToken, reconnectDelayMs: 50 });
   let resumedNativeSession;
@@ -145,6 +157,25 @@ try {
     throw new Error("switched native session response was not returned");
   }
 
+  const changed = await ProviderConnector.register({
+    managementUrl,
+    instanceKey: "provider-e2e-agent",
+    name: "Provider E2E Agent",
+    accessToken,
+    capabilities: { ...registered.agent.capabilities, maxConcurrency: 2 },
+  });
+  if (changed.agent.status !== "pending"
+    || changed.agent.ownerAttestation?.status !== "invalidated") {
+    throw new Error("Provider capability change did not invalidate Owner attestation");
+  }
+  const reattested = await post(`${managementUrl}/api/provider-agents/${agentId}/activate`, {});
+  if (reattested.status !== "active"
+    || reattested.ownerAttestation?.status !== "owner-attested"
+    || reattested.ownerAttestation?.attestedCapabilitiesDigest
+      !== reattested.ownerAttestation?.capabilitiesDigest) {
+    throw new Error("Provider re-attestation did not bind the changed capability digest");
+  }
+
   console.log(JSON.stringify({
     providerRegistered: true,
     ownerActivated: true,
@@ -152,6 +183,9 @@ try {
     firstTurnCompleted: true,
     gatewayRestarted: true,
     providerReconnected: true,
+    ownerAttestationPreserved: true,
+    capabilityChangeInvalidatedAttestation: true,
+    ownerReattestedChangedCapabilities: true,
     passiveEventDelivery: true,
     resumedNativeSession,
     freshNativeSessionGeneration: 2,

@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { canonicalJson } from "../protocol/delegated-task.js";
 import type { GatewayStore } from "../storage/sqlite.js";
 import type {
   ClaimedProviderJob,
@@ -8,6 +9,7 @@ import type {
   ProviderJobRequest,
   ProviderEvent,
   ProviderEventType,
+  ProviderOwnerAttestation,
 } from "./types.js";
 
 type Row = Record<string, unknown>;
@@ -18,6 +20,11 @@ export interface ProviderSessionBinding {
   nativeSessionId: string;
   generation: number;
   updatedAt: string;
+}
+
+export interface ProviderOwnerActor {
+  principalId: string;
+  agentId: string;
 }
 
 export class ProviderStore {
@@ -38,39 +45,132 @@ export class ProviderStore {
         return { agent: existing, created: false };
       }
       const now = new Date().toISOString();
-      this.gateway.db.prepare(`
-        UPDATE provider_agents
-        SET name=?, description=?, capabilities_json=?, updated_at=?, last_seen_at=?
-        WHERE id=?
-      `).run(
-        input.name,
-        input.description ?? "",
-        JSON.stringify(normalizeCapabilities(input.capabilities)),
-        now,
-        now,
-        existing.id,
-      );
+      const capabilities = normalizeCapabilities(input.capabilities);
+      const capabilitiesDigest = providerCapabilitiesDigest(capabilities);
+      const previousDigest = providerCapabilitiesDigest(existing.capabilities);
+      const capabilitiesChanged = capabilitiesDigest !== previousDigest;
+      const currentAttestation = hasCurrentOwnerAttestation(existing);
+      const invalidatesAttestation = capabilitiesChanged
+        && Boolean(existing.ownerAttestation.attestedCapabilitiesDigest);
+      const invalidActiveState = existing.status === "active" && !currentAttestation;
+      const requiresOwnerReview = invalidatesAttestation || invalidActiveState;
+      const nextStatus = existing.status === "suspended"
+        ? "suspended"
+        : requiresOwnerReview ? "pending" : existing.status;
+      const nextAttestation = requiresOwnerReview
+        ? invalidateAttestation(
+            existing.ownerAttestation,
+            capabilitiesDigest,
+            now,
+            capabilitiesChanged ? "provider-capabilities-changed" : "attestation-digest-mismatch",
+          )
+        : capabilitiesChanged
+          ? unattested(capabilitiesDigest)
+          : { ...existing.ownerAttestation, capabilitiesDigest };
+      this.gateway.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.gateway.db.prepare(`
+          UPDATE provider_agents
+          SET name=?, description=?, status=?, capabilities_json=?, attestation_json=?,
+              approved_at=?, updated_at=?, last_seen_at=?
+          WHERE id=?
+        `).run(
+          input.name,
+          input.description ?? "",
+          nextStatus,
+          JSON.stringify(capabilities),
+          JSON.stringify(nextAttestation),
+          nextAttestation.status === "owner-attested" ? nextAttestation.attestedAt ?? null : null,
+          now,
+          now,
+          existing.id,
+        );
+        if (requiresOwnerReview) {
+          this.requeueClaimedByAgent(existing.id, now, "attestation-invalidated");
+          this.emit("agent.attestation-invalidated", {
+            agentId: existing.id,
+            previousCapabilitiesDigest: previousDigest,
+            capabilitiesDigest,
+            reason: nextAttestation.invalidationReason,
+          }, existing.id);
+        }
+        this.gateway.appendAudit({
+          eventType: requiresOwnerReview
+            ? "provider.agent-attestation-invalidated"
+            : capabilitiesChanged
+              ? "provider.agent-capabilities-updated"
+              : "provider.agent-reconnected",
+          principalId: `provider:${existing.id}`,
+          agentId: existing.id,
+          action: requiresOwnerReview
+            ? "invalidate-provider-attestation"
+            : "register-local-agent",
+          resource: existing.id,
+          decision: requiresOwnerReview ? "revoked"
+            : nextStatus === "active" ? "approved" : undefined,
+          decisionReason: requiresOwnerReview
+            ? "Provider capabilities no longer match the Owner-attested digest"
+            : "Authenticated Provider identity reconnected",
+          inputDigest: previousDigest,
+          outputDigest: capabilitiesDigest,
+          metadata: {
+            providerName: input.name,
+            created: false,
+            capabilitiesChanged,
+            ownerAttestationStatus: nextAttestation.status,
+            runtimeIsolationAssurance: capabilities.isolationAssurance,
+          },
+        });
+        this.gateway.db.exec("COMMIT");
+      } catch (error) {
+        this.gateway.db.exec("ROLLBACK");
+        throw error;
+      }
       return { agent: this.getAgent(existing.id)!, created: false };
     }
     const id = randomUUID();
     const accessToken = randomBytes(32).toString("base64url");
     const now = new Date().toISOString();
-    this.gateway.db.prepare(`
-      INSERT INTO provider_agents (
-        id, instance_key, name, description, status, token_hash, capabilities_json,
-        registered_at, updated_at, last_seen_at
-      ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
-    `).run(
-      id,
-      input.instanceKey,
-      input.name,
-      input.description ?? "",
-      hash(accessToken),
-      JSON.stringify(normalizeCapabilities(input.capabilities)),
-      now,
-      now,
-      now,
-    );
+    const capabilities = normalizeCapabilities(input.capabilities);
+    const capabilitiesDigest = providerCapabilitiesDigest(capabilities);
+    this.gateway.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.gateway.db.prepare(`
+        INSERT INTO provider_agents (
+          id, instance_key, name, description, status, token_hash, capabilities_json,
+          attestation_json, registered_at, updated_at, last_seen_at
+        ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+      `).run(
+        id,
+        input.instanceKey,
+        input.name,
+        input.description ?? "",
+        hash(accessToken),
+        JSON.stringify(capabilities),
+        JSON.stringify(unattested(capabilitiesDigest)),
+        now,
+        now,
+        now,
+      );
+      this.gateway.appendAudit({
+        eventType: "provider.agent-registered",
+        principalId: `provider:${id}`,
+        agentId: id,
+        action: "register-local-agent",
+        resource: id,
+        outputDigest: capabilitiesDigest,
+        metadata: {
+          providerName: input.name,
+          created: true,
+          ownerAttestationStatus: "unattested",
+          runtimeIsolationAssurance: capabilities.isolationAssurance,
+        },
+      });
+      this.gateway.db.exec("COMMIT");
+    } catch (error) {
+      this.gateway.db.exec("ROLLBACK");
+      throw error;
+    }
     return { agent: this.getAgent(id)!, accessToken, created: true };
   }
 
@@ -90,7 +190,7 @@ export class ProviderStore {
     return this.getAgent(agentId)!;
   }
 
-  approve(agentId: string): ProviderAgent {
+  approve(agentId: string, actor: ProviderOwnerActor): ProviderAgent {
     const agent = this.getAgent(agentId);
     if (!agent) throw new Error("provider agent not found");
     if (!agent.capabilities.isolatedSessions || !agent.capabilities.structuredContextualOutput) {
@@ -99,34 +199,75 @@ export class ProviderStore {
       );
     }
     const now = new Date().toISOString();
-    const capabilities = {
-      ...agent.capabilities,
-      isolationAssurance: agent.capabilities.isolationAssurance === "enforced"
-        ? "enforced" as const
-        : "owner-attested" as const,
+    const capabilitiesDigest = providerCapabilitiesDigest(agent.capabilities);
+    const attestation: ProviderOwnerAttestation = {
+      status: "owner-attested",
+      capabilitiesDigest,
+      attestedCapabilitiesDigest: capabilitiesDigest,
+      attestedAt: now,
+      attestedByPrincipalId: actor.principalId,
+      attestedByAgentId: actor.agentId,
     };
-    this.gateway.db.prepare(`
-      UPDATE provider_agents
-      SET status='active', capabilities_json=?, approved_at=?, updated_at=?
-      WHERE id=?
-    `).run(JSON.stringify(capabilities), now, now, agentId);
-    this.emit("agent.activated", { agentId }, agentId);
+    this.gateway.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.gateway.db.prepare(`
+        UPDATE provider_agents
+        SET status='active', attestation_json=?, approved_at=?, updated_at=?
+        WHERE id=?
+      `).run(JSON.stringify(attestation), now, now, agentId);
+      this.emit("agent.activated", { agentId, capabilitiesDigest }, agentId);
+      this.gateway.appendAudit({
+        eventType: "provider.agent-attested",
+        principalId: actor.principalId,
+        agentId: actor.agentId,
+        action: "attest-local-agent",
+        resource: agentId,
+        decision: "approved",
+        inputDigest: capabilitiesDigest,
+        outputDigest: capabilitiesDigest,
+        metadata: {
+          providerName: agent.name,
+          ownerAttestationStatus: attestation.status,
+          runtimeIsolationAssurance: agent.capabilities.isolationAssurance,
+        },
+      });
+      this.gateway.db.exec("COMMIT");
+    } catch (error) {
+      this.gateway.db.exec("ROLLBACK");
+      throw error;
+    }
     return this.getAgent(agentId)!;
   }
 
-  suspend(agentId: string): ProviderAgent {
-    if (!this.getAgent(agentId)) throw new Error("provider agent not found");
-    this.gateway.db.prepare(
-      "UPDATE provider_agents SET status='suspended', updated_at=? WHERE id=?",
-    ).run(new Date().toISOString(), agentId);
-    const requeued = this.gateway.db.prepare(`
-      UPDATE provider_jobs
-      SET status='pending', agent_id=NULL, lease_token_hash=NULL, lease_expires_at=NULL,
-          updated_at=?
-      WHERE agent_id=? AND status='claimed'
-    `).run(new Date().toISOString(), agentId);
-    if (requeued.changes > 0) this.emit("job.requeued", { reason: "agent-suspended" });
-    this.emit("agent.suspended", { agentId }, agentId);
+  suspend(agentId: string, actor: ProviderOwnerActor): ProviderAgent {
+    const agent = this.getAgent(agentId);
+    if (!agent) throw new Error("provider agent not found");
+    const now = new Date().toISOString();
+    this.gateway.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.gateway.db.prepare(
+        "UPDATE provider_agents SET status='suspended', updated_at=? WHERE id=?",
+      ).run(now, agentId);
+      this.requeueClaimedByAgent(agentId, now, "agent-suspended");
+      this.emit("agent.suspended", { agentId }, agentId);
+      this.gateway.appendAudit({
+        eventType: "provider.agent-suspended",
+        principalId: actor.principalId,
+        agentId: actor.agentId,
+        action: "suspend-local-agent",
+        resource: agentId,
+        decision: "revoked",
+        inputDigest: providerCapabilitiesDigest(agent.capabilities),
+        metadata: {
+          providerName: agent.name,
+          ownerAttestationStatus: agent.ownerAttestation.status,
+        },
+      });
+      this.gateway.db.exec("COMMIT");
+    } catch (error) {
+      this.gateway.db.exec("ROLLBACK");
+      throw error;
+    }
     return this.getAgent(agentId)!;
   }
 
@@ -149,15 +290,13 @@ export class ProviderStore {
   }
 
   hasActiveSessionProvider(): boolean {
-    const row = this.gateway.db.prepare(`
-      SELECT capabilities_json FROM provider_agents WHERE status='active'
-    `).all() as Array<{ capabilities_json: string }>;
-    return row.some((item) => {
-      const capabilities = JSON.parse(item.capabilities_json) as ProviderCapabilities;
-      return capabilities.isolatedSessions
-        && capabilities.sessionResume
-        && capabilities.structuredContextualOutput;
-    });
+    const agents = (this.gateway.db.prepare(`
+      SELECT * FROM provider_agents WHERE status='active'
+    `).all() as Row[]).map(mapAgent);
+    return agents.some((agent) => hasCurrentOwnerAttestation(agent)
+      && agent.capabilities.isolatedSessions
+      && agent.capabilities.sessionResume
+      && agent.capabilities.structuredContextualOutput);
   }
 
   enqueue(request: ProviderJobRequest, preferredAgentId?: string): ProviderJob {
@@ -188,7 +327,7 @@ export class ProviderStore {
 
   claim(agentId: string, accessToken: string, leaseSeconds = 45): ClaimedProviderJob | undefined {
     const agent = this.heartbeat(agentId, accessToken);
-    if (agent.status !== "active") return undefined;
+    if (agent.status !== "active" || !hasCurrentOwnerAttestation(agent)) return undefined;
     this.requeueExpired();
     const active = this.gateway.db.prepare(`
       SELECT COUNT(*) AS count FROM provider_jobs
@@ -457,6 +596,22 @@ export class ProviderStore {
     }
   }
 
+  private requeueClaimedByAgent(agentId: string, now: string, reason: string): void {
+    const jobs = this.gateway.db.prepare(`
+      SELECT id FROM provider_jobs WHERE agent_id=? AND status='claimed'
+    `).all(agentId) as Array<{ id: string }>;
+    this.gateway.db.prepare(`
+      UPDATE provider_jobs
+      SET status='pending', agent_id=NULL, lease_token_hash=NULL, lease_expires_at=NULL,
+          updated_at=?
+      WHERE agent_id=? AND status='claimed'
+    `).run(now, agentId);
+    for (const job of jobs) {
+      this.emit("job.requeued", { reason }, agentId, job.id);
+      this.emit("job.available", { status: "pending", reason }, agentId, job.id);
+    }
+  }
+
 
   private emit(
     type: ProviderEventType,
@@ -480,6 +635,7 @@ export class ProviderStore {
         status TEXT NOT NULL,
         token_hash TEXT NOT NULL,
         capabilities_json TEXT NOT NULL,
+        attestation_json TEXT,
         registered_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         last_seen_at TEXT NOT NULL,
@@ -547,6 +703,83 @@ export class ProviderStore {
     if (!columns.some((column) => column.name === "target_agent_id")) {
       this.gateway.db.exec("ALTER TABLE provider_jobs ADD COLUMN target_agent_id TEXT");
     }
+    const agentColumns = this.gateway.db.prepare("PRAGMA table_info(provider_agents)")
+      .all() as Array<{ name: string }>;
+    const addedAttestationColumn = !agentColumns.some(
+      (column) => column.name === "attestation_json",
+    );
+    if (addedAttestationColumn) {
+      this.gateway.db.exec("ALTER TABLE provider_agents ADD COLUMN attestation_json TEXT");
+    }
+    const agents = this.gateway.db.prepare("SELECT * FROM provider_agents").all() as Row[];
+    for (const row of agents) {
+      const capabilities = normalizeCapabilities(
+        JSON.parse(String(row.capabilities_json)) as ProviderCapabilities,
+      );
+      const capabilitiesDigest = providerCapabilitiesDigest(capabilities);
+      const attestation = parseAttestation(
+        row.attestation_json,
+        capabilitiesDigest,
+        nullable(row.approved_at),
+      );
+      const previousStatus = String(row.status) as ProviderAgent["status"];
+      const status = previousStatus === "active" && attestation.status !== "owner-attested"
+        ? "pending"
+        : previousStatus;
+      this.gateway.db.prepare(`
+        UPDATE provider_agents
+        SET status=?, capabilities_json=?, attestation_json=?, approved_at=?
+        WHERE id=?
+      `).run(
+        status,
+        JSON.stringify(capabilities),
+        JSON.stringify(attestation),
+        attestation.status === "owner-attested" ? attestation.attestedAt ?? null : null,
+        String(row.id),
+      );
+      if (status !== previousStatus) {
+        const now = new Date().toISOString();
+        this.requeueClaimedByAgent(String(row.id), now, "attestation-invalidated");
+        this.emit("agent.attestation-invalidated", {
+          agentId: String(row.id),
+          capabilitiesDigest,
+          reason: attestation.invalidationReason ?? "missing-owner-attestation",
+        }, String(row.id));
+        this.gateway.appendAudit({
+          eventType: "provider.agent-attestation-invalidated",
+          principalId: "system:provider-attestation-migration",
+          agentId: String(row.id),
+          action: "invalidate-provider-attestation",
+          resource: String(row.id),
+          decision: "revoked",
+          decisionReason: "Active Provider did not have a current digest-bound Owner attestation",
+          inputDigest: capabilitiesDigest,
+          outputDigest: capabilitiesDigest,
+          metadata: {
+            providerName: String(row.name),
+            ownerAttestationStatus: attestation.status,
+            source: "startup-integrity-check",
+          },
+        });
+      }
+      if (addedAttestationColumn && attestation.status === "owner-attested") {
+        this.gateway.appendAudit({
+          eventType: "provider.agent-attestation-migrated",
+          principalId: "system:provider-attestation-migration",
+          agentId: String(row.id),
+          action: "migrate-provider-attestation",
+          resource: String(row.id),
+          decision: "approved",
+          inputDigest: capabilitiesDigest,
+          outputDigest: capabilitiesDigest,
+          metadata: {
+            providerName: String(row.name),
+            ownerAttestationStatus: attestation.status,
+            source: "legacy-approved-provider",
+          },
+        });
+      }
+    }
   }
 }
 
@@ -563,6 +796,7 @@ function mapEvent(row: Row): ProviderEvent {
 }
 
 function normalizeCapabilities(value: ProviderCapabilities): ProviderCapabilities {
+  const isolationAssurance = String(value.isolationAssurance ?? "unknown");
   return {
     isolatedSessions: value.isolatedSessions === true,
     sessionResume: value.sessionResume === true,
@@ -570,27 +804,116 @@ function normalizeCapabilities(value: ProviderCapabilities): ProviderCapabilitie
     separateMemoryNamespace: value.separateMemoryNamespace === true,
     supportsCancellation: value.supportsCancellation === true,
     maxConcurrency: Math.min(32, Math.max(1, Math.floor(value.maxConcurrency || 1))),
-    operations: unique(value.operations),
-    artifactTypes: unique(value.artifactTypes),
-    isolationAssurance: ["self-reported", "owner-attested", "enforced"].includes(
-      value.isolationAssurance,
-    ) ? value.isolationAssurance : "unknown",
+    operations: unique(value.operations).sort(),
+    artifactTypes: unique(value.artifactTypes).sort(),
+    isolationAssurance: isolationAssurance === "enforced" ? "enforced"
+      : isolationAssurance === "self-reported" || isolationAssurance === "owner-attested"
+        ? "self-reported"
+        : "unknown",
   };
 }
 
 function mapAgent(row: Row): ProviderAgent {
+  const capabilities = normalizeCapabilities(
+    JSON.parse(String(row.capabilities_json)) as ProviderCapabilities,
+  );
+  const capabilitiesDigest = providerCapabilitiesDigest(capabilities);
   return {
     id: String(row.id),
     instanceKey: String(row.instance_key),
     name: String(row.name),
     description: String(row.description),
     status: String(row.status) as ProviderAgent["status"],
-    capabilities: JSON.parse(String(row.capabilities_json)) as ProviderCapabilities,
+    capabilities,
+    ownerAttestation: parseAttestation(
+      row.attestation_json,
+      capabilitiesDigest,
+      nullable(row.approved_at),
+    ),
     registeredAt: String(row.registered_at),
     updatedAt: String(row.updated_at),
     lastSeenAt: String(row.last_seen_at),
     approvedAt: nullable(row.approved_at),
   };
+}
+
+export function providerCapabilitiesDigest(capabilities: ProviderCapabilities): string {
+  return createHash("sha256")
+    .update(canonicalJson(normalizeCapabilities(capabilities)))
+    .digest("hex");
+}
+
+function unattested(capabilitiesDigest: string): ProviderOwnerAttestation {
+  return { status: "unattested", capabilitiesDigest };
+}
+
+function invalidateAttestation(
+  previous: ProviderOwnerAttestation,
+  capabilitiesDigest: string,
+  invalidatedAt: string,
+  invalidationReason: string,
+): ProviderOwnerAttestation {
+  return {
+    ...previous,
+    status: "invalidated",
+    capabilitiesDigest,
+    invalidatedAt,
+    invalidationReason,
+  };
+}
+
+function parseAttestation(
+  value: unknown,
+  capabilitiesDigest: string,
+  legacyApprovedAt?: string,
+): ProviderOwnerAttestation {
+  let raw: Record<string, unknown> | undefined;
+  try {
+    raw = value ? JSON.parse(String(value)) as Record<string, unknown> : undefined;
+  } catch {
+    raw = undefined;
+  }
+  if (!raw) {
+    return legacyApprovedAt ? {
+      status: "owner-attested",
+      capabilitiesDigest,
+      attestedCapabilitiesDigest: capabilitiesDigest,
+      attestedAt: legacyApprovedAt,
+      attestedByPrincipalId: "system:legacy-owner",
+    } : unattested(capabilitiesDigest);
+  }
+  const status = ["unattested", "owner-attested", "invalidated"].includes(String(raw.status))
+    ? String(raw.status) as ProviderOwnerAttestation["status"]
+    : "unattested";
+  const attestedCapabilitiesDigest = nullable(raw.attestedCapabilitiesDigest);
+  if (status === "owner-attested" && attestedCapabilitiesDigest !== capabilitiesDigest) {
+    return {
+      status: "invalidated",
+      capabilitiesDigest,
+      attestedCapabilitiesDigest,
+      attestedAt: nullable(raw.attestedAt),
+      attestedByPrincipalId: nullable(raw.attestedByPrincipalId),
+      attestedByAgentId: nullable(raw.attestedByAgentId),
+      invalidatedAt: nullable(raw.invalidatedAt) ?? new Date().toISOString(),
+      invalidationReason: "attestation-digest-mismatch",
+    };
+  }
+  return {
+    status,
+    capabilitiesDigest,
+    attestedCapabilitiesDigest,
+    attestedAt: nullable(raw.attestedAt),
+    attestedByPrincipalId: nullable(raw.attestedByPrincipalId),
+    attestedByAgentId: nullable(raw.attestedByAgentId),
+    invalidatedAt: nullable(raw.invalidatedAt),
+    invalidationReason: nullable(raw.invalidationReason),
+  };
+}
+
+function hasCurrentOwnerAttestation(agent: ProviderAgent): boolean {
+  return agent.ownerAttestation.status === "owner-attested"
+    && agent.ownerAttestation.attestedCapabilitiesDigest
+      === providerCapabilitiesDigest(agent.capabilities);
 }
 
 function mapJob(row: Row): ProviderJob {

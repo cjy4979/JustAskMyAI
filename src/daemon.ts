@@ -998,36 +998,12 @@ managementApp.post("/api/provider/connect/jobs/:id/fail", (req, res) => {
 });
 managementApp.post("/api/provider-agents/:id/activate", (req, res) => {
   try {
-    const activated = providerAgents.approve(req.params.id);
-    store.appendAudit({
-      eventType: "provider.agent-activated",
-      principalId,
-      agentId,
-      action: "activate-local-agent",
-      resource: activated.id,
-      decision: "approved",
-      metadata: {
-        providerName: activated.name,
-        capabilities: activated.capabilities,
-        assurance: "owner-attested",
-      },
-    });
-    return res.json(activated);
+    return res.json(providerAgents.approve(req.params.id, { principalId, agentId }));
   } catch (error) { return res.status(400).json({ error: String(error) }); }
 });
 managementApp.post("/api/provider-agents/:id/suspend", (req, res) => {
   try {
-    const suspended = providerAgents.suspend(req.params.id);
-    store.appendAudit({
-      eventType: "provider.agent-suspended",
-      principalId,
-      agentId,
-      action: "suspend-local-agent",
-      resource: suspended.id,
-      decision: "revoked",
-      metadata: { providerName: suspended.name },
-    });
-    return res.json(suspended);
+    return res.json(providerAgents.suspend(req.params.id, { principalId, agentId }));
   } catch (error) { return res.status(400).json({ error: String(error) }); }
 });
 managementApp.get("/api/settings", (_req, res) => res.json({

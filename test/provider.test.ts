@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { ProviderAdapter } from "../src/adapters/provider.js";
 import { ProviderStore } from "../src/provider/store.js";
+import type { ProviderCapabilities } from "../src/provider/types.js";
 import { GatewayStore } from "../src/storage/sqlite.js";
 
 const capabilities = {
@@ -18,6 +19,7 @@ const capabilities = {
   artifactTypes: ["text", "report"],
   isolationAssurance: "self-reported" as const,
 };
+const owner = { principalId: "owner-principal", agentId: "owner-agent" };
 
 test("Provider registration requires Owner activation before claiming work", () => {
   const gateway = new GatewayStore(":memory:");
@@ -30,6 +32,8 @@ test("Provider registration requires Owner activation before claiming work", () 
   assert.equal(registered.created, true);
   assert.ok(registered.accessToken);
   assert.equal(registered.agent.status, "pending");
+  assert.equal(registered.agent.capabilities.isolationAssurance, "self-reported");
+  assert.equal(registered.agent.ownerAttestation.status, "unattested");
   providers.enqueue({
     prompt: "hello",
     contextId: "context-1",
@@ -43,10 +47,169 @@ test("Provider registration requires Owner activation before claiming work", () 
     providers.claim(registered.agent.id, registered.accessToken!),
     undefined,
   );
-  providers.approve(registered.agent.id);
+  const activated = providers.approve(registered.agent.id, owner);
+  assert.equal(activated.capabilities.isolationAssurance, "self-reported");
+  assert.equal(activated.ownerAttestation.status, "owner-attested");
+  assert.equal(
+    activated.ownerAttestation.attestedCapabilitiesDigest,
+    activated.ownerAttestation.capabilitiesDigest,
+  );
+  assert.equal(activated.ownerAttestation.attestedByPrincipalId, owner.principalId);
   const claimed = providers.claim(registered.agent.id, registered.accessToken!);
   assert.equal(claimed?.request.prompt, "hello");
   assert.equal(claimed?.attempt, 1);
+  gateway.close();
+});
+
+test("Provider reconnect preserves attestation only for the same capability digest", () => {
+  const gateway = new GatewayStore(":memory:");
+  const providers = new ProviderStore(gateway);
+  const registered = providers.register({
+    instanceKey: "attested-agent",
+    name: "Attested Agent",
+    capabilities,
+  });
+  const activated = providers.approve(registered.agent.id, owner);
+  const attestedDigest = activated.ownerAttestation.attestedCapabilitiesDigest;
+  const reconnected = new ProviderStore(gateway).register({
+    instanceKey: "attested-agent",
+    name: "Renamed Attested Agent",
+    accessToken: registered.accessToken,
+    capabilities: {
+      ...capabilities,
+      operations: [...capabilities.operations].reverse(),
+      artifactTypes: [...capabilities.artifactTypes].reverse(),
+    },
+  });
+  assert.equal(reconnected.agent.status, "active");
+  assert.equal(reconnected.agent.ownerAttestation.status, "owner-attested");
+  assert.equal(reconnected.agent.ownerAttestation.attestedCapabilitiesDigest, attestedDigest);
+  assert.equal(reconnected.agent.capabilities.isolationAssurance, "self-reported");
+  assert.ok(gateway.listAudit().some(
+    (event) => event.eventType === "provider.agent-reconnected"
+      && event.outputDigest === attestedDigest,
+  ));
+
+  const queued = providers.enqueue({
+    prompt: "capability-bound work",
+    contextId: "attestation-context",
+    taskId: "attestation-task",
+    approvedScopes: [],
+    deniedScopes: [],
+    allowedResources: [],
+    deniedResources: [],
+  }, registered.agent.id);
+  assert.ok(providers.claim(registered.agent.id, registered.accessToken!));
+
+  const changed = providers.register({
+    instanceKey: "attested-agent",
+    name: "Attested Agent",
+    accessToken: registered.accessToken,
+    capabilities: { ...capabilities, maxConcurrency: capabilities.maxConcurrency + 1 },
+  });
+  assert.equal(changed.agent.status, "pending");
+  assert.equal(changed.agent.ownerAttestation.status, "invalidated");
+  assert.equal(changed.agent.ownerAttestation.invalidationReason, "provider-capabilities-changed");
+  assert.notEqual(changed.agent.ownerAttestation.capabilitiesDigest, attestedDigest);
+  assert.equal(providers.getJob(queued.id)?.status, "pending");
+  assert.equal(providers.claim(changed.agent.id, registered.accessToken!), undefined);
+  assert.ok(providers.listEvents(changed.agent.id).some(
+    (event) => event.type === "agent.attestation-invalidated",
+  ));
+  assert.ok(gateway.listAudit().some(
+    (event) => event.eventType === "provider.agent-attestation-invalidated"
+      && event.decision === "revoked",
+  ));
+  gateway.close();
+});
+
+test("Provider cannot self-assert Owner attestation", () => {
+  const gateway = new GatewayStore(":memory:");
+  const providers = new ProviderStore(gateway);
+  const spoofed = providers.register({
+    instanceKey: "spoofed-agent",
+    name: "Spoofed Agent",
+    capabilities: {
+      ...capabilities,
+      isolationAssurance: "owner-attested",
+    } as unknown as ProviderCapabilities,
+  });
+  assert.equal(spoofed.agent.status, "pending");
+  assert.equal(spoofed.agent.capabilities.isolationAssurance, "self-reported");
+  assert.equal(spoofed.agent.ownerAttestation.status, "unattested");
+  gateway.close();
+});
+
+test("Legacy approved Providers migrate to a digest-bound Owner attestation", () => {
+  const gateway = new GatewayStore(":memory:");
+  gateway.db.exec(`
+    CREATE TABLE provider_agents (
+      id TEXT PRIMARY KEY,
+      instance_key TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      description TEXT NOT NULL,
+      status TEXT NOT NULL,
+      token_hash TEXT NOT NULL,
+      capabilities_json TEXT NOT NULL,
+      registered_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      approved_at TEXT
+    )
+  `);
+  const approvedAt = new Date().toISOString();
+  gateway.db.prepare(`
+    INSERT INTO provider_agents (
+      id,instance_key,name,description,status,token_hash,capabilities_json,
+      registered_at,updated_at,last_seen_at,approved_at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+  `).run(
+    "legacy-agent", "legacy-instance", "Legacy Agent", "", "active", "unused",
+    JSON.stringify({ ...capabilities, isolationAssurance: "owner-attested" }),
+    approvedAt, approvedAt, approvedAt, approvedAt,
+  );
+  const providers = new ProviderStore(gateway);
+  const migrated = providers.getAgent("legacy-agent")!;
+  assert.equal(migrated.status, "active");
+  assert.equal(migrated.capabilities.isolationAssurance, "self-reported");
+  assert.equal(migrated.ownerAttestation.status, "owner-attested");
+  assert.equal(
+    migrated.ownerAttestation.attestedCapabilitiesDigest,
+    migrated.ownerAttestation.capabilitiesDigest,
+  );
+  assert.equal(providers.hasActiveSessionProvider(), true);
+  assert.ok(gateway.listAudit().some(
+    (event) => event.eventType === "provider.agent-attestation-migrated",
+  ));
+  gateway.close();
+});
+
+test("Startup integrity check fails closed for an active Provider with a stale attestation", () => {
+  const gateway = new GatewayStore(":memory:");
+  const providers = new ProviderStore(gateway);
+  const registered = providers.register({
+    instanceKey: "stale-attestation-agent",
+    name: "Stale Attestation Agent",
+    capabilities,
+  });
+  providers.approve(registered.agent.id, owner);
+  gateway.db.prepare(
+    "UPDATE provider_agents SET capabilities_json=? WHERE id=?",
+  ).run(
+    JSON.stringify({ ...capabilities, maxConcurrency: capabilities.maxConcurrency + 1 }),
+    registered.agent.id,
+  );
+
+  const restarted = new ProviderStore(gateway);
+  const checked = restarted.getAgent(registered.agent.id)!;
+  assert.equal(checked.status, "pending");
+  assert.equal(checked.ownerAttestation.status, "invalidated");
+  assert.equal(checked.ownerAttestation.invalidationReason, "attestation-digest-mismatch");
+  assert.equal(restarted.hasActiveSessionProvider(), false);
+  assert.ok(gateway.listAudit().some(
+    (event) => event.eventType === "provider.agent-attestation-invalidated"
+      && event.metadata?.source === "startup-integrity-check",
+  ));
   gateway.close();
 });
 
@@ -58,7 +221,7 @@ test("Provider event cursor reports durable arrival and lease requeue", () => {
     name: "Event Agent",
     capabilities,
   });
-  providers.approve(registered.agent.id);
+  providers.approve(registered.agent.id, owner);
   const queued = providers.enqueue({
     prompt: "event work",
     contextId: "context-event",
@@ -96,7 +259,7 @@ test("ProviderAdapter persists an Agent session and resumes it after adapter res
       name: "Persistent Agent",
       capabilities,
     });
-    providers.approve(registered.agent.id);
+    providers.approve(registered.agent.id, owner);
     const token = registered.accessToken!;
     const adapter = new ProviderAdapter(gateway, { timeoutMs: 3000 });
     const firstWorker = serviceOne(providers, registered.agent.id, token, (job) => {
@@ -118,7 +281,7 @@ test("ProviderAdapter persists an Agent session and resumes it after adapter res
       name: "Other Agent",
       capabilities,
     });
-    providers.approve(other.agent.id);
+    providers.approve(other.agent.id, owner);
     const secondPromise = restartedAdapter.run(request("turn-2"));
     assert.equal(
       providers.claim(other.agent.id, other.accessToken!),

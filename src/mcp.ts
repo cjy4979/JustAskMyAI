@@ -98,7 +98,7 @@ server.registerTool(
       maxConcurrency: z.number().int().min(1).max(32).default(1),
       operations: z.array(z.string().min(1)).default(["ask", "task", "review"]),
       artifactTypes: z.array(z.string().min(1)).default(["text", "report"]),
-      isolationAssurance: z.enum(["self-reported", "owner-attested", "enforced", "unknown"])
+      isolationAssurance: z.enum(["self-reported", "enforced", "unknown"])
         .default("self-reported"),
     },
   },
@@ -118,20 +118,6 @@ server.registerTool(
         operations: input.operations,
         artifactTypes: input.artifactTypes,
         isolationAssurance: input.isolationAssurance,
-      },
-    });
-    store.appendAudit({
-      eventType: "provider.agent-registered",
-      principalId,
-      agentId,
-      action: "register-local-agent",
-      resource: result.agent.id,
-      decision: result.agent.status === "active" ? "approved" : undefined,
-      metadata: {
-        providerName: result.agent.name,
-        providerInstanceKey: result.agent.instanceKey,
-        created: result.created,
-        capabilities: result.agent.capabilities,
       },
     });
     return text(JSON.stringify({
