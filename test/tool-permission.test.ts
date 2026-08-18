@@ -142,6 +142,40 @@ test("Windows native realpath namespaces match ordinary drive-path grants", () =
   ), true);
 });
 
+test("relative grants and requested paths share the same real base directory", async (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), "jamai-resource-base-link-"));
+  try {
+    const realBase = path.join(root, "real-base");
+    const aliasBase = path.join(root, "alias-base");
+    mkdirSync(path.join(realBase, "workspace"), { recursive: true });
+    writeFileSync(path.join(realBase, "workspace", "model.json"), "{}");
+    try {
+      symlinkSync(realBase, aliasBase, process.platform === "win32" ? "junction" : "dir");
+    } catch (error) {
+      t.skip(`base-path symlink creation unavailable: ${String(error)}`);
+      return;
+    }
+    const result = await decideToolPermission({
+      localToolsEnabled: true,
+      toolCall: {
+        toolCallId: "relative-alias-1",
+        kind: "read",
+        name: "read_file",
+        rawInput: { file: "workspace/model.json" },
+      },
+      options,
+      approvedScopes: ["read-workspace"],
+      deniedScopes: [],
+      allowedResources: ["path:workspace/**"],
+      deniedResources: [],
+      resourceBasePath: aliasBase,
+    });
+    assert.equal(result.decision.allowed, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("realpath enforcement blocks a symlink escape from an allowed root", async (t) => {
   const base = mkdtempSync(path.join(tmpdir(), "jamai-resource-link-"));
   try {

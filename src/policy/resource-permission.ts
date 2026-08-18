@@ -116,7 +116,7 @@ export function resourcePatternMatches(
   resource: string,
   basePath = process.cwd(),
 ): boolean {
-  const normalizedPattern = normalizeResource(pattern, false, basePath);
+  const normalizedPattern = normalizeResource(pattern, true, basePath);
   const normalizedResource = normalizeResource(resource, true, basePath);
   if (normalizedPattern === "*" || normalizedPattern === normalizedResource) return true;
   if (normalizedPattern.endsWith("/**")) {
