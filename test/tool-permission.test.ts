@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { resourcePatternMatches } from "../src/policy/resource-permission.js";
 import { decideToolPermission } from "../src/policy/tool-permission.js";
 
 const options = [
@@ -131,6 +132,14 @@ test("relative resource paths resolve inside the adapter working directory", asy
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
+});
+
+test("Windows native realpath namespaces match ordinary drive-path grants", () => {
+  assert.equal(resourcePatternMatches(
+    "path:D:/workspaces/project/**",
+    "path:\\\\?\\D:\\workspaces\\project\\model.json",
+    "D:\\workspaces\\project",
+  ), true);
 });
 
 test("realpath enforcement blocks a symlink escape from an allowed root", async (t) => {

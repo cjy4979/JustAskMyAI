@@ -143,8 +143,15 @@ function normalizePath(value: string, basePath: string, resolveRealPath: boolean
     : value.startsWith("/") || basePath.startsWith("/") ? path.posix : path;
   const resolved = api.isAbsolute(value) ? api.resolve(value) : api.resolve(basePath, value);
   const real = resolveRealPath ? nearestRealPath(resolved, api) : resolved;
-  const normalized = real.replaceAll("\\", "/").replace(/\/+$/, "");
+  const portableReal = api === path.win32 ? stripWindowsNamespace(real) : real;
+  const normalized = portableReal.replaceAll("\\", "/").replace(/\/+$/, "");
   return api === path.win32 ? normalized.toLowerCase() : normalized;
+}
+
+function stripWindowsNamespace(value: string): string {
+  if (value.startsWith("\\\\?\\UNC\\")) return `\\\\${value.slice(8)}`;
+  if (value.startsWith("\\\\?\\")) return value.slice(4);
+  return value;
 }
 
 function nearestRealPath(resolved: string, api: typeof path): string {
