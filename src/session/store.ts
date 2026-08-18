@@ -1043,6 +1043,30 @@ export class SessionStore {
         originalEgressViolation: current.reason,
         releasedAnswerDigest: next.releasedAnswerDigest,
       }, current.projectedContextRefs);
+      this.gateway.appendAudit({
+        eventType: input.decision === "released"
+          ? "external-session.egress-released"
+          : "external-session.egress-rejected",
+        principalId: input.ownerPrincipalId,
+        agentId: session.ownerAgentId,
+        peerId: session.callerPeerId,
+        contextId: session.a2aContextId,
+        action: "resolve-egress-challenge",
+        resource: current.sessionId,
+        decision: input.decision === "released" ? "allowed" : "denied",
+        decisionReason: input.decision === "released"
+          ? "Owner explicitly released the digest-bound Egress draft"
+          : "Owner rejected the digest-bound Egress draft",
+        inputDigest: current.draftDigest,
+        outputDigest: next.releasedAnswerDigest,
+        metadata: {
+          egressChallengeId: current.id,
+          egressGrantId: current.egressGrantId,
+          authorityVersion: current.authorityVersion,
+          originalEgressViolation: current.reason,
+          ownerOverride: input.decision === "released",
+        },
+      });
       this.gateway.db.exec("COMMIT");
     } catch (error) {
       this.gateway.db.exec("ROLLBACK");

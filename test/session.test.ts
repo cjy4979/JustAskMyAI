@@ -673,6 +673,13 @@ test("Egress Grant blocks excerpts and Owner confirmation releases an immutable 
   });
   assert.equal(released.status, "released");
   assert.equal(released.resolvedByPrincipalId, "alice");
+  const releaseAudit = env.gateway.listAudit().find(
+    (event) => event.eventType === "external-session.egress-released",
+  );
+  assert.equal(releaseAudit?.decision, "allowed");
+  assert.equal(releaseAudit?.inputDigest, challenge.draftDigest);
+  assert.equal(releaseAudit?.outputDigest, released.releasedAnswerDigest);
+  assert.equal(releaseAudit?.metadata?.egressChallengeId, challenge.id);
   assert.equal(env.sessions.listEvents(env.session.id).some((event) =>
     event.type === "artifact"
     && (event.content as { taskId?: string }).taskId === "egress-task"), true);
@@ -785,6 +792,9 @@ test("Egress resolution rolls back challenge, events, and task together", () => 
     "awaiting_owner_confirmation");
   assert.equal(env.sessions.listEvents(env.session.id).some((event) =>
     event.type === "agent-message" || event.type === "artifact"), false);
+  assert.equal(env.gateway.listAudit().some(
+    (event) => event.eventType === "external-session.egress-released",
+  ), false);
   env.gateway.close();
 });
 
