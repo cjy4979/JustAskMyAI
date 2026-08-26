@@ -1,6 +1,14 @@
-# JustAskMyAI
+# JustAskMyAI (JAMA)
 
-> Let one person's AI safely discover, contact, ask, and delegate to another person's AI.
+> **Your AI can ask mine - but only under both Owners' rules.**
+
+JAMA is the consent and accountability layer for collaboration between independently owned
+AI Agents. It lets Codex, Claude Code, DeepSeek Harness, Hermes, OpenClaw, and future Agents
+work across people without replacing their native tools, memory, sessions, or configuration.
+
+JAMA is deliberately not a shared VM, editor, model router, or Agent orchestrator. It owns the
+boundary between Agents: identity, human consent, scoped delegation, session continuity,
+egress control, and tamper-evident audit.
 
 > **DeepSeek Harness plugin preview is now in development.** JAMA's native Cordis bundle gives
 > independently owned DSH Agents a consent-bound collaboration boundary without replacing
@@ -90,6 +98,27 @@ network until end-to-end relay encryption, identity revocation, and
 rate limiting are implemented.
 
 ## Run
+
+### Fastest Windows start
+
+Install dependencies once, then start the gateway, Owner Hub, and passive receiving Agent
+with one command:
+
+```powershell
+npm install
+npm run start:codex
+```
+
+For Claude Code, use `npm run start:claude`. The launcher detects a LAN IPv4 address, keeps the
+management interface on localhost, opens the Owner Hub, and waits passively over SSE. The
+model is invoked only after authorized work arrives. Review the pending Agent in the Owner
+Hub before it can receive a task.
+
+Use `-DryRun -NoOpenHub` to inspect the resolved URLs, paths, and executable without starting
+anything. The compressed preview-release scope and gates are tracked in
+[Launch closure](./docs/launch-closure.md).
+
+### Development start
 
 ```powershell
 npm install

@@ -21,7 +21,7 @@ and creates no model turn.
 
 ## 1. Start the receiving gateway
 
-On Computer B, pull the `codex/provider-test-matrix` branch, then run:
+On Computer B, pull the `codex/launch-closure` preview branch, then run:
 
 ```powershell
 npm install

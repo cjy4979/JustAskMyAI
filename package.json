@@ -14,6 +14,8 @@
     "dev:node": "tsx src/daemon.ts",
     "dev:mcp": "tsx src/mcp.ts",
     "dev:hub": "tsx src/hub.ts",
+    "start:codex": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-jama.ps1 -Agent codex",
+    "start:claude": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-jama.ps1 -Agent claude-code",
     "serve:provider": "node scripts/serve-cli-provider.mjs",
     "test": "npm run test:unit && npm run test:dsh",
     "test:unit": "node --test --test-concurrency=4 --import tsx test/*.test.ts",
