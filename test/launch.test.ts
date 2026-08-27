@@ -63,3 +63,34 @@ test(
     assert.equal(path.resolve(config.agentExecutable), path.resolve(process.execPath));
   },
 );
+
+test(
+  "Windows launcher rejects Markdown disguised as a proxy URL",
+  { skip: process.platform !== "win32" },
+  () => {
+    const result = spawnSync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        launcher,
+        "-PublicIp",
+        "192.168.50.7",
+        "-AgentCwd",
+        root,
+        "-Command",
+        process.execPath,
+        "-ProxyUrl",
+        "[http://127.0.0.1:7890](http://127.0.0.1:7890)",
+        "-DryRun",
+        "-NoOpenHub",
+      ],
+      { cwd: root, encoding: "utf8" },
+    );
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /plain absolute http\(s\) URL/);
+  },
+);

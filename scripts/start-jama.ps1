@@ -114,6 +114,14 @@ if (-not [Net.IPAddress]::TryParse($PublicIp, [ref]$parsedIp) -or
     $parsedIp.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) {
   throw "PublicIp must be an IPv4 address."
 }
+$parsedProxy = $null
+if ($ProxyUrl -and
+    (-not [Uri]::TryCreate($ProxyUrl, [UriKind]::Absolute, [ref]$parsedProxy) -or
+     $parsedProxy.Scheme -notin @("http", "https"))) {
+  throw "ProxyUrl must be a plain absolute http(s) URL, for example http://127.0.0.1:7890. Do not paste Markdown link syntax."
+}
+if ($parsedProxy) { $ProxyUrl = $parsedProxy.AbsoluteUri.TrimEnd("/") }
+
 $ipOctets = $parsedIp.GetAddressBytes()
 $isPrivateAddress = $ipOctets[0] -eq 10 -or
   ($ipOctets[0] -eq 172 -and $ipOctets[1] -ge 16 -and $ipOctets[1] -le 31) -or

@@ -114,6 +114,9 @@ management interface on localhost, opens the Owner Hub, and waits passively over
 model is invoked only after authorized work arrives. Review the pending Agent in the Owner
 Hub before it can receive a task.
 
+When using `-ProxyUrl`, pass the plain URL (for example `http://127.0.0.1:7890`), not Markdown
+link syntax copied from rendered text.
+
 Use `-DryRun -NoOpenHub` to inspect the resolved URLs, paths, and executable without starting
 anything. The compressed preview-release scope and gates are tracked in
 [Launch closure](./docs/launch-closure.md).
