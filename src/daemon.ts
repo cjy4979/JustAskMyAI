@@ -59,6 +59,12 @@ import type {
 import { ownerPage } from "./ui/owner-page.js";
 import { guestPage } from "./ui/guest-page.js";
 import { ProviderStore } from "./provider/store.js";
+import {
+  enqueueRuntimeControl,
+  prepareRuntimeControl,
+  runtimeControlStatus,
+  type RuntimeControlAction,
+} from "./runtime-control.js";
 
 const config = loadConfig();
 const store = new GatewayStore();
@@ -1005,6 +1011,31 @@ managementApp.post("/api/provider-agents/:id/suspend", (req, res) => {
   try {
     return res.json(providerAgents.suspend(req.params.id, { principalId, agentId }));
   } catch (error) { return res.status(400).json({ error: String(error) }); }
+});
+managementApp.get("/api/runtime-control", (_req, res) => {
+  res.json(runtimeControlStatus());
+});
+managementApp.post("/api/runtime-control/:action", (req, res) => {
+  try {
+    const action = req.params.action;
+    if (!["restart", "update"].includes(action)) {
+      return res.status(400).json({ error: "runtime action must be restart or update" });
+    }
+    const prepared = prepareRuntimeControl(action as RuntimeControlAction);
+    store.appendAudit({
+      eventType: "runtime.control-requested",
+      principalId,
+      agentId,
+      action: `runtime-${action}`,
+      resource: "local-runtime",
+      decision: "approved",
+      metadata: { requestId: prepared.request.id },
+    });
+    const request = enqueueRuntimeControl(prepared);
+    return res.status(202).json({ accepted: true, request });
+  } catch (error) {
+    return res.status(409).json({ error: String(error) });
+  }
 });
 managementApp.get("/api/settings", (_req, res) => res.json({
   guestInvitesEnabled: guestInvitesEnabled(),

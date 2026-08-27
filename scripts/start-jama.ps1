@@ -173,11 +173,6 @@ if (-not (Test-Path -LiteralPath (Join-Path $projectRoot "dist/src/daemon.js") -
 
 Assert-PortAvailable $PublicPort
 Assert-PortAvailable $ManagementPort
-$logDirectory = Join-Path $projectRoot ".jamai/logs"
-New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
-$gatewayOut = Join-Path $logDirectory "gateway.out.log"
-$gatewayErr = Join-Path $logDirectory "gateway.err.log"
-
 $env:JAMAI_NAME = "$Name Gateway"
 $env:JAMAI_HOST = "0.0.0.0"
 $env:JAMAI_PORT = "$PublicPort"
@@ -190,64 +185,29 @@ $env:JAMAI_ADAPTER = "provider"
 $env:JAMAI_AGENT_CWD = $workspace
 $env:JAMAI_DB_PATH = $database
 
-$gatewayProcess = $null
+$env:JAMAI_CLI_PROVIDER = $Agent
+$env:JAMAI_CLI_COMMAND = $agentExecutable
+$env:JAMAI_PROVIDER_NAME = $Name
+$env:JAMAI_PROVIDER_IDENTITY_FILE = $providerIdentity
+$env:JAMAI_CLI_TIMEOUT_MS = "$($TimeoutMinutes * 60 * 1000)"
+if ($ProxyUrl) {
+  $env:HTTP_PROXY = $ProxyUrl
+  $env:HTTPS_PROXY = $ProxyUrl
+  $env:ALL_PROXY = $ProxyUrl
+}
+
+$runtimeDirectory = Join-Path $projectRoot ".jamai/runtime"
+New-Item -ItemType Directory -Force -Path $runtimeDirectory | Out-Null
+$env:JAMAI_SUPERVISOR_CONTROL_FILE = Join-Path $runtimeDirectory "control.json"
+$env:JAMAI_SUPERVISOR_STATUS_FILE = Join-Path $runtimeDirectory "status.json"
+$env:JAMAI_SUPERVISOR_OPEN_HUB = if ($NoOpenHub) { "false" } else { "true" }
+$gitAvailable = Get-Command git.exe -ErrorAction SilentlyContinue
+$env:JAMAI_SUPERVISOR_UPDATE_ENABLED = if ((Test-Path -LiteralPath (Join-Path $projectRoot ".git")) -and $gitAvailable) { "true" } else { "false" }
+
+Push-Location $projectRoot
 try {
-  $gatewayProcess = Start-Process -FilePath "node.exe" `
-    -ArgumentList "dist/src/daemon.js" `
-    -WorkingDirectory $projectRoot `
-    -WindowStyle Hidden `
-    -RedirectStandardOutput $gatewayOut `
-    -RedirectStandardError $gatewayErr `
-    -PassThru
-
-  $healthy = $false
-  foreach ($attempt in 1..50) {
-    if ($gatewayProcess.HasExited) {
-      $details = if (Test-Path -LiteralPath $gatewayErr) { Get-Content -Raw $gatewayErr } else { "" }
-      throw "JAMA gateway stopped during startup. $details"
-    }
-    try {
-      $health = Invoke-RestMethod -Uri "$managementUrl/health" -TimeoutSec 1
-      if ($health.ok) { $healthy = $true; break }
-    } catch {
-      Start-Sleep -Milliseconds 200
-    }
-  }
-  if (-not $healthy) { throw "JAMA gateway did not become healthy at $managementUrl." }
-
-  Write-Host ""
-  Write-Host "JAMA is ready" -ForegroundColor Green
-  Write-Host "Owner Hub:  $ownerHub"
-  Write-Host "Share URL:  $publicUrl"
-  Write-Host "Agent:      $Name ($agentLabel)"
-  Write-Host "Idle mode:  passive SSE; no model turn"
-  Write-Host ""
-  Write-Host "Confirm the pending Agent in the Owner Hub. Press Ctrl+C to stop JAMA."
-
-  if (-not $NoOpenHub) {
-    try { Start-Process $ownerHub | Out-Null } catch { Write-Warning "Open the Owner Hub manually: $ownerHub" }
-  }
-
-  $env:JAMAI_CLI_PROVIDER = $Agent
-  $env:JAMAI_CLI_COMMAND = $agentExecutable
-  $env:JAMAI_PROVIDER_NAME = $Name
-  $env:JAMAI_PROVIDER_IDENTITY_FILE = $providerIdentity
-  $env:JAMAI_CLI_TIMEOUT_MS = "$($TimeoutMinutes * 60 * 1000)"
-  if ($ProxyUrl) {
-    $env:HTTP_PROXY = $ProxyUrl
-    $env:HTTPS_PROXY = $ProxyUrl
-    $env:ALL_PROXY = $ProxyUrl
-  }
-
-  Push-Location $projectRoot
-  try {
-    & node.exe scripts/serve-cli-provider.mjs
-    if ($LASTEXITCODE -ne 0) { throw "JAMA Provider stopped with exit code $LASTEXITCODE." }
-  } finally {
-    Pop-Location
-  }
+  & node.exe scripts/supervise-jama.mjs
+  if ($LASTEXITCODE -ne 0) { throw "JAMA supervisor stopped with exit code $LASTEXITCODE." }
 } finally {
-  if ($gatewayProcess -and -not $gatewayProcess.HasExited) {
-    Stop-Process -Id $gatewayProcess.Id -ErrorAction SilentlyContinue
-  }
+  Pop-Location
 }

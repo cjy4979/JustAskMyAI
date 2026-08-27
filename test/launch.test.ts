@@ -10,15 +10,18 @@ const launcher = path.join(root, "scripts", "start-jama.ps1");
 
 test("Windows launcher keeps management local and uses passive Provider delivery", () => {
   const source = readFileSync(launcher, "utf8");
+  const supervisor = readFileSync(path.join(root, "scripts", "supervise-jama.mjs"), "utf8");
 
   assert.match(source, /JAMAI_MANAGEMENT_HOST\s*=\s*"127\.0\.0\.1"/);
   assert.match(source, /JAMAI_ADAPTER\s*=\s*"provider"/);
   assert.match(source, /Do not expose this preview to an untrusted public network/);
-  assert.match(source, /scripts\/serve-cli-provider\.mjs/);
-  assert.match(source, /passive SSE; no model turn/);
-  assert.match(source, /finally\s*\{/);
-  assert.match(source, /Stop-Process -Id \$gatewayProcess\.Id/);
-  assert.doesNotMatch(source, /access[_-]?token/i);
+  assert.match(source, /JAMAI_SUPERVISOR_CONTROL_FILE/);
+  assert.match(source, /scripts\/supervise-jama\.mjs/);
+  assert.match(supervisor, /dist\/src\/daemon\.js/);
+  assert.match(supervisor, /scripts\/serve-cli-provider\.mjs/);
+  assert.match(supervisor, /passive SSE; no model turn/);
+  assert.match(supervisor, /"pull", "--ff-only"/);
+  assert.doesNotMatch(source + supervisor, /access[_-]?token/i);
 });
 
 test(
