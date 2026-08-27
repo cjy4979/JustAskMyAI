@@ -15,7 +15,8 @@ test("Codex sidecar starts a locked-down fresh native session", () => {
     cwd: "C:\\workspace",
   });
   assert.equal(invocation.command, "codex-test");
-  assert.deepEqual(invocation.args.slice(0, 3), ["exec", "--json", "--ask-for-approval"]);
+  assert.deepEqual(invocation.args.slice(0, 3), ["--ask-for-approval", "never", "exec"]);
+  assert.ok(invocation.args.indexOf("--ask-for-approval") < invocation.args.indexOf("exec"));
   assert.equal(valueAfter(invocation.args, "--sandbox"), "read-only");
   assert.ok(invocation.args.includes("--ignore-user-config"));
   assert.ok(invocation.args.includes("mcp_servers={}"));

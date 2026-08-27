@@ -172,9 +172,9 @@ function codexInvocation(
   const sandbox = approved(job, "edit-workspace") ? "workspace-write" : "read-only";
   const args = [
     ...(options.extraArgs ?? []),
+    "--ask-for-approval", "never",
     "exec",
     "--json",
-    "--ask-for-approval", "never",
     "--sandbox", sandbox,
     "-c", "sandbox_workspace_write.network_access=false",
     "-c", 'web_search="disabled"',
