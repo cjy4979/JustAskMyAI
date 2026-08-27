@@ -919,13 +919,16 @@ function gateway(name, publicPort, managementPort, dbPath) {
 }
 
 async function waitReady(node) {
-  for (let attempt = 0; attempt < 50; attempt += 1) {
-    try {
-      const response = await fetch(`${node.managementUrl}/health`);
-      if (response.ok) return;
-    } catch {
-      await delay(100);
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    if (node.child.exitCode !== null) {
+      throw new Error(`${node.name} exited before becoming ready: ${node.stderr()}`);
     }
+    try {
+      const response = await fetch(`${node.managementUrl}/health`, { signal: AbortSignal.timeout(1_000) });
+      if (response.ok) return;
+    } catch {}
+    await delay(100);
   }
   throw new Error(`${node.name} did not become ready: ${node.stderr()}`);
 }

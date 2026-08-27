@@ -233,15 +233,16 @@ async function stopGateway(child) {
 }
 
 async function waitReady() {
-  for (let attempt = 0; attempt < 80; attempt += 1) {
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
     try {
-      const response = await fetch(`${managementUrl}/health`);
+      const response = await fetch(`${managementUrl}/health`, { signal: AbortSignal.timeout(1_000) });
       if (response.ok) return;
     } catch {}
     if (gateway?.exitCode !== null) {
       throw new Error(`provider gateway exited early: ${gateway.getOutput()}`);
     }
-    await delay(50);
+    await delay(100);
   }
   throw new Error(`provider gateway did not become ready: ${gateway?.getOutput()}`);
 }
