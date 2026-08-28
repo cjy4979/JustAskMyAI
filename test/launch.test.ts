@@ -21,6 +21,8 @@ test("Windows launcher keeps management local and uses passive Provider delivery
   assert.match(supervisor, /scripts\/serve-cli-provider\.mjs/);
   assert.match(supervisor, /passive SSE; no model turn/);
   assert.match(supervisor, /"pull", "--ff-only"/);
+  assert.doesNotMatch(supervisor, /status", "--porcelain/);
+  assert.match(supervisor, /local files were preserved/);
   assert.doesNotMatch(source + supervisor, /access[_-]?token/i);
 });
 

@@ -87,9 +87,14 @@ async function waitForControl(gateway, provider) {
 }
 
 async function applyUpdate() {
-  const dirty = (await capture(gitCommand, ["status", "--porcelain"])).trim();
-  if (dirty) throw new Error("working tree has local changes; update was not applied");
-  await run(gitCommand, ["pull", "--ff-only"]);
+  // Git can safely fast-forward while preserving unrelated local configuration.
+  // If an incoming file would overwrite a local edit, pull aborts before changing the worktree.
+  try {
+    const output = (await capture(gitCommand, ["pull", "--ff-only"])).trim();
+    if (output) console.log(output);
+  } catch (error) {
+    throw new Error(`Git could not fast-forward safely; local files were preserved. ${error}`);
+  }
   await run(npmCommand, ["install"]);
   await run(npmCommand, ["run", "build"]);
 }

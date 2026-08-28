@@ -21,7 +21,7 @@ test("Owner Hub renders product workflows with valid client JavaScript", () => {
   assert.match(page, /运行时声明与 Owner 证明分开记录/);
   assert.match(page, /能力变化后已停止领取新工作/);
   assert.match(page, /function providerTrustView\(\)/);
-  assert.match(page, /更新并重启/);
+  assert.match(page, /同步开发版/);
   assert.match(page, /function runtimeAction\(action\)/);
   assert.match(page, /\/api\/runtime-control/);
   assert.match(page, /协作组/);
