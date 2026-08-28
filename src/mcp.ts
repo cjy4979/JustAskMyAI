@@ -709,7 +709,7 @@ server.registerTool(
       tags: z.array(z.string().min(1)).default([]),
       maxItems: z.number().int().min(1).max(50).default(8),
       maxTokens: z.number().int().min(256).max(50000).default(6000),
-      leaseSeconds: z.number().int().min(60).max(604800).default(28800),
+      leaseSeconds: z.number().int().min(60).max(604800).default(604800),
       groupId: z.string().min(1).optional(),
     },
   },
@@ -1515,6 +1515,11 @@ async function signedExternalFetch(
     contextId?: string;
   },
 ): Promise<unknown> {
+  if (input.contextId && ["session.message", "session.close", "writeback.propose"]
+    .includes(input.action)) {
+    // Refreshing the signed state is transport-only and never invokes the remote model.
+    await refreshRemoteSessionState(peerUrl, input.contextId);
+  }
   const remote = await getRemoteIdentity(peerUrl);
   let wireBody = input.body === undefined
     ? undefined
@@ -1580,6 +1585,33 @@ async function signedExternalFetch(
     throw new Error(`Remote gateway returned ${response.status}: ${reason}`);
   }
   return parsed;
+}
+
+async function refreshRemoteSessionState(peerUrl: string, sessionId: string) {
+  const result = await signedExternalFetch(peerUrl,
+    `/external/sessions/${encodeURIComponent(sessionId)}`, {
+      action: "session.get", method: "GET", payload: { sessionId }, contextId: sessionId,
+    }) as Record<string, unknown>;
+  const state = { ...result };
+  delete state.proof;
+  const verified = verifySignedStatement(result.proof, state, store);
+  if (!verified.ok) throw new Error(`remote session state is invalid: ${verified.reason}`);
+  const session = result.session as {
+    id?: unknown; purpose?: unknown; authorityVersion?: unknown; authorityDigest?: unknown;
+  } | undefined;
+  if (typeof session?.id !== "string" || typeof session.purpose !== "string"
+    || typeof session.authorityVersion !== "number"
+    || typeof session.authorityDigest !== "string") {
+    throw new Error("remote session state is missing its authority binding");
+  }
+  if (!isAuthorityBinding(result.authorityBundle, session)) {
+    throw new Error("remote session authority bundle is invalid");
+  }
+  store.setMeta(remoteSessionBindingKey(verified.peerId, session.id), JSON.stringify({
+    purpose: session.purpose, authorityVersion: session.authorityVersion,
+    authorityDigest: session.authorityDigest,
+  }));
+  return result;
 }
 
 function remoteSessionBindingKey(peerId: string, sessionId: string): string {

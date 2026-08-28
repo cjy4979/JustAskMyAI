@@ -54,7 +54,7 @@ test("External Session binds caller, lease, status, grant, and immutable thread 
   env.sessions.setSessionStatus(env.session.id, "revoked");
   assert.throws(() => env.sessions.requireActive(env.session.id, "bob", "bob-peer"), /not active/);
   assert.throws(() => env.sessions.setSessionStatus(env.session.id, "active"), /terminal/);
-  assert.throws(() => env.sessions.extendSession(env.session.id, 3600), /terminal/);
+  assert.throws(() => env.sessions.extendSession(env.session.id, 3600), /active or paused/);
   env.gateway.close();
 });
 
@@ -291,7 +291,7 @@ test("auto Context Grant is bounded by collection policy and Owner can narrow a 
   assert.equal(auto.maxItems, 3);
   assert.equal(auto.maxTokens, 1200);
 
-  const pending = env.sessions.createSession({
+  const createPending = () => env.sessions.createSession({
     ownerPrincipalId: "alice",
     ownerAgentId: "alice-agent",
     callerType: "agent",
@@ -325,9 +325,15 @@ test("auto Context Grant is bounded by collection policy and Owner can narrow a 
       approvalRule: "per-tool",
       issuedByOwnerPolicy: "deny-by-default",
     },
+    leaseSeconds: 60,
     status: "awaiting_owner_consent",
   });
+  const pending = createPending();
+  assert.equal(pending.session.requestedLeaseSeconds, 60);
+  assert.equal(pending.session.expiresAt, pending.session.consentExpiresAt);
+  assert.ok(Date.parse(pending.session.consentExpiresAt!) - Date.now() > 6 * 86_400_000);
   assert.throws(() => env.sessions.setSessionStatus(pending.session.id, "active"), /issue narrowed/);
+  const approvedAt = Date.now();
   const approved = env.sessions.approveSession({
     sessionId: pending.session.id,
     ownerPrincipalId: "alice",
@@ -344,12 +350,36 @@ test("auto Context Grant is bounded by collection policy and Owner can narrow a 
     actionApprovalRule: "per-task",
   });
   assert.equal(approved.session.status, "active");
+  assert.ok(approved.session.activatedAt);
+  assert.ok(Date.parse(approved.session.expiresAt) - approvedAt >= 59_000);
+  assert.ok(Date.parse(approved.session.expiresAt) - approvedAt <= 61_000);
+  assert.equal(approved.grant.expiresAt, approved.session.expiresAt);
+  assert.equal(approved.actionGrant.expiresAt, approved.session.expiresAt);
+  for (const [table, id] of [
+    ["context_grants", approved.grant.id],
+    ["session_operation_grants", approved.operationGrant.id],
+    ["session_action_grants", approved.actionGrant.id],
+    ["session_egress_grants", approved.egressGrant.id],
+  ]) {
+    const row = env.gateway.db.prepare(`SELECT expires_at FROM ${table} WHERE id=?`)
+      .get(id) as { expires_at: string };
+    assert.equal(row.expires_at, approved.session.expiresAt);
+  }
   assert.deepEqual(approved.grant.allowedCollections, [env.collection.id]);
   assert.equal(approved.grant.maxItems, 2);
   assert.deepEqual(approved.operationGrant.allowedOperations, ["ask"]);
   assert.deepEqual(approved.actionGrant.allowedScopes, ["read-workspace"]);
   assert.deepEqual(approved.actionGrant.allowedResources, ["simulation"]);
   assert.deepEqual(approved.actionGrant.deniedResources, ["path:C:/secrets/**"]);
+  const stale = createPending();
+  const past = new Date(Date.now() - 1_000).toISOString();
+  const staleJson = { ...stale.session, consentExpiresAt: past, expiresAt: past };
+  env.gateway.db.prepare(
+    "UPDATE external_sessions SET expires_at=?,session_json=? WHERE id=?",
+  ).run(past, JSON.stringify(staleJson), stale.session.id);
+  assert.throws(() => env.sessions.approveSession({ sessionId: stale.session.id } as never),
+    /approval window/);
+  assert.equal(env.sessions.getSession(stale.session.id)?.status, "expired");
   env.gateway.close();
 });
 

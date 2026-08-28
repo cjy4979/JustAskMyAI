@@ -196,9 +196,13 @@ export class SessionStore {
       throw new Error("issued context grant cannot exceed the caller request");
     }
     const now = new Date();
-    const leaseSeconds = Math.min(Math.max(input.leaseSeconds ?? 28_800, 60), 604_800);
+    const leaseSeconds = Math.min(Math.max(input.leaseSeconds ?? 604_800, 60), 604_800);
     const sessionId = randomUUID();
-    const expiresAt = new Date(now.getTime() + leaseSeconds * 1000).toISOString();
+    const consentExpiresAt = new Date(now.getTime() + 604_800_000).toISOString();
+    const activatedAt = input.status === "active" ? now.toISOString() : undefined;
+    const expiresAt = input.status === "active"
+      ? new Date(now.getTime() + leaseSeconds * 1000).toISOString()
+      : consentExpiresAt;
     const requestedGrant: RequestedContextGrant = {
       id: randomUUID(),
       sessionId,
@@ -325,7 +329,12 @@ export class SessionStore {
       authorityVersion: initialBundle.authorityVersion,
       authorityDigest: initialBundle.authorityDigest,
       allowedActions: operationGrant.allowedOperations,
-      status: input.status, createdAt: now.toISOString(), expiresAt,
+      status: input.status,
+      createdAt: now.toISOString(),
+      requestedLeaseSeconds: leaseSeconds,
+      consentExpiresAt,
+      activatedAt,
+      expiresAt,
     };
     this.gateway.db.exec("BEGIN IMMEDIATE");
     try {
@@ -364,7 +373,13 @@ export class SessionStore {
       .get(id) as { session_json: string } | undefined;
     if (!row) return undefined;
     const session = JSON.parse(row.session_json) as ExternalSession;
-    if (session.status === "active" && Date.parse(session.expiresAt) <= Date.now()) {
+    const pendingDeadline = session.consentExpiresAt ?? session.expiresAt;
+    if (session.status === "awaiting_owner_consent"
+      && Date.parse(pendingDeadline) <= Date.now()) {
+      return this.setSessionStatus(id, "expired");
+    }
+    if (["active", "paused"].includes(session.status)
+      && Date.parse(session.expiresAt) <= Date.now()) {
       return this.setSessionStatus(id, "expired");
     }
     return session;
@@ -535,6 +550,21 @@ export class SessionStore {
     if (!session || !["awaiting_owner_consent", "paused"].includes(session.status)) {
       throw new Error("external session is not awaiting Owner consent or paused reauthorization");
     }
+    const now = new Date();
+    const firstActivation = session.status === "awaiting_owner_consent" && !session.activatedAt;
+    const pendingDeadline = session.consentExpiresAt ?? session.expiresAt;
+    if ((firstActivation && Date.parse(pendingDeadline) <= now.getTime())
+      || (!firstActivation && Date.parse(session.expiresAt) <= now.getTime())) {
+      this.setSessionStatus(session.id, "expired");
+      throw new Error("external session approval window or active lease has expired");
+    }
+    const legacyLeaseSeconds = Math.max(60, Math.min(604_800, Math.floor(
+      (Date.parse(session.expiresAt) - Date.parse(session.createdAt)) / 1000,
+    )));
+    const requestedLeaseSeconds = session.requestedLeaseSeconds ?? legacyLeaseSeconds;
+    const expiresAt = firstActivation
+      ? new Date(now.getTime() + requestedLeaseSeconds * 1000).toISOString()
+      : session.expiresAt;
     if (session.ownerPrincipalId !== input.ownerPrincipalId) throw new Error("Owner mismatch");
     const requested = this.getRequestedGrant(session.requestedContextGrantId);
     const currentGrant = this.getGrant(session.contextGrantId);
@@ -572,11 +602,13 @@ export class SessionStore {
       maxTokens: evaluated.maxTokens,
       issuedByOwnerPolicy: "human-owner-decision",
       issuedByPrincipalId: input.ownerPrincipalId,
+      expiresAt,
     };
     const operationGrant: SessionOperationGrant = {
       ...currentOperation,
       allowedOperations: [...new Set(input.allowedOperations)],
       issuedByOwnerPolicy: "human-owner-decision",
+      expiresAt,
     };
     const actionGrant: SessionActionGrant = {
       ...currentAction,
@@ -589,6 +621,7 @@ export class SessionStore {
         : input.actionApprovalRule,
       issuedByOwnerPolicy: "human-owner-decision",
       issuedByPrincipalId: input.ownerPrincipalId,
+      expiresAt,
     };
     const requestedAuthorities = new Set(currentEgress.allowedAuthority);
     const egressGrant: EgressGrant = {
@@ -616,6 +649,7 @@ export class SessionStore {
       ])],
       issuedByOwnerPolicy: "human-owner-decision",
       issuedByPrincipalId: input.ownerPrincipalId,
+      expiresAt,
     };
     const bundle = createAuthorityBundle({
       sessionId: session.id,
@@ -631,6 +665,10 @@ export class SessionStore {
     const active = {
       ...session,
       status: "active" as const,
+      requestedLeaseSeconds,
+      consentExpiresAt: session.consentExpiresAt ?? pendingDeadline,
+      activatedAt: session.activatedAt ?? now.toISOString(),
+      expiresAt,
       authorityVersion: bundle.authorityVersion,
       authorityDigest: bundle.authorityDigest,
       groupPolicyVersion: input.groupPolicyVersion ?? session.groupPolicyVersion,
@@ -638,18 +676,18 @@ export class SessionStore {
     };
     this.gateway.db.exec("BEGIN IMMEDIATE");
     try {
-      this.gateway.db.prepare("UPDATE context_grants SET grant_json=? WHERE id=?")
-        .run(JSON.stringify(grant), grant.id);
-      this.gateway.db.prepare("UPDATE session_operation_grants SET grant_json=? WHERE id=?")
-        .run(JSON.stringify(operationGrant), operationGrant.id);
-      this.gateway.db.prepare("UPDATE session_action_grants SET grant_json=? WHERE id=?")
-        .run(JSON.stringify(actionGrant), actionGrant.id);
-      this.gateway.db.prepare("UPDATE session_egress_grants SET grant_json=? WHERE id=?")
-        .run(JSON.stringify(egressGrant), egressGrant.id);
+      this.gateway.db.prepare("UPDATE context_grants SET grant_json=?,expires_at=? WHERE id=?")
+        .run(JSON.stringify(grant), expiresAt, grant.id);
+      this.gateway.db.prepare("UPDATE session_operation_grants SET grant_json=?,expires_at=? WHERE id=?")
+        .run(JSON.stringify(operationGrant), expiresAt, operationGrant.id);
+      this.gateway.db.prepare("UPDATE session_action_grants SET grant_json=?,expires_at=? WHERE id=?")
+        .run(JSON.stringify(actionGrant), expiresAt, actionGrant.id);
+      this.gateway.db.prepare("UPDATE session_egress_grants SET grant_json=?,expires_at=? WHERE id=?")
+        .run(JSON.stringify(egressGrant), expiresAt, egressGrant.id);
       this.insertAuthorityBundle(bundle);
       this.gateway.db.prepare(
-        "UPDATE external_sessions SET status='active',session_json=? WHERE id=?",
-      ).run(JSON.stringify(active), active.id);
+        "UPDATE external_sessions SET status='active',expires_at=?,session_json=? WHERE id=?",
+      ).run(expiresAt, JSON.stringify(active), active.id);
       this.gateway.db.exec("COMMIT");
     } catch (error) {
       this.gateway.db.exec("ROLLBACK");
@@ -657,6 +695,8 @@ export class SessionStore {
     }
     this.appendEvent(active.id, "status", input.ownerPrincipalId, {
       status: "active",
+      activatedAt: active.activatedAt,
+      expiresAt: active.expiresAt,
       issuedContextGrantDigest: digest(grant),
       actionGrantDigest: digest(actionGrant),
       egressGrantDigest: digest(egressGrant),
@@ -725,11 +765,11 @@ export class SessionStore {
   extendSession(id: string, additionalSeconds: number): ExternalSession {
     const current = this.getSessionRaw(id);
     if (!current) throw new Error("external session not found");
-    if (["revoked", "expired", "closed"].includes(current.status)) {
-      throw new Error("terminal external session cannot be extended");
+    if (!["active", "paused"].includes(current.status)) {
+      throw new Error("only an active or paused external session can be extended");
     }
     const seconds = Math.min(Math.max(Math.floor(additionalSeconds), 60), 604_800);
-    const maximum = Date.parse(current.createdAt) + 604_800_000;
+    const maximum = Date.parse(current.activatedAt ?? current.createdAt) + 604_800_000;
     const expiresAt = new Date(Math.min(Date.parse(current.expiresAt) + seconds * 1000, maximum))
       .toISOString();
     if (expiresAt === current.expiresAt) throw new Error("external session reached its 7-day maximum");

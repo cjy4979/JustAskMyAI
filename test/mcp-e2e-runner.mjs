@@ -214,6 +214,36 @@ try {
   if (!JSON.stringify(webAnswer).includes("answer")) {
     throw new Error("localhost paired-gateway Web Chat did not reach the remote AI");
   }
+  await postJson(`${bob.managementUrl}/api/external-sessions/${webSessionResult.session.id}/status`, {
+    status: "paused",
+  });
+  await postJson(
+    `${bob.managementUrl}/api/external-sessions/${webSessionResult.session.id}/approve`,
+    {
+      allowedCollections: [simulationCollection.id],
+      sensitivityCeiling: "internal",
+      exactContentAllowed: false,
+      maxItems: 2,
+      maxTokens: 500,
+      allowedOperations: ["ask"],
+      actionScopes: [],
+      deniedScopes: [],
+      allowedResources: [],
+      deniedResources: [],
+      actionApprovalRule: "runtime-policy",
+    },
+  );
+  const resumedWebAnswer = await postJson(
+    `${alice.managementUrl}/api/remote-external-sessions/${webSessionResult.session.id}/messages`,
+    {
+      peerId: bobIdentity.peerId,
+      operation: "ask",
+      message: "Continue after the remote Owner updated this Session's authority.",
+    },
+  );
+  if (!JSON.stringify(resumedWebAnswer).includes("answer")) {
+    throw new Error("Owner Hub did not automatically refresh the remote Authority Bundle");
+  }
   const capabilities = await mcp.callTool({
     name: "discover_agent_capabilities",
     arguments: { peerUrl: bob.publicUrl },
@@ -306,10 +336,7 @@ try {
     resources: ["simulation"],
     actionApprovalRule: "per-task",
   });
-  await mcp.callTool({
-    name: "get_external_session",
-    arguments: { peerUrl: bob.publicUrl, sessionId: externalSession.id },
-  });
+  // The next state-changing call must refresh the changed Authority Bundle automatically.
   const governedTaskArgs = {
     peerUrl: bob.publicUrl,
     sessionId: externalSession.id,
@@ -396,10 +423,6 @@ try {
     actionApprovalRule: "runtime-policy",
     egressQuoteMode: "none",
     egressRequireEvidenceRefs: true,
-  });
-  await mcp.callTool({
-    name: "get_external_session",
-    arguments: { peerUrl: bob.publicUrl, sessionId: externalSession.id },
   });
   const blockedEgress = await mcp.callTool({
     name: "send_external_message",

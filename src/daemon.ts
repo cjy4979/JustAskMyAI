@@ -1081,7 +1081,7 @@ managementApp.post("/api/remote-external-sessions", async (req, res) => {
       sensitivityCeiling: parseSensitivity(req.body?.sensitivityCeiling),
       exactContentAllowed: req.body?.exactContentAllowed === true,
       allowedActions: parseSessionActions(req.body?.allowedActions),
-      leaseSeconds: typeof req.body?.leaseSeconds === "number" ? req.body.leaseSeconds : 28_800,
+      leaseSeconds: typeof req.body?.leaseSeconds === "number" ? req.body.leaseSeconds : 604_800,
       groupId: typeof req.body?.groupId === "string" ? req.body.groupId : undefined,
     };
     const result = await callRemoteSession(peerId, "/external/sessions", {
@@ -2403,6 +2403,39 @@ function auditGroupMemberChange(
   });
 }
 
+async function refreshRemoteSessionBinding(peerId: string, sessionId: string): Promise<void> {
+  const result = await callRemoteSession(
+    peerId,
+    `/external/sessions/${encodeURIComponent(sessionId)}`,
+    { action: "session.get", contextId: sessionId, payload: { sessionId }, method: "GET" },
+  ) as Record<string, unknown>;
+  const state = { ...result };
+  delete state.proof;
+  const verified = verifySignedStatement(result.proof, state, store);
+  if (!verified.ok || verified.peerId !== peerId) {
+    throw new Error("remote session state proof is invalid");
+  }
+  const session = result.session as {
+    id?: unknown; purpose?: unknown; authorityVersion?: unknown; authorityDigest?: unknown;
+  } | undefined;
+  if (typeof session?.id !== "string" || typeof session.purpose !== "string"
+    || typeof session.authorityVersion !== "number"
+    || typeof session.authorityDigest !== "string") {
+    throw new Error("remote session state is missing its authority binding");
+  }
+  if (!isAuthorityBinding(result.authorityBundle, {
+    id: session.id,
+    authorityVersion: session.authorityVersion,
+    authorityDigest: session.authorityDigest,
+  })) {
+    throw new Error("remote session authority bundle is invalid");
+  }
+  store.setMeta(remoteSessionBindingKey(peerId, session.id), JSON.stringify({
+    purpose: session.purpose, authorityVersion: session.authorityVersion,
+    authorityDigest: session.authorityDigest,
+  }));
+}
+
 function remoteSessionBindingKey(peerId: string, sessionId: string): string {
   return `external.remote.${peerId}.${sessionId}`;
 }
@@ -2438,6 +2471,11 @@ async function callRemoteSession(
     method?: "GET" | "POST";
   },
 ): Promise<unknown> {
+  if (input.contextId && ["session.message", "session.close", "writeback.propose"]
+    .includes(input.action)) {
+    // Owner Hub state changes also recover stale bindings without a manual refresh step.
+    await refreshRemoteSessionBinding(peerId, input.contextId);
+  }
   const peer = requiredPairedPeer(peerId);
   let body = input.body === undefined
     ? undefined

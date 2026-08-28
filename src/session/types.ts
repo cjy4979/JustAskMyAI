@@ -194,6 +194,11 @@ export interface ExternalSession {
   allowedActions: string[];
   status: SessionStatus;
   createdAt: string;
+  /** Requested active-work lease. It starts when Owner consent activates the Session. */
+  requestedLeaseSeconds?: number;
+  /** Deadline for an Owner to decide a pending request; distinct from the active lease. */
+  consentExpiresAt?: string;
+  activatedAt?: string;
   expiresAt: string;
   closedAt?: string;
   retentionUntil?: string;
