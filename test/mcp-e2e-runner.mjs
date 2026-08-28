@@ -214,6 +214,41 @@ try {
   if (!JSON.stringify(webAnswer).includes("answer")) {
     throw new Error("localhost paired-gateway Web Chat did not reach the remote AI");
   }
+  const indexedAfterContinue = await getJson(
+    alice.managementUrl + "/api/remote-external-sessions",
+  );
+  const indexedWebSession = indexedAfterContinue.find(
+    (session) => session.sessionId === webSessionResult.session.id,
+  );
+  if (
+    indexedWebSession?.peerId !== bobIdentity.peerId
+    || indexedWebSession.activeGeneration !== 1
+    || JSON.stringify(indexedWebSession.nativeGenerations) !== "[1]"
+  ) {
+    throw new Error("Owner Hub did not persist the outbound Session and its first native generation");
+  }
+  await postJson(
+    alice.managementUrl + "/api/remote-external-sessions/"
+      + webSessionResult.session.id + "/messages",
+    {
+      peerId: bobIdentity.peerId,
+      operation: "ask",
+      message: "Start a clean native branch for a separate design alternative.",
+      sessionIntent: "new",
+    },
+  );
+  const indexedAfterNew = await getJson(
+    alice.managementUrl + "/api/remote-external-sessions",
+  );
+  const newBranch = indexedAfterNew.find(
+    (session) => session.sessionId === webSessionResult.session.id,
+  );
+  if (
+    newBranch?.activeGeneration !== 2
+    || JSON.stringify(newBranch.nativeGenerations) !== "[1,2]"
+  ) {
+    throw new Error("Owner Hub did not expose the new opaque native Session generation");
+  }
   await postJson(`${bob.managementUrl}/api/external-sessions/${webSessionResult.session.id}/status`, {
     status: "paused",
   });

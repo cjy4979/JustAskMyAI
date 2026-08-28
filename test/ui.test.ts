@@ -24,6 +24,11 @@ test("Owner Hub renders product workflows with valid client JavaScript", () => {
   assert.match(page, /同步开发版/);
   assert.match(page, /function runtimeAction\(action\)/);
   assert.match(page, /\/api\/runtime-control/);
+  assert.match(page, /我发起的协作/);
+  assert.match(page, /function remoteSessionDetail\(id,peerId\)/);
+  assert.match(page, /开启新的 Agent 会话/);
+  assert.match(page, /switch:/);
+  assert.match(page, /\/api\/remote-external-sessions/);
   assert.match(page, /协作组/);
   assert.match(page, /审计 Reviewer/);
   assert.match(page, /const MOBILE_NAV=/);

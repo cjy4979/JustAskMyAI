@@ -48,6 +48,11 @@ import type {
   SignedGroupManifest,
 } from "./group/types.js";
 import { SessionStore, digest as sessionDigest } from "./session/store.js";
+import {
+  listRemoteSessions,
+  noteRemoteSessionInteraction,
+  rememberRemoteSession,
+} from "./session/remote-session.js";
 import { buildContextPrompt, indexExplicitFile } from "./session/context.js";
 import { normalizeContextualAnswer } from "./session/answer.js";
 import { isAuthorityBinding, validateExternalEnvelope } from "./session/envelope.js";
@@ -550,6 +555,10 @@ publicApp.get("/external/sessions/:id", (req, res) => {
       authorityVersion: challenge.authorityVersion,
       reason: challenge.reason,
       status: challenge.status,
+      sessionControl: {
+        new: true,
+        switch: adapter.id === "provider",
+      },
       createdAt: challenge.createdAt,
       resolvedAt: challenge.resolvedAt,
       releasedAnswer: challenge.status === "released" ? challenge.releasedAnswer : undefined,
@@ -1070,6 +1079,16 @@ managementApp.get("/api/remote-capabilities/:peerId", async (req, res) => {
     ));
   } catch (error) { return res.status(400).json({ error: String(error) }); }
 });
+managementApp.get("/api/remote-external-sessions", (_req, res) => {
+  res.json(listRemoteSessions(store).map((session) => {
+    const peer = store.getPairedPeer(session.peerId);
+    return {
+      ...session,
+      peerName: peer?.name ?? session.peerId,
+      peerUrl: peer?.url,
+    };
+  }));
+});
 managementApp.post("/api/remote-external-sessions", async (req, res) => {
   try {
     const peerId = requiredString(req.body?.peerId, "peerId");
@@ -1109,11 +1128,7 @@ managementApp.post("/api/remote-external-sessions", async (req, res) => {
       || !isAuthorityBinding(result.authorityBundle, result.session)) {
       throw new Error(`remote session grant is invalid${verified.ok ? "" : `: ${verified.reason}`}`);
     }
-    store.setMeta(remoteSessionBindingKey(peerId, result.session.id), JSON.stringify({
-      purpose: result.session.purpose,
-      authorityVersion: result.session.authorityVersion,
-      authorityDigest: result.session.authorityDigest,
-    }));
+    rememberRemoteSession(store, peerId, result.session);
     return res.status(201).json(result);
   } catch (error) { return res.status(400).json({ error: String(error) }); }
 });
@@ -1121,7 +1136,11 @@ managementApp.post("/api/remote-external-sessions/:id/messages", async (req, res
   try {
     const peerId = requiredString(req.body?.peerId, "peerId");
     const operation = req.body?.operation === "task" ? "task" : "ask";
-    return res.json(await callRemoteSession(
+    const control = parseNativeSessionIntent(
+      req.body?.sessionIntent,
+      req.body?.sessionGeneration,
+    );
+    const result = await callRemoteSession(
       peerId,
       `/external/sessions/${encodeURIComponent(req.params.id)}/messages`,
       {
@@ -1131,9 +1150,13 @@ managementApp.post("/api/remote-external-sessions/:id/messages", async (req, res
           callerPrincipalId: principalId,
           operation,
           message: requiredString(req.body?.message, "message"),
+          sessionIntent: control.intent,
+          sessionGeneration: control.generation,
         },
       },
-    ));
+    );
+    noteRemoteSessionInteraction(store, peerId, req.params.id, control.intent, control.generation);
+    return res.json(result);
   } catch (error) { return res.status(400).json({ error: String(error) }); }
 });
 managementApp.get("/api/remote-external-sessions/:id", async (req, res) => {
@@ -1161,11 +1184,7 @@ managementApp.get("/api/remote-external-sessions/:id", async (req, res) => {
       if (!isAuthorityBinding(result.authorityBundle, session)) {
         throw new Error("remote session authority bundle is invalid");
       }
-      store.setMeta(remoteSessionBindingKey(peerId, session.id), JSON.stringify({
-        purpose: session.purpose,
-        authorityVersion: session.authorityVersion,
-        authorityDigest: session.authorityDigest,
-      }));
+      rememberRemoteSession(store, peerId, session);
     }
     return res.json(result);
   } catch (error) { return res.status(400).json({ error: String(error) }); }
@@ -1173,7 +1192,7 @@ managementApp.get("/api/remote-external-sessions/:id", async (req, res) => {
 managementApp.post("/api/remote-external-sessions/:id/close", async (req, res) => {
   try {
     const peerId = requiredString(req.body?.peerId, "peerId");
-    return res.json(await callRemoteSession(
+    const result = await callRemoteSession(
       peerId,
       `/external/sessions/${encodeURIComponent(req.params.id)}/close`,
       {
@@ -1181,7 +1200,12 @@ managementApp.post("/api/remote-external-sessions/:id/close", async (req, res) =
         contextId: req.params.id,
         body: { sessionId: req.params.id, callerPrincipalId: principalId },
       },
-    ));
+    ) as ExternalSession;
+    if (result.id !== req.params.id || result.status !== "closed") {
+      throw new Error("remote session close response is invalid");
+    }
+    rememberRemoteSession(store, peerId, result);
+    return res.json(result);
   } catch (error) { return res.status(400).json({ error: String(error) }); }
 });
 managementApp.get("/api/agent-profile", (_req, res) =>
@@ -2430,10 +2454,7 @@ async function refreshRemoteSessionBinding(peerId: string, sessionId: string): P
   })) {
     throw new Error("remote session authority bundle is invalid");
   }
-  store.setMeta(remoteSessionBindingKey(peerId, session.id), JSON.stringify({
-    purpose: session.purpose, authorityVersion: session.authorityVersion,
-    authorityDigest: session.authorityDigest,
-  }));
+  rememberRemoteSession(store, peerId, session as Parameters<typeof rememberRemoteSession>[2]);
 }
 
 function remoteSessionBindingKey(peerId: string, sessionId: string): string {

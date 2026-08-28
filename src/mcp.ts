@@ -43,6 +43,10 @@ import {
 } from "./group/policy.js";
 import { selectDisclosurePaths } from "./group/disclosure.js";
 import { SessionStore } from "./session/store.js";
+import {
+  noteRemoteSessionInteraction,
+  rememberRemoteSession,
+} from "./session/remote-session.js";
 import type { ExternalSessionEnvelope } from "./session/types.js";
 import { ProviderStore } from "./provider/store.js";
 
@@ -753,7 +757,9 @@ server.registerTool(
     );
     if (!verified.ok) throw new Error(`remote session grant is invalid: ${verified.reason}`);
     const remoteSession = result.session as {
-      id?: unknown; purpose?: unknown; authorityVersion?: unknown; authorityDigest?: unknown;
+      id?: unknown; purpose?: unknown; status?: unknown; createdAt?: unknown;
+      activatedAt?: unknown; expiresAt?: unknown;
+      authorityVersion?: unknown; authorityDigest?: unknown;
     } | undefined;
     if (typeof remoteSession?.id !== "string" || typeof remoteSession.purpose !== "string"
       || typeof remoteSession.authorityVersion !== "number"
@@ -761,11 +767,7 @@ server.registerTool(
       || !isAuthorityBinding(result.authorityBundle, remoteSession)) {
       throw new Error("remote session grant is missing session identity");
     }
-    store.setMeta(remoteSessionBindingKey(verified.peerId, remoteSession.id), JSON.stringify({
-      purpose: remoteSession.purpose,
-      authorityVersion: remoteSession.authorityVersion,
-      authorityDigest: remoteSession.authorityDigest,
-    }));
+    rememberRemoteSession(store, verified.peerId, remoteSession as Parameters<typeof rememberRemoteSession>[2]);
     store.appendAudit({
       eventType: "external-session.remote-opened",
       principalId,
@@ -877,7 +879,9 @@ server.registerTool(
     const verified = verifySignedStatement(proof, state, store);
     if (!verified.ok) throw new Error(`remote session state is invalid: ${verified.reason}`);
     const session = result.session as {
-      id?: unknown; purpose?: unknown; authorityVersion?: unknown; authorityDigest?: unknown;
+      id?: unknown; purpose?: unknown; status?: unknown; createdAt?: unknown;
+      activatedAt?: unknown; expiresAt?: unknown;
+      authorityVersion?: unknown; authorityDigest?: unknown;
     } | undefined;
     if (typeof session?.id === "string" && typeof session.purpose === "string"
       && typeof session.authorityVersion === "number"
@@ -885,11 +889,7 @@ server.registerTool(
       if (!isAuthorityBinding(result.authorityBundle, session)) {
         throw new Error("remote session authority bundle is invalid");
       }
-      store.setMeta(remoteSessionBindingKey(verified.peerId, session.id), JSON.stringify({
-        purpose: session.purpose,
-        authorityVersion: session.authorityVersion,
-        authorityDigest: session.authorityDigest,
-      }));
+      rememberRemoteSession(store, verified.peerId, session as Parameters<typeof rememberRemoteSession>[2]);
     }
     return text(JSON.stringify(result, null, 2));
   },
@@ -1584,6 +1584,31 @@ async function signedExternalFetch(
       : raw;
     throw new Error(`Remote gateway returned ${response.status}: ${reason}`);
   }
+  if (input.action === "session.message" && input.contextId && response.status !== 202) {
+    const body = input.body as {
+      sessionIntent?: unknown;
+      sessionGeneration?: unknown;
+    } | undefined;
+    const intent = body?.sessionIntent === "new" || body?.sessionIntent === "switch"
+      ? body.sessionIntent
+      : "continue";
+    const generation = Number.isInteger(body?.sessionGeneration)
+      ? Number(body?.sessionGeneration)
+      : undefined;
+    noteRemoteSessionInteraction(store, remote.peerId, input.contextId, intent, generation);
+  }
+  if (input.action === "session.close" && parsed && typeof parsed === "object") {
+    const session = parsed as {
+      id?: unknown; purpose?: unknown; status?: unknown; createdAt?: unknown;
+      activatedAt?: unknown; expiresAt?: unknown;
+      authorityVersion?: unknown; authorityDigest?: unknown;
+    };
+    if (typeof session.id === "string" && typeof session.purpose === "string"
+      && typeof session.authorityVersion === "number"
+      && typeof session.authorityDigest === "string") {
+      rememberRemoteSession(store, remote.peerId, session as Parameters<typeof rememberRemoteSession>[2]);
+    }
+  }
   return parsed;
 }
 
@@ -1597,7 +1622,9 @@ async function refreshRemoteSessionState(peerUrl: string, sessionId: string) {
   const verified = verifySignedStatement(result.proof, state, store);
   if (!verified.ok) throw new Error(`remote session state is invalid: ${verified.reason}`);
   const session = result.session as {
-    id?: unknown; purpose?: unknown; authorityVersion?: unknown; authorityDigest?: unknown;
+    id?: unknown; purpose?: unknown; status?: unknown; createdAt?: unknown;
+    activatedAt?: unknown; expiresAt?: unknown;
+    authorityVersion?: unknown; authorityDigest?: unknown;
   } | undefined;
   if (typeof session?.id !== "string" || typeof session.purpose !== "string"
     || typeof session.authorityVersion !== "number"
@@ -1607,10 +1634,7 @@ async function refreshRemoteSessionState(peerUrl: string, sessionId: string) {
   if (!isAuthorityBinding(result.authorityBundle, session)) {
     throw new Error("remote session authority bundle is invalid");
   }
-  store.setMeta(remoteSessionBindingKey(verified.peerId, session.id), JSON.stringify({
-    purpose: session.purpose, authorityVersion: session.authorityVersion,
-    authorityDigest: session.authorityDigest,
-  }));
+  rememberRemoteSession(store, verified.peerId, session as Parameters<typeof rememberRemoteSession>[2]);
   return result;
 }
 

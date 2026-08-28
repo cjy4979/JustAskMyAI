@@ -126,6 +126,14 @@ export class GatewayStore {
     `).run(key, value);
   }
 
+  listMeta(prefix: string): Array<{ key: string; value: string }> {
+    return this.db.prepare(`
+      SELECT key, value FROM gateway_meta
+      WHERE key >= ? AND key < ?
+      ORDER BY key ASC
+    `).all(prefix, `${prefix}\uffff`) as Array<{ key: string; value: string }>;
+  }
+
   pairPeer(input: {
     peerId: string;
     publicKey: string;
