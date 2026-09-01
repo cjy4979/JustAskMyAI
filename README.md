@@ -73,6 +73,8 @@ perform bounded work within that authority.
   authority, disclosure, approval, tool decisions, and artifact digests
 - Local receipt evidence records with field-selective localhost disclosure
 - Signed, audience-bound capability discovery with policy-filtered public aliases
+- Stable per-thread task indexes for inbound and outbound work, with localhost projections
+  of progress, artifacts, signed receipts, and locally held evidence
 - Persistent External Sessions for multi-turn Human-to-Agent and Agent-to-Agent access
 - Stable External Thread identity with renewable, versioned Grants; lease expiry pauses access
   without discarding messages, tasks, artifacts, or native Agent session generations
@@ -149,6 +151,8 @@ internal IDs. It provides:
 - a single inbox for access requests, task approvals, egress confirmations, and writebacks;
 - persistent External Session cards with pause, resume, one-click Grant renewal, revoke, and conversation history;
 - a multi-task board, paired people directory, and explicit Context Collection manager;
+- a Group Thread workspace that presents requester, responder, progress, result, signed receipt,
+  and local evidence verification in one human-readable responsibility chain;
 - an in-product setup checklist and runtime switch for guest invitation links;
 - invite creation with human-readable purpose, selected knowledge, actions, and lease;
 - a responsive guest chat that unlocks automatically after Owner approval and falls back

@@ -332,8 +332,12 @@ export class BridgeExecutor implements AgentExecutor {
       this.groups.bindTask({
         taskId,
         groupId: groupEnvelope.groupId,
+        threadId: groupEnvelope.thread.id,
+        direction: "inbound",
         requesterMemberId: validation.sender.id,
         requesterPeerId: peerId,
+        responderMemberId: validation.receiver.id,
+        responderPeerId: this.identity.peerId,
       });
       this.audit("group.envelope-accepted", {
         peerId,

@@ -5,7 +5,8 @@ import {
   verifySignedStatement,
   type GatewayIdentity,
 } from "../protocol/signed-request.js";
-import type { GatewayStore } from "../storage/sqlite.js";
+import type { GatewayStore, StoredRemoteTask } from "../storage/sqlite.js";
+import type { RemoteArtifact } from "../protocol/artifact.js";
 import {
   createSponsorship,
   digestValue,
@@ -64,8 +65,29 @@ export const DEFAULT_ROLE_POLICY: Record<string, GroupRoleGrant> = {
 export interface GroupTaskBinding {
   taskId: string;
   groupId: string;
+  threadId?: string;
+  direction?: "inbound" | "outbound";
   requesterMemberId: string;
   requesterPeerId: string;
+  responderMemberId?: string;
+  responderPeerId?: string;
+  createdAt?: string;
+}
+
+export interface GroupThreadTask {
+  taskId: string;
+  groupId: string;
+  threadId: string;
+  direction: "inbound" | "outbound";
+  requesterMemberId: string;
+  responderMemberId?: string;
+  task?: StoredRemoteTask;
+  artifacts: RemoteArtifact[];
+  receipt?: GroupReceipt;
+  evidence?: Partial<GroupReceiptEvidence>;
+  evidenceVerified: boolean;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export class GroupStore {
@@ -668,16 +690,31 @@ export class GroupStore {
   }
 
   bindTask(binding: GroupTaskBinding): void {
+    const now = new Date().toISOString();
     this.gateway.db.prepare(`
-      INSERT OR REPLACE INTO group_task_bindings (
-        task_id, group_id, requester_member_id, requester_peer_id, created_at
-      ) VALUES (?, ?, ?, ?, ?)
+      INSERT INTO group_task_bindings (
+        task_id, group_id, thread_id, direction,
+        requester_member_id, requester_peer_id,
+        responder_member_id, responder_peer_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(task_id) DO UPDATE SET
+        group_id = excluded.group_id,
+        thread_id = COALESCE(excluded.thread_id, group_task_bindings.thread_id),
+        direction = excluded.direction,
+        requester_member_id = excluded.requester_member_id,
+        requester_peer_id = excluded.requester_peer_id,
+        responder_member_id = COALESCE(excluded.responder_member_id, group_task_bindings.responder_member_id),
+        responder_peer_id = COALESCE(excluded.responder_peer_id, group_task_bindings.responder_peer_id)
     `).run(
       binding.taskId,
       binding.groupId,
+      binding.threadId ?? null,
+      binding.direction ?? "inbound",
       binding.requesterMemberId,
       binding.requesterPeerId,
-      new Date().toISOString(),
+      binding.responderMemberId ?? null,
+      binding.responderPeerId ?? null,
+      binding.createdAt ?? now,
     );
   }
 
@@ -685,12 +722,78 @@ export class GroupStore {
     const row = this.gateway.db.prepare(`
       SELECT * FROM group_task_bindings WHERE task_id = ?
     `).get(taskId) as Row | undefined;
-    return row ? {
-      taskId: String(row.task_id),
-      groupId: String(row.group_id),
-      requesterMemberId: String(row.requester_member_id),
-      requesterPeerId: String(row.requester_peer_id),
-    } : undefined;
+    return row ? mapTaskBinding(row) : undefined;
+  }
+
+  listTaskBindings(groupId: string, threadId?: string): GroupTaskBinding[] {
+    const rows = threadId
+      ? this.gateway.db.prepare(`
+          SELECT * FROM group_task_bindings
+          WHERE group_id = ? AND thread_id = ?
+          ORDER BY created_at ASC
+        `).all(groupId, threadId) as Row[]
+      : this.gateway.db.prepare(`
+          SELECT * FROM group_task_bindings
+          WHERE group_id = ?
+          ORDER BY created_at ASC
+        `).all(groupId) as Row[];
+    return rows.map(mapTaskBinding);
+  }
+
+  listThreadTasks(groupId: string, threadId: string): GroupThreadTask[] {
+    if (!this.getThread(groupId, threadId)) throw new Error("group thread not found");
+    const receipts = this.listReceipts(groupId, threadId);
+    const receiptByTask = new Map(receipts.map((receipt) => [receipt.taskId, receipt]));
+    const bindingByTask = new Map(
+      this.listTaskBindings(groupId, threadId).map((binding) => [binding.taskId, binding]),
+    );
+    const taskIds = new Set([...bindingByTask.keys(), ...receiptByTask.keys()]);
+    const localMember = this.signer
+      ? this.findLocalMember(groupId, this.signer.peerId)
+      : undefined;
+    return [...taskIds].map((taskId) => {
+      const binding = bindingByTask.get(taskId);
+      const receipt = receiptByTask.get(taskId);
+      const task = this.gateway.getRemoteTask(taskId);
+      const artifacts = this.gateway.listArtifacts(taskId);
+      const requesterMemberId = binding?.requesterMemberId
+        ?? receipt?.requesterMemberId
+        ?? "";
+      const evidence = receipt
+        ? this.getReceiptEvidence(groupId, receipt.id)
+        : undefined;
+      const evidenceVerified = Boolean(
+        receipt
+        && evidence?.authority
+        && digestValue(evidence.authority) === receipt.acceptedAuthorityDigest
+        && (!receipt.approvalDigest || digestValue(evidence.approvals) === receipt.approvalDigest)
+        && (
+          !receipt.toolDecisionDigest
+          || digestValue(evidence.toolDecisions ?? []) === receipt.toolDecisionDigest
+        )
+        && (
+          !evidence.terminal
+          || digestValue(evidence.terminal) === receipt.artifactDigest
+        ),
+      );
+      const createdAt = task?.createdAt ?? binding?.createdAt ?? receipt?.createdAt ?? "";
+      return {
+        taskId,
+        groupId,
+        threadId,
+        direction: binding?.direction
+          ?? (localMember?.id === requesterMemberId ? "outbound" : "inbound"),
+        requesterMemberId,
+        responderMemberId: binding?.responderMemberId ?? receipt?.responderMemberId,
+        task,
+        artifacts,
+        receipt,
+        evidence,
+        evidenceVerified,
+        createdAt,
+        updatedAt: task?.updatedAt ?? receipt?.createdAt ?? createdAt,
+      };
+    }).sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   }
 
   async authorizeTaskControl(taskId: string, peerId: string): Promise<string | undefined> {
@@ -1267,8 +1370,12 @@ export class GroupStore {
       CREATE TABLE IF NOT EXISTS group_task_bindings (
         task_id TEXT PRIMARY KEY,
         group_id TEXT NOT NULL,
+        thread_id TEXT,
+        direction TEXT NOT NULL DEFAULT 'inbound',
         requester_member_id TEXT NOT NULL,
         requester_peer_id TEXT NOT NULL,
+        responder_member_id TEXT,
+        responder_peer_id TEXT,
         created_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS group_governance_proposals (
@@ -1321,6 +1428,14 @@ export class GroupStore {
     ensureColumn(this.gateway, "group_threads", "thread_version", "INTEGER NOT NULL DEFAULT 1");
     ensureColumn(this.gateway, "group_receipts", "proof_json", "TEXT NOT NULL DEFAULT '{}'");
     ensureColumn(this.gateway, "group_receipts", "receipt_json", "TEXT NOT NULL DEFAULT '{}'");
+    ensureColumn(this.gateway, "group_task_bindings", "thread_id", "TEXT");
+    ensureColumn(this.gateway, "group_task_bindings", "direction", "TEXT NOT NULL DEFAULT 'inbound'");
+    ensureColumn(this.gateway, "group_task_bindings", "responder_member_id", "TEXT");
+    ensureColumn(this.gateway, "group_task_bindings", "responder_peer_id", "TEXT");
+    this.gateway.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_group_task_bindings_thread
+        ON group_task_bindings(group_id, thread_id, created_at);
+    `);
   }
 
   private expireInvitations(): void {
@@ -1423,6 +1538,20 @@ function mapThread(row: Row): GroupThread {
     status: String(row.status) as GroupThread["status"],
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
+  };
+}
+
+function mapTaskBinding(row: Row): GroupTaskBinding {
+  return {
+    taskId: String(row.task_id),
+    groupId: String(row.group_id),
+    threadId: row.thread_id ? String(row.thread_id) : undefined,
+    direction: row.direction === "outbound" ? "outbound" : "inbound",
+    requesterMemberId: String(row.requester_member_id),
+    requesterPeerId: String(row.requester_peer_id),
+    responderMemberId: row.responder_member_id ? String(row.responder_member_id) : undefined,
+    responderPeerId: row.responder_peer_id ? String(row.responder_peer_id) : undefined,
+    createdAt: row.created_at ? String(row.created_at) : undefined,
   };
 }
 

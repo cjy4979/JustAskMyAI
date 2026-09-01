@@ -373,6 +373,21 @@ export class GatewayStore {
     );
   }
 
+  listArtifacts(taskId: string): RemoteArtifact[] {
+    return (this.db.prepare(`
+      SELECT * FROM remote_artifacts WHERE task_id = ? ORDER BY created_at ASC
+    `).all(taskId) as DbRow[]).map((row) => ({
+      id: String(row.id),
+      taskId: String(row.task_id),
+      kind: String(row.kind) as RemoteArtifact["kind"],
+      mediaType: String(row.media_type),
+      name: String(row.name),
+      digest: nullableString(row.digest),
+      content: parseJson(row.content_json),
+      reference: nullableString(row.reference),
+    }));
+  }
+
   upsertAgentSession(input: {
     contextId: string;
     peerId: string;

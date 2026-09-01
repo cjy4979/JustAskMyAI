@@ -47,6 +47,10 @@ test("Owner Hub renders product workflows with valid client JavaScript", () => {
   assert.match(page, /function acceptGroupInvite\(id\)/);
   assert.match(page, /function groupDetail\(id\)/);
   assert.match(page, /知识库/);
+  assert.match(page, /function groupThreadWorkspace\(groupId,threadId\)/);
+  assert.match(page, /\/api\/groups\/.*\/threads\/.*\/workspace/);
+  assert.match(page, /Reviewer 只读审计视图/);
+  assert.match(page, /dialog\.wide/);
   assert.doesNotThrow(() => new vm.Script(inlineScript(page)));
 });
 

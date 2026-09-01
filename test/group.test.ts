@@ -639,3 +639,125 @@ test("signed removal propagates through the manifest chain and blocks task contr
   env.aliceGateway.close();
   env.bobGateway.close();
 });
+test("group thread tasks project direction, artifacts, receipts, and verified local evidence", () => {
+  const env = pairedGateways();
+  const groups = new GroupStore(env.aliceGateway, env.aliceIdentity);
+  const created = groups.createWorkgroup({
+    name: "Workspace team",
+    ownerPrincipalId: "alice-principal",
+    ownerAgentId: "alice-agent",
+    ownerPeerId: env.aliceIdentity.peerId,
+    ownerUrl: "http://127.0.0.1:43220",
+  });
+  const alice = created.manifest.members[0];
+  const bobSponsorship = createSponsorship({
+    principalId: "bob-principal",
+    agentId: "bob-agent",
+    gatewayPeerId: env.bobIdentity.peerId,
+    capabilities: ["read-workspace", "run-tests"],
+  }, env.bobIdentity);
+  const added = groups.upsertMember({
+    groupId: created.manifest.workgroup.id,
+    principalId: "bob-principal",
+    agentId: "bob-agent",
+    gatewayPeerId: env.bobIdentity.peerId,
+    displayName: "Bob",
+    url: "http://127.0.0.1:43222",
+    roles: ["member"],
+    sponsoredBy: "alice-principal",
+    sponsorship: bobSponsorship,
+    status: "active",
+    issuedByMemberId: alice.id,
+  });
+  const thread = groups.createThread({
+    groupId: created.manifest.workgroup.id,
+    objective: "Ship a verified workspace",
+    createdByMemberId: alice.id,
+  });
+  groups.bindTask({
+    taskId: "task-workspace",
+    groupId: created.manifest.workgroup.id,
+    threadId: thread.id,
+    direction: "outbound",
+    requesterMemberId: alice.id,
+    requesterPeerId: env.aliceIdentity.peerId,
+    responderMemberId: added.member.id,
+    responderPeerId: env.bobIdentity.peerId,
+  });
+  env.aliceGateway.upsertRemoteTask({
+    id: "task-workspace",
+    contextId: "context-workspace",
+    peerId: env.bobIdentity.peerId,
+    mode: "delegate",
+    status: "completed",
+    requestHash: "request-digest",
+    result: { answer: "Workspace verified" },
+  });
+  env.aliceGateway.storeArtifact({
+    id: "artifact-workspace",
+    taskId: "task-workspace",
+    kind: "report",
+    mediaType: "text/plain",
+    name: "verification-report",
+    digest: digestValue("Workspace verified"),
+    content: "Workspace verified",
+  });
+  const authority = {
+    approvedScopes: ["read-workspace", "run-tests"],
+    deniedScopes: ["deploy"],
+    resources: [],
+    approvalModes: ["receiver"],
+  };
+  const approvals = { receiver: { mode: "auto" }, preflight: [] };
+  const receipt = createReceipt({
+    groupId: created.manifest.workgroup.id,
+    policyVersion: created.manifest.workgroup.policyVersion,
+    membershipVersion: added.signedManifest.manifest.workgroup.membershipVersion,
+    threadId: thread.id,
+    taskId: "task-workspace",
+    requesterMemberId: alice.id,
+    responderMemberId: added.member.id,
+    requestDigest: "request-digest",
+    acceptedAuthorityDigest: digestValue(authority),
+    artifactDigest: digestValue("Workspace verified"),
+    approvalDigest: digestValue(approvals),
+    status: "completed",
+    signedBy: [added.member.id],
+  }, env.bobIdentity);
+  groups.storeReceipt(receipt, { authority, approvals });
+
+  const tasks = groups.listThreadTasks(created.manifest.workgroup.id, thread.id);
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0].direction, "outbound");
+  assert.equal(tasks[0].responderMemberId, added.member.id);
+  assert.equal(tasks[0].task?.status, "completed");
+  assert.equal(tasks[0].artifacts[0]?.content, "Workspace verified");
+  assert.equal(tasks[0].receipt?.id, receipt.id);
+  assert.equal(tasks[0].evidenceVerified, true);
+
+  env.aliceGateway.close();
+  env.bobGateway.close();
+});
+
+test("legacy group task bindings migrate to thread-aware workspace indexes", () => {
+  const gateway = new GatewayStore(":memory:");
+  gateway.db.exec(`
+    CREATE TABLE group_task_bindings (
+      task_id TEXT PRIMARY KEY,
+      group_id TEXT NOT NULL,
+      requester_member_id TEXT NOT NULL,
+      requester_peer_id TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+  `);
+  assert.doesNotThrow(() => new GroupStore(gateway, new GatewayIdentity(gateway)));
+  const columns = gateway.db.prepare("PRAGMA table_info(group_task_bindings)")
+    .all() as Array<{ name: string }>;
+  const names = new Set(columns.map((column) => column.name));
+  assert.equal(names.has("thread_id"), true);
+  assert.equal(names.has("direction"), true);
+  assert.equal(names.has("responder_member_id"), true);
+  assert.equal(names.has("responder_peer_id"), true);
+
+  gateway.close();
+});

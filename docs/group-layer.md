@@ -168,6 +168,19 @@ threadId + threadVersion + objectiveDigest + creator
 If a receiver already has the same `threadId`, every binding must match. A different
 objective or version is rejected instead of silently reusing local state.
 
+The receiving and sending gateways both persist a task-to-thread binding, including direction
+and requester/responder member IDs. The localhost Owner Hub projects those bindings at:
+
+```text
+GET /api/groups/:groupId/threads/:threadId/workspace
+```
+
+The projection combines local task state, locally stored artifacts, signed receipts, and any
+receipt evidence held by that gateway. A Reviewer gets a read-only presentation when its local
+Group role has no task operation. Opening or refreshing the workspace does not copy artifacts
+or detailed tool decisions from another member's computer. Cross-member review must remain an
+explicit, scoped delegation or future Owner-approved audit-package submission.
+
 ## Accountability Receipt v2
 
 The receiver signs a receipt for completed, failed, and cancelled tasks, binding:

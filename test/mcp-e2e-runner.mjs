@@ -756,6 +756,29 @@ try {
   if (!receiptsOutput.includes(bobIdentity.peerId) || !receiptsOutput.includes("signature")) {
     throw new Error(`verified group receipt was not persisted: ${receiptsOutput}`);
   }
+  const aliceWorkspace = await getJson(
+    `${alice.managementUrl}/api/groups/${createdGroup.manifest.workgroup.id}/threads/${groupThread.id}/workspace`,
+  );
+  const aliceGroupTask = aliceWorkspace.tasks.find((item) => item.receipt);
+  if (
+    aliceWorkspace.summary.tasks !== 1
+    || aliceGroupTask?.direction !== "outbound"
+    || aliceGroupTask?.receipt?.responderMemberId !== bobMember.id
+  ) {
+    throw new Error(`Alice Group workspace did not project the outbound responsibility chain: ${JSON.stringify(aliceWorkspace)}`);
+  }
+  const bobWorkspace = await getJson(
+    `${bob.managementUrl}/api/groups/${createdGroup.manifest.workgroup.id}/threads/${groupThread.id}/workspace`,
+  );
+  const bobGroupTask = bobWorkspace.tasks.find((item) => item.receipt);
+  if (
+    bobGroupTask?.direction !== "inbound"
+    || bobGroupTask?.evidenceVerified !== true
+    || !bobGroupTask?.artifacts?.length
+  ) {
+    throw new Error(`Bob Group workspace did not retain local verified evidence: ${JSON.stringify(bobWorkspace)}`);
+  }
+
   const disclosureArguments = {
     groupId: createdGroup.manifest.workgroup.id,
     threadId: groupThread.id,

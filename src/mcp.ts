@@ -1219,6 +1219,7 @@ async function sendRemoteTask(input: {
     const summarized = summarizeResult(raw as Task | Message);
     if ("status" in raw) {
       storeGroupReceipt(input, raw);
+      bindOutboundGroupTask(input, raw);
       recordOutbound(input, raw, summarized);
     }
     return summarized;
@@ -1300,6 +1301,33 @@ function recordOutbound(
           }
         : {}),
     },
+  });
+}
+
+function bindOutboundGroupTask(
+  input: {
+    groupEnvelope?: GroupEnvelope;
+    expectedPeerId?: string;
+  },
+  task: Task,
+): void {
+  if (!input.groupEnvelope) return;
+  const targetMember = groups.listMembers(input.groupEnvelope.groupId).find((member) =>
+    member.status === "active"
+    && member.gatewayPeerId === input.expectedPeerId
+    && groupTargetMatches(input.groupEnvelope!.target, member));
+  if (!targetMember) {
+    throw new Error("outbound group task target no longer matches an active member");
+  }
+  groups.bindTask({
+    taskId: task.id,
+    groupId: input.groupEnvelope.groupId,
+    threadId: input.groupEnvelope.thread.id,
+    direction: "outbound",
+    requesterMemberId: input.groupEnvelope.senderMemberId,
+    requesterPeerId: localPeerId,
+    responderMemberId: targetMember.id,
+    responderPeerId: targetMember.gatewayPeerId,
   });
 }
 

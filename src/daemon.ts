@@ -2001,6 +2001,46 @@ managementApp.post("/api/groups/:id/threads", (req, res) => {
     return res.status(400).json({ error: String(error) });
   }
 });
+managementApp.get("/api/groups/:id/threads/:threadId/workspace", (req, res) => {
+  try {
+    const workgroup = groups.getWorkgroup(req.params.id);
+    const thread = groups.getThread(req.params.id, req.params.threadId);
+    if (!workgroup || !thread) {
+      return res.status(404).json({ error: "group thread not found" });
+    }
+    const localMember = groups.findLocalMember(req.params.id, nodeId);
+    if (!localMember) {
+      return res.status(403).json({ error: "this gateway is not an active group member" });
+    }
+    const operations = new Set(localMember.roles.flatMap((role) =>
+      workgroup.rolePolicy[role]?.operations ?? []));
+    const tasks = groups.listThreadTasks(req.params.id, req.params.threadId);
+    return res.json({
+      workgroup,
+      thread,
+      localMember,
+      members: groups.listMembers(req.params.id),
+      capabilities: {
+        canDelegate: operations.has("task"),
+        canReview: operations.has("decision"),
+        reviewOnly: localMember.roles.includes("reviewer") && !operations.has("task"),
+      },
+      summary: {
+        tasks: tasks.length,
+        active: tasks.filter((item) =>
+          item.task && !["completed", "failed", "cancelled", "rejected", "expired"]
+            .includes(item.task.status)).length,
+        completed: tasks.filter((item) => item.receipt?.status === "completed").length,
+        verifiedReceipts: tasks.filter((item) =>
+          item.receipt && item.evidenceVerified).length,
+      },
+      tasks,
+    });
+  } catch (error) {
+    return res.status(400).json({ error: String(error) });
+  }
+});
+
 managementApp.get("/api/groups/:id/receipts", (req, res) => {
   const threadId = typeof req.query.threadId === "string" ? req.query.threadId : undefined;
   if (!groups.getWorkgroup(req.params.id)) {
