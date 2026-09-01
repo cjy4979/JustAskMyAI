@@ -315,6 +315,7 @@ export class SessionStore {
     }, this.signAuthority);
     const session: ExternalSession = {
       id: sessionId, ownerPrincipalId: input.ownerPrincipalId, ownerAgentId: input.ownerAgentId,
+      threadId: sessionId,
       callerType: input.callerType, callerPrincipalId: input.callerPrincipalId,
       callerAgentId: input.callerAgentId, callerPeerId: input.callerPeerId,
       callerTrust: input.callerTrust, purpose: input.purpose, groupId: input.groupId,
@@ -328,6 +329,7 @@ export class SessionStore {
       egressGrantId: egressGrant.id,
       authorityVersion: initialBundle.authorityVersion,
       authorityDigest: initialBundle.authorityDigest,
+      grantVersion: initialBundle.authorityVersion,
       allowedActions: operationGrant.allowedOperations,
       status: input.status,
       createdAt: now.toISOString(),
@@ -372,15 +374,19 @@ export class SessionStore {
     const row = this.gateway.db.prepare("SELECT session_json FROM external_sessions WHERE id=?")
       .get(id) as { session_json: string } | undefined;
     if (!row) return undefined;
-    const session = JSON.parse(row.session_json) as ExternalSession;
-    const pendingDeadline = session.consentExpiresAt ?? session.expiresAt;
-    if (session.status === "awaiting_owner_consent"
-      && Date.parse(pendingDeadline) <= Date.now()) {
-      return this.setSessionStatus(id, "expired");
+    const session = normalizeExternalSession(JSON.parse(row.session_json) as ExternalSession);
+    if (session.status === "awaiting_owner_consent") {
+      const renewal = Boolean(session.activatedAt);
+      const pendingDeadline = renewal
+        ? session.renewalConsentExpiresAt ?? session.consentExpiresAt ?? session.expiresAt
+        : session.consentExpiresAt ?? session.expiresAt;
+      if (Date.parse(pendingDeadline) <= Date.now()) {
+        return this.setSessionStatus(id, renewal ? "renewal_required" : "expired");
+      }
     }
     if (["active", "paused"].includes(session.status)
       && Date.parse(session.expiresAt) <= Date.now()) {
-      return this.setSessionStatus(id, "expired");
+      return this.setSessionStatus(id, "renewal_required");
     }
     return session;
   }
@@ -552,17 +558,20 @@ export class SessionStore {
     }
     const now = new Date();
     const firstActivation = session.status === "awaiting_owner_consent" && !session.activatedAt;
-    const pendingDeadline = session.consentExpiresAt ?? session.expiresAt;
-    if ((firstActivation && Date.parse(pendingDeadline) <= now.getTime())
-      || (!firstActivation && Date.parse(session.expiresAt) <= now.getTime())) {
-      this.setSessionStatus(session.id, "expired");
+    const renewing = session.status === "awaiting_owner_consent" && Boolean(session.activatedAt);
+    const pendingDeadline = renewing
+      ? session.renewalConsentExpiresAt ?? session.consentExpiresAt ?? session.expiresAt
+      : session.consentExpiresAt ?? session.expiresAt;
+    if (((firstActivation || renewing) && Date.parse(pendingDeadline) <= now.getTime())
+      || (!firstActivation && !renewing && Date.parse(session.expiresAt) <= now.getTime())) {
+      this.setSessionStatus(session.id, renewing ? "renewal_required" : "expired");
       throw new Error("external session approval window or active lease has expired");
     }
     const legacyLeaseSeconds = Math.max(60, Math.min(604_800, Math.floor(
       (Date.parse(session.expiresAt) - Date.parse(session.createdAt)) / 1000,
     )));
     const requestedLeaseSeconds = session.requestedLeaseSeconds ?? legacyLeaseSeconds;
-    const expiresAt = firstActivation
+    const expiresAt = firstActivation || renewing
       ? new Date(now.getTime() + requestedLeaseSeconds * 1000).toISOString()
       : session.expiresAt;
     if (session.ownerPrincipalId !== input.ownerPrincipalId) throw new Error("Owner mismatch");
@@ -671,6 +680,10 @@ export class SessionStore {
       expiresAt,
       authorityVersion: bundle.authorityVersion,
       authorityDigest: bundle.authorityDigest,
+      grantVersion: bundle.authorityVersion,
+      renewalRequestedAt: undefined,
+      renewalConsentExpiresAt: undefined,
+      lastRenewedAt: renewing ? now.toISOString() : session.lastRenewedAt,
       groupPolicyVersion: input.groupPolicyVersion ?? session.groupPolicyVersion,
       groupMembershipVersion: input.groupMembershipVersion ?? session.groupMembershipVersion,
     };
@@ -702,8 +715,64 @@ export class SessionStore {
       egressGrantDigest: digest(egressGrant),
       authorityVersion: bundle.authorityVersion,
       authorityDigest: bundle.authorityDigest,
+      renewal: renewing,
     }, []);
     return { session: active, grant, operationGrant, actionGrant, egressGrant };
+  }
+
+  requestRenewal(input: {
+    sessionId: string;
+    callerPrincipalId: string;
+    callerPeerId?: string;
+    leaseSeconds?: number;
+  }): ExternalSession {
+    const current = this.getSession(input.sessionId);
+    if (!current) throw new Error("external session not found");
+    if (!current.activatedAt) throw new Error("only an established External Thread can be renewed");
+    if (current.callerPrincipalId !== input.callerPrincipalId) {
+      throw new Error("session caller mismatch");
+    }
+    if (current.callerPeerId && current.callerPeerId !== input.callerPeerId) {
+      throw new Error("session caller gateway mismatch");
+    }
+    if (current.status === "awaiting_owner_consent" && current.renewalRequestedAt) {
+      return current;
+    }
+    if (current.status !== "renewal_required") {
+      throw new Error("external session does not require renewal");
+    }
+    const now = new Date();
+    const requestedLeaseSeconds = Math.min(Math.max(
+      Math.floor(input.leaseSeconds ?? current.requestedLeaseSeconds ?? 604_800),
+      60,
+    ), 604_800);
+    const next: ExternalSession = {
+      ...current,
+      status: "awaiting_owner_consent",
+      requestedLeaseSeconds,
+      renewalRequestedAt: now.toISOString(),
+      renewalConsentExpiresAt: new Date(now.getTime() + 604_800_000).toISOString(),
+      closedAt: undefined,
+      retentionUntil: undefined,
+    };
+    this.gateway.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.gateway.db.prepare(
+        "UPDATE external_sessions SET status=?,session_json=? WHERE id=?",
+      ).run(next.status, JSON.stringify(next), next.id);
+      this.appendEventInTransaction(next.id, "status", input.callerPrincipalId, {
+        status: next.status,
+        reason: "grant-renewal-requested",
+        threadId: next.threadId,
+        grantVersion: next.grantVersion,
+        renewalConsentExpiresAt: next.renewalConsentExpiresAt,
+      }, []);
+      this.gateway.db.exec("COMMIT");
+    } catch (error) {
+      this.gateway.db.exec("ROLLBACK");
+      throw error;
+    }
+    return next;
   }
 
   setSessionStatus(id: string, status: SessionStatus): ExternalSession {
@@ -715,7 +784,7 @@ export class SessionStore {
     ) {
       throw new Error("terminal external session state cannot be changed");
     }
-    if (current.status === "awaiting_owner_consent" && status === "active") {
+    if (["awaiting_owner_consent", "renewal_required"].includes(current.status) && status === "active") {
       throw new Error("Owner must issue narrowed grants before activating the session");
     }
     const terminal = ["revoked", "expired", "closed"].includes(status);
@@ -800,6 +869,7 @@ export class SessionStore {
       expiresAt,
       authorityVersion: bundle.authorityVersion,
       authorityDigest: bundle.authorityDigest,
+      grantVersion: bundle.authorityVersion,
     };
     this.gateway.db.exec("BEGIN IMMEDIATE");
     try {
@@ -1471,7 +1541,7 @@ export class SessionStore {
   private getSessionRaw(id: string): ExternalSession | undefined {
     const row = this.gateway.db.prepare("SELECT session_json FROM external_sessions WHERE id=?")
       .get(id) as { session_json: string } | undefined;
-    return row ? JSON.parse(row.session_json) as ExternalSession : undefined;
+    return row ? normalizeExternalSession(JSON.parse(row.session_json) as ExternalSession) : undefined;
   }
 
   private purgeExpiredRetention(): void {
@@ -1479,7 +1549,7 @@ export class SessionStore {
       "SELECT id,session_json FROM external_sessions",
     ).all() as { id: string; session_json: string }[])
       .filter((row) => {
-        const session = JSON.parse(row.session_json) as ExternalSession;
+        const session = normalizeExternalSession(JSON.parse(row.session_json) as ExternalSession);
         return session.retentionUntil && Date.parse(session.retentionUntil) <= Date.now();
       })
       .map((row) => row.id);
@@ -1673,6 +1743,20 @@ export class SessionStore {
 
 export function digest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function normalizeExternalSession(session: ExternalSession): ExternalSession {
+  const legacyExpiredLease = session.status === "expired" && Boolean(session.activatedAt);
+  return {
+    ...session,
+    threadId: session.threadId ?? session.id,
+    grantVersion: session.grantVersion ?? session.authorityVersion,
+    ...(legacyExpiredLease ? {
+      status: "renewal_required" as const,
+      closedAt: undefined,
+      retentionUntil: undefined,
+    } : {}),
+  };
 }
 
 function mapCollection(row: Record<string, unknown>): ContextCollection {

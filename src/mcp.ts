@@ -896,6 +896,66 @@ server.registerTool(
 );
 
 server.registerTool(
+  "renew_external_session",
+  {
+    description: "Request renewal of an established External Thread whose Grant expired. The same Thread, event history, and native Agent sessions are preserved; the remote Owner must approve a new Grant version.",
+    inputSchema: {
+      peerUrl: z.string().url(),
+      sessionId: z.string().min(1),
+      leaseSeconds: z.number().int().min(60).max(604800).optional(),
+    },
+  },
+  async ({ peerUrl, sessionId, leaseSeconds }) => {
+    const body = { sessionId, callerPrincipalId: principalId, leaseSeconds };
+    const result = await signedExternalFetch(
+      peerUrl,
+      `/external/sessions/${encodeURIComponent(sessionId)}/renew`,
+      { action: "session.renew", method: "POST", body, contextId: sessionId },
+    ) as {
+      session?: {
+        id?: unknown; threadId?: unknown; purpose?: unknown; status?: unknown;
+        createdAt?: unknown; activatedAt?: unknown; expiresAt?: unknown;
+        grantVersion?: unknown; renewalRequestedAt?: unknown;
+        renewalConsentExpiresAt?: unknown; lastRenewedAt?: unknown;
+        authorityVersion?: unknown; authorityDigest?: unknown;
+      };
+      requestedGrant?: unknown; grant?: unknown; operationGrant?: unknown;
+      actionGrant?: unknown; egressGrant?: unknown; authorityBundle?: unknown; proof?: unknown;
+    };
+    const verified = verifySignedStatement(
+      result.proof,
+      {
+        session: result.session,
+        requestedGrant: result.requestedGrant,
+        grant: result.grant,
+        operationGrant: result.operationGrant,
+        actionGrant: result.actionGrant,
+        egressGrant: result.egressGrant,
+        authorityBundle: result.authorityBundle,
+      },
+      store,
+    );
+    const remoteSession = result.session;
+    if (!verified.ok
+      || typeof remoteSession?.id !== "string"
+      || remoteSession.id !== sessionId
+      || remoteSession.status !== "awaiting_owner_consent"
+      || typeof remoteSession.purpose !== "string"
+      || typeof remoteSession.authorityVersion !== "number"
+      || typeof remoteSession.authorityDigest !== "string"
+      || !isAuthorityBinding(result.authorityBundle, remoteSession)) {
+      throw new Error(`remote session renewal is invalid${verified.ok ? "" : `: ${verified.reason}`}`);
+    }
+    rememberRemoteSession(
+      store,
+      verified.peerId,
+      remoteSession as Parameters<typeof rememberRemoteSession>[2],
+    );
+    return text(JSON.stringify(result, null, 2));
+  },
+);
+
+server.registerTool(
   "close_external_session",
   {
     description: "Close a persistent remote External Session.",
@@ -1515,7 +1575,7 @@ async function signedExternalFetch(
     contextId?: string;
   },
 ): Promise<unknown> {
-  if (input.contextId && ["session.message", "session.close", "writeback.propose"]
+  if (input.contextId && ["session.message", "session.renew", "session.close", "writeback.propose"]
     .includes(input.action)) {
     // Refreshing the signed state is transport-only and never invokes the remote model.
     await refreshRemoteSessionState(peerUrl, input.contextId);
@@ -1528,13 +1588,15 @@ async function signedExternalFetch(
     const body = wireBody as Record<string, unknown>;
     const operation = input.action === "session.open"
       ? "session.open"
-      : input.action === "session.close"
-        ? "session.close"
-        : input.action === "writeback.propose"
-          ? "writeback.propose"
-          : input.action === "session.message"
-            ? body.operation === "task" ? "session.task" : "session.message"
-            : undefined;
+      : input.action === "session.renew"
+        ? "session.renew"
+        : input.action === "session.close"
+          ? "session.close"
+          : input.action === "writeback.propose"
+            ? "writeback.propose"
+            : input.action === "session.message"
+              ? body.operation === "task" ? "session.task" : "session.message"
+              : undefined;
     if (operation) {
       const binding = input.contextId
         ? remoteSessionBinding(remote.peerId, input.contextId)

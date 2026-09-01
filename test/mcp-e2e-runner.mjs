@@ -356,6 +356,65 @@ try {
   ) {
     throw new Error(`External Thread was not persistent across interactions: ${JSON.stringify(externalState)}`);
   }
+  if (
+    externalThread.sessionControl?.new !== true
+    || typeof externalThread.sessionControl?.switch !== "boolean"
+    || externalThread.egressChallenges?.some((challenge) => challenge.sessionControl !== undefined)
+  ) {
+    throw new Error("External Session control capabilities were not exposed at the signed state root");
+  }
+
+  await postJson(`${bob.managementUrl}/api/external-sessions/${externalSession.id}/status`, {
+    status: "renewal_required",
+  });
+  const renewalRequest = await mcp.callTool({
+    name: "renew_external_session",
+    arguments: {
+      peerUrl: bob.publicUrl,
+      sessionId: externalSession.id,
+      leaseSeconds: 180,
+    },
+  });
+  const renewalText = renewalRequest.content?.find((item) => item.type === "text")?.text;
+  const renewal = renewalText ? JSON.parse(renewalText) : {};
+  if (
+    renewal.session?.id !== externalSession.id
+    || renewal.session?.threadId !== externalSession.threadId
+    || renewal.session?.status !== "awaiting_owner_consent"
+    || renewal.session?.grantVersion !== externalThread.session.grantVersion
+  ) {
+    throw new Error(`External Thread renewal request changed identity or grant: ${JSON.stringify(renewalRequest)}`);
+  }
+  await postJson(
+    `${bob.managementUrl}/api/external-sessions/${externalSession.id}/approve`,
+    {},
+  );
+  const renewedStateResult = await mcp.callTool({
+    name: "get_external_session",
+    arguments: { peerUrl: bob.publicUrl, sessionId: externalSession.id },
+  });
+  const renewedStateText = renewedStateResult.content?.find((item) => item.type === "text")?.text;
+  const renewedState = renewedStateText ? JSON.parse(renewedStateText) : {};
+  if (
+    renewedState.session?.id !== externalSession.id
+    || renewedState.session?.threadId !== externalSession.threadId
+    || renewedState.session?.status !== "active"
+    || renewedState.session?.grantVersion !== externalThread.session.grantVersion + 1
+    || renewedState.events?.length <= externalThread.events.length
+  ) {
+    throw new Error(`External Thread did not resume under a new Grant version: ${JSON.stringify(renewedStateResult)}`);
+  }
+  const renewedAnswer = await mcp.callTool({
+    name: "send_external_message",
+    arguments: {
+      peerUrl: bob.publicUrl,
+      sessionId: externalSession.id,
+      message: "Continue in the same External Thread after Grant renewal.",
+    },
+  });
+  if (!JSON.stringify(renewedAnswer).includes("answer")) {
+    throw new Error("renewed External Thread did not resume messaging");
+  }
   await postJson(`${bob.managementUrl}/api/external-sessions/${externalSession.id}/status`, {
     status: "paused",
   });

@@ -61,6 +61,16 @@ structured claims with authority, sensitivity, evidence references, source Event
 Authority Bundle digest under which they were observed. Claims are filtered again against the
 current Context and Egress grants before restart rehydration.
 
+The External Session ID is the stable External Thread ID. The active lease belongs to its
+current Authority Bundle, not to the Thread itself. When an established lease expires, JAMA
+moves the Session to `renewal_required`: messages and tasks fail closed, while Events,
+Artifacts, Tasks, checkpoints, and opaque native-session generations remain intact. The
+paired caller signs `session.renew` against the last Authority Bundle. A duplicate request is
+idempotent. Owner approval re-evaluates or narrows the existing grants, appends a new
+Authority Bundle version, and returns the same Thread to `active`. Initial consent requests
+that expire without ever activating remain terminal `expired`; explicit `revoked` and
+`closed` states cannot be renewed.
+
 The default `managed` isolation policy accepts JAMA's Managed ACP Profile. It creates one
 process and profile namespace per `externalSessionId` and redirects HOME, XDG, AppData,
 temporary files, histories, Codex, Claude, Hermes, and other known Agent configuration paths.
@@ -130,7 +140,7 @@ does not claim complete semantic leak detection.
 ## Authority versions
 
 Context, operation, action, Egress, and Group epoch authority are captured in an immutable,
-gateway-signed Authority Bundle. Approval, extension, and Group reauthorization append a new
+gateway-signed Authority Bundle. Approval, renewal, extension, and Group reauthorization append a new
 version linked by `previousAuthorityDigest`; old bundles remain queryable. Every post-open
 External Session Envelope binds the complete current `authorityVersion` and `authorityDigest`,
 so a message signed under an earlier Context, operation, action, Egress, or Group authority is

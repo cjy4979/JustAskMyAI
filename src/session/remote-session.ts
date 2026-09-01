@@ -4,6 +4,7 @@ const PREFIX = "external.remote.";
 
 export interface RemoteSessionRecord {
   sessionId: string;
+  threadId: string;
   peerId: string;
   purpose: string;
   status: string;
@@ -12,6 +13,10 @@ export interface RemoteSessionRecord {
   expiresAt?: string;
   authorityVersion: number;
   authorityDigest: string;
+  grantVersion: number;
+  renewalRequestedAt?: string;
+  renewalConsentExpiresAt?: string;
+  lastRenewedAt?: string;
   nativeGenerations: number[];
   activeGeneration?: number;
   updatedAt: string;
@@ -26,27 +31,40 @@ export function rememberRemoteSession(
   peerId: string,
   session: {
     id: string;
+    threadId?: unknown;
     purpose: string;
     status?: unknown;
     createdAt?: unknown;
     activatedAt?: unknown;
     expiresAt?: unknown;
+    grantVersion?: unknown;
+    renewalRequestedAt?: unknown;
+    renewalConsentExpiresAt?: unknown;
+    lastRenewedAt?: unknown;
     authorityVersion: number;
     authorityDigest: string;
   },
 ): RemoteSessionRecord {
   const current = readRecord(store, peerId, session.id);
+  const status = typeof session.status === "string" ? session.status : current?.status ?? "unknown";
   const record: RemoteSessionRecord = {
     sessionId: session.id,
     peerId,
+    threadId: stringValue(session.threadId) ?? current?.threadId ?? session.id,
     purpose: session.purpose,
-    status: typeof session.status === "string" ? session.status : current?.status ?? "unknown",
+    status,
     createdAt: stringValue(session.createdAt) ?? current?.createdAt,
     activatedAt: stringValue(session.activatedAt) ?? current?.activatedAt,
     expiresAt: stringValue(session.expiresAt) ?? current?.expiresAt,
     authorityVersion: session.authorityVersion,
     authorityDigest: session.authorityDigest,
     nativeGenerations: current?.nativeGenerations ?? [],
+    grantVersion: numberValue(session.grantVersion) ?? session.authorityVersion,
+    renewalRequestedAt: stringValue(session.renewalRequestedAt)
+      ?? (status === "active" ? undefined : current?.renewalRequestedAt),
+    renewalConsentExpiresAt: stringValue(session.renewalConsentExpiresAt)
+      ?? (status === "active" ? undefined : current?.renewalConsentExpiresAt),
+    lastRenewedAt: stringValue(session.lastRenewedAt) ?? current?.lastRenewedAt,
     activeGeneration: current?.activeGeneration,
     updatedAt: new Date().toISOString(),
   };
@@ -118,6 +136,7 @@ function parseRecord(key: string, value: string): RemoteSessionRecord | undefine
     return {
       sessionId,
       peerId,
+      threadId: typeof parsed.threadId === "string" ? parsed.threadId : sessionId,
       purpose: parsed.purpose,
       status: typeof parsed.status === "string" ? parsed.status : "unknown",
       createdAt: stringValue(parsed.createdAt),
@@ -125,6 +144,10 @@ function parseRecord(key: string, value: string): RemoteSessionRecord | undefine
       expiresAt: stringValue(parsed.expiresAt),
       authorityVersion: parsed.authorityVersion,
       authorityDigest: parsed.authorityDigest,
+      grantVersion: numberValue(parsed.grantVersion) ?? parsed.authorityVersion,
+      renewalRequestedAt: stringValue(parsed.renewalRequestedAt),
+      renewalConsentExpiresAt: stringValue(parsed.renewalConsentExpiresAt),
+      lastRenewedAt: stringValue(parsed.lastRenewedAt),
       nativeGenerations: Array.isArray(parsed.nativeGenerations)
         ? parsed.nativeGenerations.filter(
           (item): item is number => Number.isInteger(item) && item >= 0,
@@ -140,4 +163,8 @@ function parseRecord(key: string, value: string): RemoteSessionRecord | undefine
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
 }

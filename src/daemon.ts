@@ -555,18 +555,68 @@ publicApp.get("/external/sessions/:id", (req, res) => {
       authorityVersion: challenge.authorityVersion,
       reason: challenge.reason,
       status: challenge.status,
-      sessionControl: {
-        new: true,
-        switch: adapter.id === "provider",
-      },
       createdAt: challenge.createdAt,
       resolvedAt: challenge.resolvedAt,
       releasedAnswer: challenge.status === "released" ? challenge.releasedAnswer : undefined,
     })),
+    sessionControl: {
+      new: true,
+      switch: adapter.id === "provider",
+    },
     checkpoint: sessions.getCheckpoint(session.id),
     events: sessions.listEvents(session.id),
   };
   return res.json({ ...state, proof: gatewayIdentity.signStatement(state) });
+});
+publicApp.post("/external/sessions/:id/renew", (req, res) => {
+  try {
+    const verified = verifySignedRequest(
+      decodeSignedRequest(req.header(JAMAI_AUTH_HEADER)),
+      {
+        audiencePeerId: nodeId,
+        action: "session.renew",
+        contextId: req.params.id,
+        payload: req.body,
+      },
+      store,
+    );
+    if (!verified.ok) return res.status(401).json({ error: verified.reason });
+    const session = sessions.getSession(req.params.id);
+    if (!session || session.callerPeerId !== verified.peerId) {
+      return res.status(404).json({ error: "external session not found" });
+    }
+    validateExternalEnvelope(req.body?.envelope, {
+      operation: "session.renew",
+      body: req.body,
+      session,
+      authorityVersion: session.authorityVersion,
+      authorityDigest: session.authorityDigest,
+    });
+    const renewed = sessions.requestRenewal({
+      sessionId: session.id,
+      callerPrincipalId: requiredString(req.body?.callerPrincipalId, "callerPrincipalId"),
+      callerPeerId: verified.peerId,
+      leaseSeconds: typeof req.body?.leaseSeconds === "number" ? req.body.leaseSeconds : undefined,
+    });
+    const signed = signedExternalSessionGrant(renewed);
+    store.appendAudit({
+      eventType: "external-session.renewal-requested",
+      principalId,
+      agentId,
+      peerId: verified.peerId,
+      contextId: renewed.a2aContextId,
+      action: "renew-external-session",
+      resource: renewed.id,
+      metadata: {
+        threadId: renewed.threadId,
+        grantVersion: renewed.grantVersion,
+        renewalConsentExpiresAt: renewed.renewalConsentExpiresAt,
+      },
+    });
+    return res.status(202).json(signed);
+  } catch (error) {
+    return res.status(400).json({ error: String(error) });
+  }
 });
 publicApp.post("/external/sessions/:id/close", (req, res) => {
   const verified = verifySignedRequest(
@@ -1189,6 +1239,50 @@ managementApp.get("/api/remote-external-sessions/:id", async (req, res) => {
     return res.json(result);
   } catch (error) { return res.status(400).json({ error: String(error) }); }
 });
+managementApp.post("/api/remote-external-sessions/:id/renew", async (req, res) => {
+  try {
+    const peerId = requiredString(req.body?.peerId, "peerId");
+    const result = await callRemoteSession(
+      peerId,
+      `/external/sessions/${encodeURIComponent(req.params.id)}/renew`,
+      {
+        action: "session.renew",
+        contextId: req.params.id,
+        body: {
+          sessionId: req.params.id,
+          callerPrincipalId: principalId,
+          leaseSeconds: typeof req.body?.leaseSeconds === "number"
+            ? req.body.leaseSeconds : undefined,
+        },
+      },
+    ) as {
+      session?: ExternalSession; requestedGrant?: unknown; grant?: unknown;
+      operationGrant?: unknown; actionGrant?: unknown; egressGrant?: unknown;
+      authorityBundle?: unknown; proof?: unknown;
+    };
+    const verified = verifySignedStatement(
+      result.proof,
+      {
+        session: result.session,
+        requestedGrant: result.requestedGrant,
+        grant: result.grant,
+        operationGrant: result.operationGrant,
+        actionGrant: result.actionGrant,
+        egressGrant: result.egressGrant,
+        authorityBundle: result.authorityBundle,
+      },
+      store,
+    );
+    if (!verified.ok || verified.peerId !== peerId || !result.session
+      || result.session.id !== req.params.id
+      || result.session.status !== "awaiting_owner_consent"
+      || !isAuthorityBinding(result.authorityBundle, result.session)) {
+      throw new Error(`remote session renewal is invalid${verified.ok ? "" : `: ${verified.reason}`}`);
+    }
+    rememberRemoteSession(store, peerId, result.session);
+    return res.status(202).json(result);
+  } catch (error) { return res.status(400).json({ error: String(error) }); }
+});
 managementApp.post("/api/remote-external-sessions/:id/close", async (req, res) => {
   try {
     const peerId = requiredString(req.body?.peerId, "peerId");
@@ -1333,7 +1427,7 @@ managementApp.get("/api/external-sessions/:id/events", (req, res) => {
 managementApp.post("/api/external-sessions/:id/status", (req, res) => {
   try {
     const status = requiredString(req.body?.status, "status");
-    if (!["requested", "awaiting_owner_consent", "active", "paused", "revoked",
+    if (!["requested", "awaiting_owner_consent", "active", "paused", "renewal_required", "revoked",
       "expired", "closed"].includes(status)) throw new Error("invalid session status");
     const updated = sessions.setSessionStatus(req.params.id, status as SessionStatus);
     if (["revoked", "expired", "closed"].includes(status)) {
@@ -1347,8 +1441,13 @@ managementApp.post("/api/external-sessions/:id/approve", async (req, res) => {
     const session = sessions.getSession(req.params.id);
     if (!session) throw new Error("external session not found");
     const requested = sessions.getRequestedGrant(session.requestedContextGrantId);
+    const contextGrant = sessions.getGrant(session.contextGrantId);
     const operation = sessions.getOperationGrant(session.operationGrantId);
-    if (!requested || !operation) throw new Error("session request grants are missing");
+    const action = sessions.getActionGrant(session.actionGrantId);
+    if (!requested || !contextGrant || !operation || !action) {
+      throw new Error("session request grants are missing");
+    }
+    const renewing = session.status === "awaiting_owner_consent" && Boolean(session.activatedAt);
     let currentGroup = session.groupId ? groups.getWorkgroup(session.groupId) : undefined;
     if (session.groupId) {
       await groups.refreshFromAuthority(session.groupId);
@@ -1373,29 +1472,42 @@ managementApp.post("/api/external-sessions/:id/approve", async (req, res) => {
       sessionId: session.id,
       ownerPrincipalId: principalId,
       allowedCollections: Array.isArray(req.body?.allowedCollections)
-        ? stringArray(req.body.allowedCollections) : requested.requestedCollections,
+        ? stringArray(req.body.allowedCollections)
+        : renewing ? contextGrant.allowedCollections : requested.requestedCollections,
       sensitivityCeiling: parseSensitivity(
-        req.body?.sensitivityCeiling ?? requested.requestedSensitivity,
+        req.body?.sensitivityCeiling
+          ?? (renewing ? contextGrant.sensitivityCeiling : requested.requestedSensitivity),
       ),
-      exactContentAllowed: req.body?.exactContentAllowed === true,
+      exactContentAllowed: req.body?.exactContentAllowed === undefined
+        ? renewing && contextGrant.exactContentAllowed
+        : req.body.exactContentAllowed === true,
       maxItems: boundedNumber(
-        req.body?.maxItems, requested.requestedLimits.maxItems, 1,
+        req.body?.maxItems,
+        renewing ? contextGrant.maxItems : requested.requestedLimits.maxItems,
+        1,
         requested.requestedLimits.maxItems,
       ),
       maxTokens: boundedNumber(
-        req.body?.maxTokens, requested.requestedLimits.maxTokens, 256,
+        req.body?.maxTokens,
+        renewing ? contextGrant.maxTokens : requested.requestedLimits.maxTokens,
+        256,
         requested.requestedLimits.maxTokens,
       ),
       allowedOperations: Array.isArray(req.body?.allowedOperations)
         ? parseSessionActions(req.body.allowedOperations) as Array<"ask" | "task" | "review">
         : operation.allowedOperations,
-      actionScopes: stringArray(req.body?.actionScopes),
-      deniedScopes: stringArray(req.body?.deniedScopes),
-      allowedResources: stringArray(req.body?.allowedResources ?? req.body?.resources),
-      deniedResources: stringArray(req.body?.deniedResources),
+      actionScopes: Array.isArray(req.body?.actionScopes)
+        ? stringArray(req.body.actionScopes) : renewing ? action.allowedScopes : [],
+      deniedScopes: Array.isArray(req.body?.deniedScopes)
+        ? stringArray(req.body.deniedScopes) : renewing ? action.deniedScopes : [],
+      allowedResources: Array.isArray(req.body?.allowedResources ?? req.body?.resources)
+        ? stringArray(req.body.allowedResources ?? req.body.resources)
+        : renewing ? action.allowedResources : [],
+      deniedResources: Array.isArray(req.body?.deniedResources)
+        ? stringArray(req.body.deniedResources) : renewing ? action.deniedResources : [],
       actionApprovalRule: ["per-session", "per-task", "runtime-policy", "per-tool"]
         .includes(String(req.body?.actionApprovalRule))
-        ? req.body.actionApprovalRule : "runtime-policy",
+        ? req.body.actionApprovalRule : renewing ? action.approvalRule : "runtime-policy",
       egressAllowedAuthority: parseContextAuthorities(req.body?.egressAllowedAuthority),
       egressAllowedSensitivity: req.body?.egressAllowedSensitivity
         ? parseSensitivity(req.body.egressAllowedSensitivity) : undefined,
@@ -2287,6 +2399,29 @@ function publicProfile(
   };
 }
 
+function signedExternalSessionGrant(session: ExternalSession) {
+  const requestedGrant = sessions.getRequestedGrant(session.requestedContextGrantId);
+  const grant = sessions.getGrant(session.contextGrantId);
+  const operationGrant = sessions.getOperationGrant(session.operationGrantId);
+  const actionGrant = sessions.getActionGrant(session.actionGrantId);
+  const egressGrant = sessions.getEgressGrant(session.egressGrantId);
+  const authorityBundle = sessions.getAuthorityBundle(session.id);
+  if (!requestedGrant || !grant || !operationGrant || !actionGrant
+    || !egressGrant || !authorityBundle) {
+    throw new Error("session authority grants are incomplete");
+  }
+  const state = {
+    session,
+    requestedGrant,
+    grant,
+    operationGrant,
+    actionGrant,
+    egressGrant,
+    authorityBundle,
+  };
+  return { ...state, proof: gatewayIdentity.signStatement(state) };
+}
+
 function streamSessionEvents(
   sessionId: string,
   req: express.Request,
@@ -2492,7 +2627,7 @@ async function callRemoteSession(
     method?: "GET" | "POST";
   },
 ): Promise<unknown> {
-  if (input.contextId && ["session.message", "session.close", "writeback.propose"]
+  if (input.contextId && ["session.message", "session.renew", "session.close", "writeback.propose"]
     .includes(input.action)) {
     // Owner Hub state changes also recover stale bindings without a manual refresh step.
     await refreshRemoteSessionBinding(peerId, input.contextId);
@@ -2505,10 +2640,11 @@ async function callRemoteSession(
     const object = body as Record<string, unknown>;
     const operation: ExternalSessionEnvelope["operation"] | undefined =
       input.action === "session.open" ? "session.open"
-        : input.action === "session.close" ? "session.close"
-          : input.action === "session.message"
-            ? object.operation === "task" ? "session.task" : "session.message"
-            : input.action === "writeback.propose" ? "writeback.propose" : undefined;
+        : input.action === "session.renew" ? "session.renew"
+          : input.action === "session.close" ? "session.close"
+            : input.action === "session.message"
+              ? object.operation === "task" ? "session.task" : "session.message"
+              : input.action === "writeback.propose" ? "writeback.propose" : undefined;
     if (operation) {
       const binding = input.contextId ? remoteSessionBinding(peerId, input.contextId) : undefined;
       object.envelope = {

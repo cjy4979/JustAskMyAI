@@ -74,6 +74,8 @@ perform bounded work within that authority.
 - Local receipt evidence records with field-selective localhost disclosure
 - Signed, audience-bound capability discovery with policy-filtered public aliases
 - Persistent External Sessions for multi-turn Human-to-Agent and Agent-to-Agent access
+- Stable External Thread identity with renewable, versioned Grants; lease expiry pauses access
+  without discarding messages, tasks, artifacts, or native Agent session generations
 - Dependency-free Managed ACP Profiles with separate per-Session Agent memory/configuration
 - Optional Docker-backed strict isolation for sensitive deployments
 - Session leases and envelopes bound to caller, purpose, and the complete Authority Bundle
@@ -145,7 +147,7 @@ primary human interface; normal use should not require management API commands o
 internal IDs. It provides:
 
 - a single inbox for access requests, task approvals, egress confirmations, and writebacks;
-- persistent External Session cards with pause, resume, revoke, and conversation history;
+- persistent External Session cards with pause, resume, one-click Grant renewal, revoke, and conversation history;
 - a multi-task board, paired people directory, and explicit Context Collection manager;
 - an in-product setup checklist and runtime switch for guest invitation links;
 - invite creation with human-readable purpose, selected knowledge, actions, and lease;

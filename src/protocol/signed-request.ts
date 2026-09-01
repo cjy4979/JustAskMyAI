@@ -25,6 +25,7 @@ export type SignedAction =
   | "session.open"
   | "session.message"
   | "session.get"
+  | "session.renew"
   | "session.close"
   | "writeback.propose";
 
@@ -274,6 +275,7 @@ function parseSignedRequest(value: unknown): SignedRequest | undefined {
       "session.open",
       "session.message",
       "session.get",
+      "session.renew",
       "session.close",
       "writeback.propose",
     ].includes(String(raw.action))

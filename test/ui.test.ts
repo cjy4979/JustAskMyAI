@@ -21,6 +21,11 @@ test("Owner Hub renders product workflows with valid client JavaScript", () => {
   assert.match(page, /运行时声明与 Owner 证明分开记录/);
   assert.match(page, /能力变化后已停止领取新工作/);
   assert.match(page, /function providerTrustView\(\)/);
+  assert.match(page, /授权待续签/);
+  assert.match(page, /function renewRemoteSession\(id,peerId\)/);
+  assert.match(page, /\/api\/remote-external-sessions\/.*\/renew/);
+  assert.match(page, /Thread、消息和 Agent 原生会话都会保留/);
+  assert.match(page, /原会话与历史已保留，可直接续签/);
   assert.match(page, /同步开发版/);
   assert.match(page, /function runtimeAction\(action\)/);
   assert.match(page, /\/api\/runtime-control/);

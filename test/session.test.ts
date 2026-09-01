@@ -58,6 +58,90 @@ test("External Session binds caller, lease, status, grant, and immutable thread 
   env.gateway.close();
 });
 
+test("expired Grant renews the same stable External Thread without losing history", () => {
+  const env = fixture();
+  const original = env.session;
+  assert.equal(original.threadId, original.id);
+  assert.equal(original.grantVersion, original.authorityVersion);
+  env.sessions.appendEvent(original.id, "caller-message", "bob", "Keep this context.", []);
+
+  const past = new Date(Date.now() - 1_000).toISOString();
+  const expiredJson = { ...original, expiresAt: past };
+  env.gateway.db.prepare(
+    "UPDATE external_sessions SET expires_at=?,session_json=? WHERE id=?",
+  ).run(past, JSON.stringify(expiredJson), original.id);
+
+  const renewable = env.sessions.getSession(original.id)!;
+  assert.equal(renewable.status, "renewal_required");
+  assert.equal(renewable.threadId, original.id);
+  assert.equal(renewable.closedAt, undefined);
+  assert.equal(renewable.retentionUntil, undefined);
+  assert.throws(() => env.sessions.setSessionStatus(original.id, "active"),
+    /issue narrowed grants/);
+  assert.throws(
+    () => env.sessions.requireActive(original.id, "bob", "bob-peer"),
+    /not active/,
+  );
+
+  const requested = env.sessions.requestRenewal({
+    sessionId: original.id,
+    callerPrincipalId: "bob",
+    callerPeerId: "bob-peer",
+    leaseSeconds: 120,
+  });
+  assert.equal(requested.id, original.id);
+  assert.equal(requested.threadId, original.threadId);
+  assert.equal(requested.status, "awaiting_owner_consent");
+  assert.equal(requested.grantVersion, original.grantVersion);
+  assert.ok(requested.renewalRequestedAt);
+  assert.ok(requested.renewalConsentExpiresAt);
+  const eventCount = env.sessions.listEvents(original.id).length;
+  assert.equal(env.sessions.requestRenewal({
+    sessionId: original.id,
+    callerPrincipalId: "bob",
+    callerPeerId: "bob-peer",
+  }).renewalRequestedAt, requested.renewalRequestedAt);
+  assert.equal(env.sessions.listEvents(original.id).length, eventCount);
+
+  const renewedAt = Date.now();
+  const renewed = env.sessions.approveSession({
+    sessionId: original.id,
+    ownerPrincipalId: "alice",
+    allowedCollections: [env.collection.id],
+    sensitivityCeiling: "internal",
+    exactContentAllowed: true,
+    maxItems: 8,
+    maxTokens: 6000,
+    allowedOperations: ["ask", "task"],
+    actionScopes: [],
+    deniedScopes: [],
+    allowedResources: [],
+    deniedResources: [],
+    actionApprovalRule: "runtime-policy",
+  });
+  assert.equal(renewed.session.id, original.id);
+  assert.equal(renewed.session.threadId, original.threadId);
+  assert.equal(renewed.session.status, "active");
+  assert.equal(renewed.session.authorityVersion, original.authorityVersion + 1);
+  assert.equal(renewed.session.grantVersion, original.grantVersion + 1);
+  assert.ok(renewed.session.lastRenewedAt);
+  assert.ok(Date.parse(renewed.session.expiresAt) - renewedAt >= 119_000);
+  assert.equal(
+    env.sessions.listEvents(original.id).some((event) => event.content === "Keep this context."),
+    true,
+  );
+  const latestBundle = env.sessions.getAuthorityBundle(original.id)!;
+  assert.equal(latestBundle.previousAuthorityDigest, original.authorityDigest);
+
+  env.sessions.setSessionStatus(original.id, "revoked");
+  assert.throws(() => env.sessions.requestRenewal({
+    sessionId: original.id,
+    callerPrincipalId: "bob",
+    callerPeerId: "bob-peer",
+  }), /does not require renewal/);
+  env.gateway.close();
+});
+
 test("Context Projection enforces collection, sensitivity, summary/exact, and item limits", () => {
   const env = fixture();
   const allowed = env.sessions.addItem({

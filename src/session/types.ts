@@ -1,7 +1,7 @@
 import type { SignedStatement } from "../protocol/signed-request.js";
 
 export type SessionStatus =
-  | "requested" | "awaiting_owner_consent" | "active" | "paused"
+  | "requested" | "awaiting_owner_consent" | "active" | "paused" | "renewal_required"
   | "revoked" | "expired" | "closed";
 export type Sensitivity = "public" | "internal" | "confidential" | "restricted";
 export type ContextAuthority =
@@ -172,6 +172,8 @@ export interface EgressGrant {
 
 export interface ExternalSession {
   id: string;
+  /** Stable collaboration thread. Grant renewal never changes this identity. */
+  threadId: string;
   ownerPrincipalId: string;
   ownerAgentId: string;
   callerType: "human" | "agent";
@@ -191,6 +193,8 @@ export interface ExternalSession {
   egressGrantId: string;
   authorityVersion: number;
   authorityDigest: string;
+  /** Human-facing alias for the current Authority Bundle version. */
+  grantVersion: number;
   allowedActions: string[];
   status: SessionStatus;
   createdAt: string;
@@ -200,6 +204,9 @@ export interface ExternalSession {
   consentExpiresAt?: string;
   activatedAt?: string;
   expiresAt: string;
+  renewalRequestedAt?: string;
+  renewalConsentExpiresAt?: string;
+  lastRenewedAt?: string;
   closedAt?: string;
   retentionUntil?: string;
 }
@@ -231,7 +238,7 @@ export interface ContextualAnswer {
 
 export interface ExternalSessionEnvelope {
   version: 1;
-  operation: "session.open" | "session.message" | "session.task" | "session.close"
+  operation: "session.open" | "session.message" | "session.task" | "session.renew" | "session.close"
     | "writeback.propose";
   sessionId?: string;
   authorityVersion?: number;

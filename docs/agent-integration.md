@@ -102,6 +102,13 @@ it as `resumeSessionId`, including after the JAMA gateway and Connector reconnec
 JAMA pins later turns to the provider Agent that created that native session, so a second
 locally connected Agent cannot claim the job or receive another Agent's session ID.
 
+An External Session ID is also its stable External Thread ID. Its Authority Bundle is a
+separate, versioned Grant: when the active lease expires, the Thread moves to
+`renewal_required` instead of becoming terminal. The caller may send one signed renewal
+request, and the remote Owner can issue the next Grant version without re-pairing, creating a
+new Thread, or losing events, tasks, artifacts, and native-session generations. Revoked and
+closed Threads remain terminal.
+
 Jobs and leases are durable. If an Agent or gateway stops while work is claimed, the lease
 expires and the job becomes claimable again. The Agent must avoid repeating irreversible
 side effects after it loses a lease. When native session resume is unavailable, it must say
